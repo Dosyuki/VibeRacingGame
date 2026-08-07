@@ -7,7 +7,13 @@
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "check:smoke": "node tools/smoke.mjs",
+    "check:fps": "node tools/fps-bench.mjs",
+    "check:energy": "node tools/energy-check.mjs",
+    "check:contract": "node tools/contract-check.mjs",
+    "check": "npm run check:contract && npm run check:smoke && npm run check:energy && npm run check:fps",
+    "selftest": "node tools/smoke.mjs --broken && node tools/energy-check.mjs --broken && node tools/fps-bench.mjs --force-software"
   },
   "repository": {
     "type": "git",

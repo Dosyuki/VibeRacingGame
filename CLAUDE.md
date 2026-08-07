@@ -127,6 +127,30 @@ different reason. Work out which before removing either.**
 The harnesses are the point of this repo more than the game is. Each answers a
 question that is genuinely hard to answer by looking.
 
+| harness | the question it answers | self-test |
+|---|---|---|
+| `smoke.mjs` | Did a frame actually reach the screen, all of it? | `--broken` scissor-clears half the buffer |
+| `fps-bench.mjs` | What does a frame cost, on a GPU we can name? | `--force-software` must be refused |
+| `energy-check.mjs` | Is the frame inside the §8 additive budget? | `--broken` blows a quarter to white |
+| `contract-check.mjs` | Does every harness method work, or refuse honestly? | reports its own coverage ledger |
+
+```bash
+npm run check          # all of them
+npm run check:smoke    # and :fps, :energy, :contract
+npm run selftest       # prove each instrument fails when it should
+```
+
+**Every harness ships a self-test, and it is not optional.** A harness nobody
+has watched fail is not evidence. The first version of `smoke.mjs` "failed" its
+own self-test because the sabotage — hiding the canvas with CSS — never touched
+the drawing buffer; the detector was fine and the test was inert. That is the
+shape of the problem: you cannot tell a working instrument from a broken one
+without making it report a failure you constructed on purpose.
+
+`energy-check.mjs` reports vantages it cannot reach yet as **PENDING**, never as
+skipped. A gate that quietly covers nothing produces the same green output as a
+gate that passed.
+
 Rules learned at other people's expense, applied here from the start:
 
 - **Validate the instrument before trusting the reading.** Every harness must be
@@ -144,8 +168,11 @@ Rules learned at other people's expense, applied here from the start:
 - **At 60 Hz there is no such thing as a 20 ms frame.** vsync returns ~16.7 or
   ~33.4 ms, so the *median* frame time of a build running at 48 fps is exactly
   16.70 and reads as a perfect pass, while "% of frames over 16.7 ms" is ~45% on
-  a flawless run purely from jitter. Gate on the MEAN and on frames that took
-  two vsyncs. Do not tidy either onto the obvious statistic.
+  a flawless run purely from jitter. `fps-bench.mjs` disables vsync so the
+  number reflects actual cost rather than the refresh grid, and gates on the
+  MEAN either way. Do not tidy that onto the obvious statistic, and do not
+  re-enable vsync for a comparison — with it on, a change that halves GPU cost
+  reports the identical frame time.
 
 - **Pin the adaptive scaler for every A/B.** A scaler that spends resolution to
   protect frame rate is right for a player and ruinous for a measurement: an
