@@ -42,7 +42,12 @@ const FULL_EXTENSION = REST_LENGTH + SUSPENSION_TRAVEL * 0.5
 const BOTTOM_LENGTH = REST_LENGTH - SUSPENSION_TRAVEL * 0.5
 const SPRING_RATE = 25_000
 const DAMPER_RATE = 2_250
-const RIDE_HEIGHT = WHEEL_RADIUS + REST_LENGTH
+// `REST_LENGTH` is the unloaded spring length.  Placing the chassis there left
+// all four springs at zero force, so every seek began with a one-frame fall and
+// a large damper transient instead of the requested driving state.
+const STATIC_SAG = MASS * GRAVITY / (4 * SPRING_RATE)
+const STATIC_RAY_LENGTH = REST_LENGTH - STATIC_SAG
+const RIDE_HEIGHT = WHEEL_RADIUS + STATIC_RAY_LENGTH
 
 const ENGINE_FORCE = 3_450
 const REVERSE_FORCE = 1_450
@@ -54,6 +59,7 @@ const MAX_STEER = 0.48
 const STEER_FADE_SPEED = 34
 const TYRE_SLIP_ANGLE = 0.115
 const TYRE_SLIP_RATIO = 0.13
+const MAX_TYRE_LOAD = MASS * GRAVITY * 0.75
 
 const DRIFT_MIN_STEER = 0.18
 const DRIFT_MIN_SPEED = 7
@@ -200,11 +206,12 @@ export const createKart: KartFactory = (
   let previousDriftButton = false
   let driftCarry = 0
   let yawRate = 0
+  let suspensionHistoryValid = false
   let built = false
 
   const wheelOmega = new Float64Array(4)
   const previousRayLength = new Float64Array(4)
-  previousRayLength.fill(REST_LENGTH)
+  previousRayLength.fill(STATIC_RAY_LENGTH)
   const wheelLocation = [makeTrackLocation(), makeTrackLocation(), makeTrackLocation(), makeTrackLocation()]
   const wheelSample = [makeTrackSample(), makeTrackSample(), makeTrackSample(), makeTrackSample()]
   const centreLocation = makeTrackLocation()
@@ -363,7 +370,11 @@ export const createKart: KartFactory = (
         // Roughness perturbs the ray target, not the chassis after integration.
         // That distinction lets spring/damper forces filter the bump instead of
         // teleporting the body, while the fixed phase keeps it deterministic.
-        const bumpPhase = location.t * track.length * 5.7 + i * 1.91 + identity.id * 0.73
+        // Both tyres on an axle cross the same transverse road feature at the
+        // same longitudinal station.  Giving left and right unrelated phases
+        // injected a permanent yaw moment even on the harness' perfectly flat
+        // straight, which then made the saturated tyre response chaotic.
+        const bumpPhase = location.t * track.length * 5.7 + (i >> 1) * 1.91 + identity.id * 0.73
         const bump = Math.sin(bumpPhase) * props.roughness * 0.42
         let rayLength =
           (mount.x - sample.position.x) * sample.normal.x +
@@ -389,7 +400,12 @@ export const createKart: KartFactory = (
         normalZ += sample.normal.z
         rayLength = clamp(rayLength, BOTTOM_LENGTH, FULL_EXTENSION)
         wheel.compression = clamp((FULL_EXTENSION - rayLength) / SUSPENSION_TRAVEL, 0, 1)
-        const compressionSpeed = (previousRayLength[i]! - rayLength) / step
+        // A pose assignment has no previous contact sample.  Treat its first
+        // ray as history rather than manufacturing a damper velocity from the
+        // old pose; the next fixed tick then has a real finite difference.
+        const compressionSpeed = suspensionHistoryValid
+          ? (previousRayLength[i]! - rayLength) / step
+          : 0
         previousRayLength[i] = rayLength
         const springForce = Math.max(
           0,
@@ -423,7 +439,12 @@ export const createKart: KartFactory = (
         // and corner stiffness moves the equilibrium to a visible slip angle;
         // there is no sideways position injection or scripted heading change.
         const rearDriftScale = drift.active && i >= 2 ? 0.61 : 1
-        const peakForce = Math.max(120, springForce * props.grip * rearDriftScale)
+        // Damper force is allowed to arrest a landing, but it is not a usable
+        // tyre load without limit.  Feeding an impact spike straight into the
+        // brush model produced forces large enough to reverse the kart through
+        // the rearward component of a steered wheel's lateral force.
+        const tyreLoad = Math.min(springForce, MAX_TYRE_LOAD)
+        const peakForce = Math.max(120, tyreLoad * props.grip * rearDriftScale)
         let lateralForce = -Math.tanh(slipAngle / (TYRE_SLIP_ANGLE / rearDriftScale)) * peakForce
         let longitudinalForce = Math.tanh(slipRatio / TYRE_SLIP_RATIO) * peakForce
 
@@ -466,6 +487,8 @@ export const createKart: KartFactory = (
           1,
         )
       }
+
+      suspensionHistoryValid = true
 
       state.grounded = groundedCount >= 2
       if (!wasGrounded && state.grounded) {
@@ -640,8 +663,9 @@ export const createKart: KartFactory = (
        */
       velocity.copy(respawnSample.tangent).multiplyScalar(speed)
       wheelOmega.fill(speed / WHEEL_RADIUS)
-      previousRayLength.fill(REST_LENGTH)
+      previousRayLength.fill(STATIC_RAY_LENGTH)
       yawRate = 0
+      suspensionHistoryValid = false
       state.speed = speed
       state.grounded = true
       state.stunTime = 0

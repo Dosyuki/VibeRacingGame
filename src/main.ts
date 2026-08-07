@@ -34,7 +34,7 @@ import {
 } from 'three'
 
 import { createEventBus } from './core/events'
-import { createLoop } from './core/loop'
+import { createLoop, type Loop } from './core/loop'
 import { createRngFactory } from './core/rng'
 import { readFrameLumaStats, readGLReport } from './core/diagnostics'
 import { detectTier, resolveQuality } from './core/quality'
@@ -45,6 +45,8 @@ import { createCameraRig } from './game/camera'
 import { createItems } from './game/items'
 import { createRace } from './game/race'
 import { createKart } from './kart/kart'
+import { createHud } from './ui/hud'
+import { createKartModel, type KartModel } from './render/kart-model'
 import { buildSky } from './render/sky'
 import { buildRoad } from './world/road'
 import { buildCanyonTerrain } from './world/terrain'
@@ -52,6 +54,7 @@ import { createTrack } from './world/track'
 import { SIMULATION_STEP } from './types'
 import type {
   BoostSource,
+  Clock,
   Ctx,
   DriverMode,
   FrameStats,
@@ -142,6 +145,24 @@ const settings: Settings = {
 const events = createEventBus()
 const rngFor = createRngFactory(seed)
 
+/*
+ * The clock does not exist during `build` and `link`, and that is not a bug to
+ * paper over — it is the lifecycle. The loop is constructed after the
+ * subsystems it drives, so a subsystem asking the time while it is being wired
+ * up is asking before there is one.
+ *
+ * The getter used to reach straight for `loop`, which is a `const` declared
+ * further down, so the first subsystem to read `ctx.clock` inside its `link`
+ * hit the temporal dead zone and took the whole page down with
+ * "Cannot read properties of undefined (reading 'clock')". `ui/` was that
+ * subsystem; anything reading the clock at link time would have been.
+ *
+ * Handing back tick zero is the truthful answer to "what time is it" before the
+ * first tick, and it keeps the failure from being a boot crash.
+ */
+const BOOT_CLOCK: Clock = { tick: 0, simTime: 0, alpha: 0, paused: false }
+let loopRef: Loop | undefined
+
 const ctx: Ctx = {
   scene,
   renderer,
@@ -149,7 +170,7 @@ const ctx: Ctx = {
   settings,
   quality,
   get clock() {
-    return loop.clock
+    return loopRef?.clock ?? BOOT_CLOCK
   },
   seed,
   rngFor,
@@ -365,6 +386,21 @@ const karts: (IKart & Subsystem)[] = identities.map((identity, i) => {
 })
 for (const kart of karts) scene.add(kart.modelRoot)
 
+/*
+ * The karts become visible here. Eight of them have been driving the circuit
+ * with full physics since the last round while nothing at all was drawn — the
+ * camera was following an invisible object, and no instrument in the project
+ * could have told you, because every one of them measures either geometry or
+ * pixels of the WORLD.
+ */
+const kartModels: KartModel[] = karts.map((kart) => {
+  const model = createKartModel(ctx, kart.identity)
+  kart.modelRoot.add(model.root)
+  return model
+})
+
+const hud = createHud(ctx)
+
 const services: GameServices = {
   track,
   input,
@@ -382,7 +418,9 @@ const services: GameServices = {
  * `build` resolves before any `link` runs, because `link` is where a subsystem
  * picks up references to things that did not exist during its own build.
  */
-const subsystems: Subsystem[] = [input, cameraRig, race, items, ...karts]
+// `PlainFactory` permits an async construction; `createHud` is synchronous, but
+// the root must not assume that of any factory.
+const subsystems: Subsystem[] = [input, cameraRig, race, items, ...karts, await hud]
 for (const s of subsystems) await s.build(ctx)
 for (const s of subsystems) s.link?.(services, ctx)
 
@@ -709,6 +747,7 @@ const loop = createLoop({
      * camera bug with no owner. `vantage()` parks the rig deliberately instead.
      */
     for (const s of subsystems) s.lateUpdate?.(SIMULATION_STEP, ctx)
+    for (let i = 0; i < kartModels.length; i++) kartModels[i]!.update(karts[i]!.state, SIMULATION_STEP)
     if (detachedVantage) applyVantage(detachedVantage)
     sky.mesh.position.copy(camera.position)
 
@@ -728,6 +767,7 @@ const loop = createLoop({
   },
 })
 
+loopRef = loop
 loop.start()
 
 // ---------------------------------------------------------------------------
@@ -893,6 +933,11 @@ const harness: HarnessAPI = {
       track.racingLine(options.t) + (options.lateral ?? 0),
       options.speed ?? 0,
     )
+    // Every driver's internal state now refers to a world that no longer exists
+    // — a pursuit controller carrying a stale previous position and yaw rate
+    // across a teleport produces a first command with no relationship to where
+    // the kart actually is.
+    for (const d of drivers) d.ai.reset()
     scriptedInput = { ...idleFrame }
     drivers[playerIndex]!.mode = 'scripted'
     await loop.stepTicks(1)

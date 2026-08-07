@@ -100,14 +100,52 @@ export function createLoop(cb: LoopCallbacks): Loop {
       if (!paused) accumulator = 0
     },
     async stepTicks(count: number): Promise<void> {
-      for (let i = 0; i < count; i++) {
-        advanceOneTick()
-        clock.alpha = 0
-        cb.lateUpdate(SIMULATION_STEP)
-        // Yield to the compositor so the frame actually presents. Without this
-        // the whole loop collapses into one long task and `readPixels` reads a
-        // frame that was never shown.
-        await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
+      /*
+       * STOP THE LIVE LOOP FIRST. This is the whole correctness of the method.
+       *
+       * The first version just ran its ticks and yielded to rAF between them —
+       * and the ordinary frame loop was still scheduled on that same rAF, still
+       * accumulating wall-clock time, still calling `advanceOneTick` on its own
+       * schedule. Every harness "step N ticks" was therefore N ticks PLUS
+       * however many the live loop got in edgeways, which depended on how long
+       * the machine took.
+       *
+       * That is not a small error. It made the DETERMINISM guarantee in the
+       * contract false for every measurement this project has ever taken: the
+       * steering harness saw repeatability spreads between 0.009 m and 0.138 m
+       * on a bit-identical binary, and the physics fix that finally exposed it
+       * spent its investigation chasing a kart that was being stepped by two
+       * drivers at once.
+       *
+       * Deterministic stepping and a free-running loop cannot both own the
+       * clock. While a harness is stepping, it owns it.
+       */
+      const wasRunning = running
+      if (wasRunning) {
+        running = false
+        if (rafId) cancelAnimationFrame(rafId)
+        rafId = 0
+      }
+
+      try {
+        for (let i = 0; i < count; i++) {
+          advanceOneTick()
+          clock.alpha = 0
+          cb.lateUpdate(SIMULATION_STEP)
+          // Yield to the compositor so the frame actually presents. Without this
+          // the whole loop collapses into one long task and `readPixels` reads a
+          // frame that was never shown.
+          await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
+        }
+      } finally {
+        if (wasRunning) {
+          // Drop the wall-clock debt accrued while stepping, or the loop
+          // fast-forwards through however long the harness took.
+          lastMs = 0
+          accumulator = 0
+          running = true
+          rafId = requestAnimationFrame(frame)
+        }
       }
     },
   }
