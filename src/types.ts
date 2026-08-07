@@ -21,6 +21,7 @@
  */
 
 import type {
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   Object3D,
   PerspectiveCamera,
   Quaternion,
@@ -406,6 +407,21 @@ export interface IKart {
   /** Place on the racing line at `t`, stationary, facing forward, drift and
    *  boost and stun cleared. Checkpoint progress is preserved. */
   respawn(t: number): void
+  /**
+   * Place at an explicit track coordinate, at a given lateral offset from the
+   * centreline, facing along the tangent. Same clearing behaviour as `respawn`.
+   *
+   * This exists for ONE reason and it is worth stating, because a pose setter is
+   * otherwise exactly the kind of surface that invites abuse: without it the
+   * steering-sign gate cannot run. That gate has to place a kart at a known
+   * offset from the racing line and assert which way it moves, and it is the
+   * cheapest available check on the most expensive class of bug this project
+   * has — a sign error that makes the game drive correctly today and breaks
+   * everything the next time either half changes.
+   *
+   * `game/` must not call this. Respawns go through `respawn`.
+   */
+  placeAt(t: number, lateral: Metres, speed?: number): void
 }
 
 // ---------------------------------------------------------------------------
@@ -939,6 +955,16 @@ export interface ResetOptions {
   readonly totalLaps?: number
   /** Default `'referenceAI'` for every kart including the player. */
   readonly drivers?: Readonly<Record<number, DriverMode>>
+  /**
+   * Which way the reference AI drives.
+   *
+   * §10c criterion 1 — "a drifting lap is measurably faster than a clean lap" —
+   * is a CONTROLLED COMPARISON, and without this there is no control.
+   * `DriverMode` has no clean-line reference driver and `setInput` reaches only
+   * the player kart, so the experiment simply could not be run. Defaults to
+   * `'seek'`, which is how the game is meant to be played.
+   */
+  readonly aiDrift?: 'seek' | 'clean'
 }
 
 export interface HarnessAPI {
@@ -965,6 +991,33 @@ export interface HarnessAPI {
    * every subsystem.
    */
   readonly track: ITrack
+
+  /**
+   * The scene root and the live camera.
+   *
+   * `seam-check.mjs` reached the world through `track.group.parent`, which is a
+   * load-bearing accident rather than a contract. And a camera is the
+   * difference between proving the ground is watertight in GEOMETRY and proving
+   * no hole is VISIBLE — which is exactly the class of miss that let the last
+   * one ship. A harness with the camera can unproject the frame and gate on
+   * pixels.
+   */
+  readonly scene: Object3D
+  readonly camera: PerspectiveCamera
+
+  /**
+   * The input frame a driver produced on the last tick, human or AI.
+   *
+   * Without this, the STEERING SIGN rule is UNFALSIFIABLE. An AI that
+   * compensates for an inverted chassis with a second negation drives around
+   * the circuit perfectly; the outcome is correct and the command is wrong, and
+   * nothing downstream can tell the difference. The next change to either sign
+   * then breaks the game and both halves still look right in isolation.
+   *
+   * This exposes the command, so the convention can be tested where it is
+   * actually stated rather than three layers downstream at `wheels[].steerAngle`.
+   */
+  lastInput(kartId: number): Readonly<InputFrame> | null
 
   /**
    * Full deterministic rebuild. Async because changing seed or quality replaces

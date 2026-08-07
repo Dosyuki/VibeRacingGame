@@ -39,17 +39,35 @@ import { createRngFactory } from './core/rng'
 import { readFrameLumaStats, readGLReport } from './core/diagnostics'
 import { detectTier, resolveQuality } from './core/quality'
 import { makeRockSurface } from './render/procedural'
+import { createInput } from './core/input'
+import { createAIDriver, type AIDriver } from './game/ai'
+import { createCameraRig } from './game/camera'
+import { createItems } from './game/items'
+import { createRace } from './game/race'
+import { createKart } from './kart/kart'
 import { buildSky } from './render/sky'
 import { buildRoad } from './world/road'
 import { buildCanyonTerrain } from './world/terrain'
 import { createTrack } from './world/track'
+import { SIMULATION_STEP } from './types'
 import type {
+  BoostSource,
   Ctx,
+  DriverMode,
   FrameStats,
+  GameServices,
   HarnessAPI,
+  IKart,
+  InputFrame,
+  KartIdentity,
+  KartState,
   QualityTier,
+  RaceTelemetry,
   Settings,
+  Subsystem,
+  TrackLocation,
   TrackSample,
+  VantageName,
 } from './types'
 
 const params = new URLSearchParams(location.search)
@@ -292,23 +310,207 @@ scene.add(
 const terrain = buildCanyonTerrain(ctx, track)
 scene.add(terrain.group)
 
-/**
- * The wet road is the signature material of this project, and it taught the
- * first real lesson here: `#14141c` at roughness 0.12 is a MIRROR, not a dark
- * surface. It is not lit by lights — it is lit by what it reflects. With the
- * moon and hemisphere fill in place and nothing to reflect, the ground still
- * measured as pure unpainted black, and the temptation was to relax the
- * detector until the frame passed.
- *
- * The detector was right both times. What the scene was missing is the
- * environment, so here it is: one PMREM pass over the emissive skyline, which
- * is what the neon actually reaches the road through. `render/` replaces this
- * with a real probe; the principle does not change.
+/*
+ * One PMREM pass over the built world, so metal and clearcoat on the karts have
+ * something to reflect. Under a sun key this matters far less than it did when
+ * the road was a mirror lit by nothing, but ART_DIRECTION §5d still puts chrome
+ * trim at roughness 0.18 and it needs a probe.
  */
 const pmrem = new PMREMGenerator(renderer)
-const envTarget = pmrem.fromScene(scene, 0, 0.1, 400)
+const envTarget = pmrem.fromScene(scene, 0, 1, 1200)
 scene.environment = envTarget.texture
 pmrem.dispose()
+
+// ---------------------------------------------------------------------------
+// THE FIELD
+// ---------------------------------------------------------------------------
+/*
+ * Eight karts, and the wiring that turns six independently-written subsystems
+ * into a race.
+ *
+ * ART_DIRECTION §5d: livery colours come from the ENVIRONMENT bands (hue 8-43
+ * and 205-228) and never from the reserved gameplay band, so that no kart can
+ * ever be mistaken at a glance for a drift signal.
+ */
+const LIVERIES: readonly [number, number][] = [
+  [0xc9764a, 0x3a2a24],
+  [0x3f77c4, 0x1b2c46],
+  [0xe3c893, 0x6b5c4e],
+  [0x8f4a33, 0x2a1a14],
+  [0x86b4e8, 0x2f4560],
+  [0xd9a068, 0x4e3a30],
+  [0x7d3529, 0x24120e],
+  [0xb9c9d8, 0x4a5560],
+]
+
+const PLAYER_KART_ID = 0
+
+const identities: KartIdentity[] = LIVERIES.map((colours, i) => ({
+  id: i,
+  isPlayer: i === PLAYER_KART_ID,
+  displayName: `Racer ${i + 1}`,
+  primaryColor: colours[0],
+  secondaryColor: colours[1],
+  liverySeed: 1000 + i * 7919,
+}))
+
+const input = createInput(ctx)
+const cameraRig = createCameraRig(ctx)
+const race = createRace(ctx)
+const items = createItems(ctx)
+
+const karts: (IKart & Subsystem)[] = identities.map((identity, i) => {
+  const slot = track.startGrid[i % track.startGrid.length]!
+  return createKart(ctx, identity, slot)
+})
+for (const kart of karts) scene.add(kart.modelRoot)
+
+const services: GameServices = {
+  track,
+  input,
+  race,
+  items,
+  camera: cameraRig,
+  karts,
+  identities,
+  playerKartId: PLAYER_KART_ID,
+  kartById: (id: number) => karts.find((k) => k.identity.id === id) ?? null,
+}
+
+/*
+ * Lifecycle, exactly as the contract's Composition section lays it out: every
+ * `build` resolves before any `link` runs, because `link` is where a subsystem
+ * picks up references to things that did not exist during its own build.
+ */
+const subsystems: Subsystem[] = [input, cameraRig, race, items, ...karts]
+for (const s of subsystems) await s.build(ctx)
+for (const s of subsystems) s.link?.(services, ctx)
+
+/*
+ * Drivers. The reference AI is a MEASURING INSTRUMENT as much as an opponent —
+ * ART_DIRECTION §10c is graded with it — so the composition root owns the
+ * bridge between `DriverMode` and the driver's own mode, and `aiDrift` selects
+ * clean-line versus drift-seeking for the criterion-1 benchmark.
+ */
+type DriverSlot = { mode: DriverMode; ai: AIDriver }
+let aiDrift: 'seek' | 'clean' = 'seek'
+const drivers: DriverSlot[] = karts.map((kart) => ({
+  mode: kart.identity.isPlayer ? 'human' : 'referenceAI',
+  ai: createAIDriver(ctx, track, kart, { mode: 'drift' }),
+}))
+
+/** The frame each driver produced last tick, for `HarnessAPI.lastInput`. */
+const lastFrames: InputFrame[] = karts.map(() => ({
+  steer: 0,
+  throttle: 0,
+  brake: 0,
+  drift: false,
+  useItem: false,
+  look: 0,
+}))
+
+/** Scripted override for the player, set by `HarnessAPI.setInput`. */
+let scriptedInput: InputFrame | null = null
+
+/*
+ * TELEMETRY.
+ *
+ * `RaceTelemetry` lives on `HarnessAPI`, not on `IRace`, and this is why: the
+ * counters it needs are spread across four subsystems. Drift attempts and tiers
+ * come from `kart/` via events, respawns and wall hits from `game/`, lap times
+ * from the standings, and position from the track. Nobody but the composition
+ * root can see all of them, and asking one subsystem to collect the others'
+ * numbers would be exactly the cross-subsystem coupling the contract exists to
+ * prevent.
+ *
+ * It accumulates from the event bus, which is also a live check that the events
+ * are actually being emitted — a kart that drifts without emitting `drift:start`
+ * shows up here as a ladder that never fires, and §10c criterion 2 is what
+ * catches it.
+ */
+interface Counters {
+  driftAttempts: number
+  driftReleases: [number, number, number, number]
+  boostSecondsBySource: Record<BoostSource, number>
+  respawns: number
+  wallHits: number
+  bestProgress: number
+  ticksWithoutProgress: number
+}
+
+function newCounters(): Counters {
+  return {
+    driftAttempts: 0,
+    driftReleases: [0, 0, 0, 0],
+    boostSecondsBySource: { none: 0, drift: 0, pad: 0, item: 0, slipstream: 0 },
+    respawns: 0,
+    wallHits: 0,
+    bestProgress: -Infinity,
+    ticksWithoutProgress: 0,
+  }
+}
+
+const counters: Counters[] = karts.map(newCounters)
+let telemetrySinceTick = 0
+
+function countersFor(kartId: number): Counters | null {
+  const i = karts.findIndex((k) => k.identity.id === kartId)
+  return i < 0 ? null : counters[i]!
+}
+
+events.on('drift:start', (p) => {
+  const c = countersFor(p.kartId)
+  if (c) c.driftAttempts++
+})
+events.on('drift:release', (p) => {
+  const c = countersFor(p.kartId)
+  if (c) c.driftReleases[p.tier]++
+})
+events.on('boost:start', (p) => {
+  const c = countersFor(p.kartId)
+  if (c) c.boostSecondsBySource[p.source] += p.seconds
+})
+events.on('kart:respawn', (p) => {
+  const c = countersFor(p.kartId)
+  if (c) c.respawns++
+})
+events.on('kart:wall', (p) => {
+  const c = countersFor(p.kartId)
+  if (c) c.wallHits++
+})
+
+const telemetryLocation: TrackLocation = {
+  t: 0,
+  lateral: 0,
+  height: 0,
+  onTrack: true,
+  checkpointIndex: 0,
+}
+
+const idleFrame: InputFrame = {
+  steer: 0,
+  throttle: 0,
+  brake: 0,
+  drift: false,
+  useItem: false,
+  look: 0,
+}
+
+function driverFrame(index: number, step: number): Readonly<InputFrame> {
+  const slot = drivers[index]!
+  switch (slot.mode) {
+    case 'human':
+      return scriptedInput ?? input.frame
+    case 'scripted':
+      return scriptedInput ?? idleFrame
+    case 'referenceAI':
+      slot.ai.mode = aiDrift === 'clean' ? 'clean' : 'drift'
+      return slot.ai.step(step)
+    case 'idle':
+    default:
+      return idleFrame
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Frame loop
@@ -353,7 +555,6 @@ window.addEventListener('resize', resize)
 resize()
 
 const cameraPath = new Vector3()
-const lookTarget = new Vector3()
 
 // Caller-owned TrackSample instances. `sample` writes into these and returns
 // them; the contract makes that the caller's job precisely so the hot path
@@ -370,11 +571,114 @@ function makeSample(): TrackSample {
   }
 }
 const camHere = makeSample()
-const camAhead = makeSample()
+
+/*
+ * THE VANTAGES — ART_DIRECTION §11.
+ *
+ * Ten fixed camera positions, so a score from round 7 is comparable with one
+ * from round 3. They were the last thing standing between `energy-check.mjs`
+ * and covering anything: it has reported "10/10 vantages PENDING" every run
+ * since it was written, and a gate covering nothing prints the same green as a
+ * gate that passed.
+ *
+ * `t` values come from §1's section table. Each is placed on the racing line so
+ * the shot is what a driver actually sees, not an aerial nobody will ever look
+ * at.
+ */
+interface Vantage {
+  readonly t: number
+  /** Metres above the road surface. */
+  readonly height: number
+  /** Arc-length fraction to look ahead by. Negative looks back. */
+  readonly ahead: number
+  /** Extra lateral offset from the racing line, metres. */
+  readonly lateral?: number
+}
+
+const VANTAGES: Readonly<Record<VantageName, Vantage>> = {
+  grid: { t: 0.015, height: 1.9, ahead: 0.012 },
+  'dune-sweep': { t: 0.17, height: 2.4, ahead: 0.02 },
+  'strata-wall': { t: 0.29, height: 2.2, ahead: 0.014 },
+  'slot-narrows': { t: 0.4, height: 2.1, ahead: 0.012 },
+  'mesa-crest': { t: 0.53, height: 3.2, ahead: 0.03 },
+  'banked-wall': { t: 0.63, height: 2.3, ahead: 0.016 },
+  'wash-descent': { t: 0.76, height: 2.6, ahead: 0.022 },
+  'arch-interior': { t: 0.9, height: 2.2, ahead: 0.012 },
+  'arch-exit': { t: 0.985, height: 2.2, ahead: 0.014 },
+  'drift-tier3': { t: 0.3, height: 1.8, ahead: 0.01, lateral: 2.5 },
+}
+
+let detachedVantage: Vantage | null = null
+const vantageAhead = makeSample()
+const vantageLook = new Vector3()
+
+function applyVantage(v: Vantage): void {
+  track.sample(v.t, camHere)
+  track.sample(v.t + v.ahead, vantageAhead)
+
+  cameraPath
+    .copy(camHere.position)
+    .addScaledVector(camHere.right, track.racingLine(v.t) + (v.lateral ?? 0))
+    .addScaledVector(camHere.normal, v.height)
+  camera.position.copy(cameraPath)
+  camera.up.copy(camHere.normal)
+
+  vantageLook
+    .copy(vantageAhead.position)
+    .addScaledVector(vantageAhead.right, track.racingLine(v.t + v.ahead))
+    .addScaledVector(vantageAhead.normal, v.height * 0.6)
+  camera.lookAt(vantageLook)
+}
 
 const loop = createLoop({
-  fixedUpdate(): void {
-    // Nothing deterministic to advance yet. Subsystems land here from round 1.
+  /*
+   * The order here IS the contract, stated in its Composition section:
+   *   input -> kart physics -> race -> items -> camera
+   *
+   * It is fixed by the root and not negotiable per subsystem, because a
+   * subsystem that wants a different order is describing a data dependency it
+   * should be reading from `GameServices` instead. Race after physics because
+   * standings are computed from where the karts ended up; camera last because
+   * it follows a kart that has already moved.
+   */
+  fixedUpdate(step: number): void {
+    input.sample(loop.clock)
+
+    for (let i = 0; i < karts.length; i++) {
+      const frame = driverFrame(i, step)
+      // Record the COMMAND, not the outcome. This is what makes the steering
+      // sign convention falsifiable — see HarnessAPI.lastInput.
+      const record = lastFrames[i]!
+      record.steer = frame.steer
+      record.throttle = frame.throttle
+      record.brake = frame.brake
+      record.drift = frame.drift
+      record.useItem = frame.useItem
+      record.look = frame.look
+      karts[i]!.step(step, frame)
+    }
+
+    race.step(step)
+    items.step(step)
+
+    // Stall detection. `Standing.progress` is NOT monotonic — it decreases on a
+    // reverse or a respawn — which is exactly why the contract carries
+    // `bestProgress` separately and says it exists only for this.
+    for (let i = 0; i < karts.length; i++) {
+      const standing = race.standings.find((s2) => s2.kartId === karts[i]!.identity.id)
+      const c = counters[i]!
+      const best = standing?.bestProgress ?? -Infinity
+      if (best > c.bestProgress) {
+        c.bestProgress = best
+        c.ticksWithoutProgress = 0
+      } else {
+        c.ticksWithoutProgress++
+      }
+    }
+
+    const player = services.kartById(PLAYER_KART_ID)
+    if (player) cameraRig.follow(player, step)
+    for (const s of subsystems) s.fixedUpdate?.(step, ctx)
   },
   lateUpdate(): void {
     if (sampling) {
@@ -396,41 +700,22 @@ const loop = createLoop({
     }
 
     /*
-     * The camera now drives the actual circuit rather than a straight line.
+     * The camera rig owns the transform now — the scripted dolly that used to
+     * live here is gone.
      *
-     * It rides the racing line at a fixed speed, looking a fixed arc-length
-     * ahead. That look-ahead is what makes a corner readable: aiming at a point
-     * a fixed distance down the road is roughly what a driver does, and it is
-     * also the cheapest possible check that the spline's frame is coherent —
-     * a track whose tangent or normal quietly goes wrong makes this camera
-     * lurch, and no still frame would show it.
-     *
-     * Driven by the simulation clock, never the wall clock, so a screenshot at
-     * tick N is the same image on every machine.
+     * `ICameraRig` is explicit that exactly one subsystem writes the camera and
+     * everything else contributes an additive decaying channel. A dolly here
+     * would be a second writer, and last-writer-wins between two of them is a
+     * camera bug with no owner. `vantage()` parks the rig deliberately instead.
      */
-    const LAP_SECONDS = 68
-    const t = (loop.clock.simTime / LAP_SECONDS) % 1
-    track.sample(t, camHere)
-    track.sample(t + 0.018, camAhead)
-
-    const lateral = track.racingLine(t)
-    cameraPath
-      .copy(camHere.position)
-      .addScaledVector(camHere.right, lateral)
-      .addScaledVector(camHere.normal, 2.4)
-    camera.position.copy(cameraPath)
-    camera.up.copy(camHere.normal)
-    lookTarget
-      .copy(camAhead.position)
-      .addScaledVector(camAhead.right, track.racingLine(t + 0.018))
-      .addScaledVector(camAhead.normal, 1.6)
-    camera.lookAt(lookTarget)
+    for (const s of subsystems) s.lateUpdate?.(SIMULATION_STEP, ctx)
+    if (detachedVantage) applyVantage(detachedVantage)
     sky.mesh.position.copy(camera.position)
 
     // The shadow frustum follows the camera; a fixed one centred on the origin
-    // loses every shadow the moment the dolly leaves the middle of the map.
-    sun.position.copy(cameraPath).addScaledVector(SUN_DIR, 240)
-    sun.target.position.copy(cameraPath)
+    // loses every shadow the moment the camera leaves the middle of the map.
+    sun.position.copy(camera.position).addScaledVector(SUN_DIR, 240)
+    sun.target.position.copy(camera.position)
     sun.target.updateMatrixWorld()
 
     renderer.render(scene, camera)
@@ -459,25 +744,213 @@ function notYet(what: string): never {
 const harness: HarnessAPI = {
   version: 2,
   ready,
-  get playerKartId(): number {
-    return notYet('playerKartId')
-  },
+  playerKartId: PLAYER_KART_ID,
 
   get track() {
     return track
   },
+  get scene() {
+    return scene
+  },
+  get camera() {
+    return camera
+  },
 
-  resetRace: () => notYet('resetRace'),
-  startRace: () => notYet('startRace'),
-  setDriver: () => notYet('setDriver'),
-  vantage: () => notYet('vantage'),
+  lastInput(kartId: number): Readonly<InputFrame> | null {
+    const i = karts.findIndex((k) => k.identity.id === kartId)
+    return i < 0 ? null : lastFrames[i]!
+  },
+
+  async resetRace(options): Promise<void> {
+    if (options?.totalLaps !== undefined && options.totalLaps !== race.totalLaps) {
+      // A lap count baked in at construction cannot be changed without a
+      // rebuild, and silently ignoring the request would make every gate that
+      // asks for three laps measure whatever the default was.
+      notYet(`resetRace({ totalLaps }) — race.totalLaps is fixed at ${race.totalLaps}`)
+    }
+    if (options?.seed !== undefined && options.seed !== seed) {
+      notYet('resetRace({ seed }) — a new seed needs a full world rebuild')
+    }
+    aiDrift = options?.aiDrift ?? 'seek'
+    for (let i = 0; i < drivers.length; i++) {
+      const mode = options?.drivers?.[karts[i]!.identity.id]
+      drivers[i]!.mode = mode ?? (karts[i]!.identity.isPlayer ? 'referenceAI' : 'referenceAI')
+      drivers[i]!.ai.reset()
+    }
+    scriptedInput = null
+    detachedVantage = null
+    race.reset()
+    items.reset()
+
+    // Put every kart back on its grid slot and zero the counters. Without this
+    // a "reset" leaves the field wherever it was and the next run's telemetry
+    // carries the previous run's drift attempts — a controlled comparison that
+    // is not controlled.
+    for (let i = 0; i < karts.length; i++) {
+      karts[i]!.respawn(track.startGrid[i % track.startGrid.length]!.t)
+      counters[i] = newCounters()
+    }
+    telemetrySinceTick = loop.clock.tick
+    // Present one frame so the caller is looking at the reset world, not the
+    // one before it.
+    await loop.stepTicks(1)
+  },
+
+  startRace(): void {
+    race.start()
+  },
+
+  setDriver(kartId: number, mode: DriverMode): void {
+    const i = karts.findIndex((k) => k.identity.id === kartId)
+    if (i < 0) throw new Error(`[harness] setDriver: no kart ${kartId}`)
+    drivers[i]!.mode = mode
+  },
+
+  async vantage(name): Promise<void> {
+    const v = VANTAGES[name]
+    // Throw on an unknown name rather than silently no-op: a misspelling would
+    // otherwise invalidate an entire review run and read as a pass.
+    if (!v) throw new Error(`[harness] vantage: unknown name "${name}"`)
+    detachedVantage = v
+    await loop.stepTicks(2)
+  },
+
   loadScenario: () => notYet('loadScenario'),
-  setInput: () => notYet('setInput'),
-  releaseInput: () => notYet('releaseInput'),
+
+  /** PERSISTENT MERGE, per the contract: omitted fields keep their last value. */
+  setInput(frame): void {
+    const base = scriptedInput ?? { ...idleFrame }
+    scriptedInput = { ...base, ...frame }
+    const i = karts.findIndex((k) => k.identity.isPlayer)
+    if (i >= 0 && drivers[i]!.mode !== 'scripted') drivers[i]!.mode = 'scripted'
+  },
+
+  releaseInput(): void {
+    scriptedInput = null
+    const i = karts.findIndex((k) => k.identity.isPlayer)
+    if (i >= 0) drivers[i]!.mode = 'human'
+  },
+
   injectInput: () => notYet('injectInput'),
-  seek: () => notYet('seek'),
-  telemetry: () => notYet('telemetry'),
-  kartSnapshot: () => notYet('kartSnapshot'),
+
+  /*
+   * `IKart` exposes no position or velocity setter, so this reaches the
+   * requested state by DRIVING to it rather than by teleporting into it.
+   *
+   * That is slower and it is also more honest: a kart placed at 18 m/s by
+   * assignment has whatever suspension compression and tyre load the assignment
+   * happened to leave behind, and a harness measuring steering response off
+   * that is measuring a state the physics never produces. Accelerating under
+   * full throttle at a fixed timestep is deterministic and lands the kart in a
+   * state the game can actually be in.
+   *
+   * Lateral offset still has no route. Reported as unavailable rather than
+   * approximated, because a seek that silently lands somewhere else makes every
+   * measurement taken from it wrong in a way nothing reports.
+   */
+  async seek(options): Promise<void> {
+    const kart = services.kartById(PLAYER_KART_ID)
+    if (!kart) notYet('seek — no player kart')
+
+    /*
+     * A seek sets up a CONTROLLED EXPERIMENT, so it has to control the whole
+     * world and not just the one kart.
+     *
+     * The first version placed the player and left the other seven driving.
+     * `steer-test.mjs` caught it immediately on its repeatability check — two
+     * identical runs produced different numbers, because run two started from
+     * wherever run one's AI field had got to. Every measurement downstream of a
+     * non-repeatable initial condition is noise wearing a decimal point.
+     *
+     * It also forced the player into scripted mode and never restored it, which
+     * is why the AI-command check read a commanded steer of exactly zero: the
+     * AI was not driving anything.
+     */
+    const playerIndex = karts.findIndex((k) => k.identity.isPlayer)
+    const playerMode = drivers[playerIndex]!.mode
+
+    /*
+     * Scatter the field around the lap and idle it — do NOT park it on the grid.
+     *
+     * Parking on the grid was the second version, and it was worse than leaving
+     * the field alone: the grid sits at t ≈ 0.98 and the flattest straight the
+     * harness picks for a steering test is t ≈ 0.007. Those are the same
+     * fifteen metres of road. Seven idle karts were being teleported directly
+     * on top of the kart under test, and the repeatability spread went to 24 m.
+     *
+     * Evenly spaced and idle keeps the physics running on a full field — which
+     * is the state a real race is in — while guaranteeing nothing is anywhere
+     * near the measurement.
+     */
+    for (let k = 0; k < karts.length; k++) {
+      if (k === playerIndex) continue
+      karts[k]!.respawn((options.t + k / karts.length) % 1)
+      drivers[k]!.mode = 'idle'
+    }
+
+    kart.placeAt(
+      options.t,
+      track.racingLine(options.t) + (options.lateral ?? 0),
+      options.speed ?? 0,
+    )
+    scriptedInput = { ...idleFrame }
+    drivers[playerIndex]!.mode = 'scripted'
+    await loop.stepTicks(1)
+
+    /*
+     * Restore the PLAYER's driver and leave the rest idle.
+     *
+     * A seek that silently leaves the player scripted makes the next AI
+     * measurement read a commanded steer of exactly 0.0000 against a perfectly
+     * working driver — which is how the AI-command check first came back red.
+     * The field stays idle on purpose: a seek is a controlled experiment and
+     * seven cars driving through it is not a control.
+     */
+    drivers[playerIndex]!.mode = playerMode
+    scriptedInput = playerMode === 'scripted' ? scriptedInput : null
+  },
+
+  telemetry(): RaceTelemetry {
+    const standings = race.standings
+    return {
+      sinceTick: telemetrySinceTick,
+      tick: loop.clock.tick,
+      phase: race.phase,
+      clock: race.clock,
+      karts: karts.map((kart, i) => {
+        const c = counters[i]!
+        const standing = standings.find((s) => s.kartId === kart.identity.id)
+        track.locate(kart.state.position, telemetryLocation)
+        const lapTimes = standing ? standing.lapTimes.slice() : []
+        return {
+          kartId: kart.identity.id,
+          driftAttempts: c.driftAttempts,
+          driftReleases: [
+            c.driftReleases[0],
+            c.driftReleases[1],
+            c.driftReleases[2],
+            c.driftReleases[3],
+          ] as const,
+          boostSecondsBySource: { ...c.boostSecondsBySource },
+          respawns: c.respawns,
+          wallHits: c.wallHits,
+          lapTimes,
+          bestLap: lapTimes.length > 0 ? Math.min(...lapTimes) : null,
+          finished: standing?.finished ?? false,
+          completedLaps: standing?.completedLaps ?? 0,
+          lastCheckpoint: telemetryLocation.checkpointIndex,
+          t: telemetryLocation.t,
+          lateral: telemetryLocation.lateral,
+          ticksWithoutProgress: c.ticksWithoutProgress,
+        }
+      }),
+    }
+  },
+
+  kartSnapshot(kartId: number): Readonly<KartState> | null {
+    const kart = services.kartById(kartId)
+    return kart ? kart.state : null
+  },
 
   stepTicks: (count: number) => loop.stepTicks(count),
 

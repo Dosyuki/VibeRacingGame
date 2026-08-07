@@ -605,20 +605,44 @@ export const createKart: KartFactory = (
     },
 
     respawn(t: number): void {
+      kart.placeAt(t, track === null ? 0 : track.racingLine(t))
+    },
+
+    /**
+     * The pose setter behind `respawn`, and behind the steering-sign gate.
+     *
+     * These were one function; splitting them IS the change. A harness has to
+     * place a kart somewhere other than the ideal line to ask which way it moves
+     * from there, and without that the sign convention is untestable — see the
+     * note on `IKart.placeAt` in the contract.
+     */
+    placeAt(t: number, lateral: number, speed = 0): void {
       if (track === null) return
       track.sample(t, respawnSample)
       position
         .copy(respawnSample.position)
-        .addScaledVector(respawnSample.right, track.racingLine(t))
+        .addScaledVector(respawnSample.right, lateral)
         .addScaledVector(respawnSample.normal, RIDE_HEIGHT)
       backward.copy(respawnSample.tangent).multiplyScalar(-1)
       basis.makeBasis(respawnSample.right, respawnSample.normal, backward)
       quaternion.setFromRotationMatrix(basis).normalize()
-      velocity.set(0, 0, 0)
-      wheelOmega.fill(0)
+      /*
+       * Velocity is SET, not driven up to.
+       *
+       * The composition root originally reached a target speed by holding full
+       * throttle and stepping the simulation, which is defensible — a kart
+       * placed by assignment carries whatever tyre load the assignment left
+       * behind. But it moved the kart tens of metres down the road before the
+       * measurement even started, so `seek(t, speed)` did not leave the kart at
+       * `t`, and every steering measurement taken from it was taken somewhere
+       * else. Setting the state is the lesser evil, and the wheels are spun to
+       * match so the tyre model does not see a locked-wheel slide on tick one.
+       */
+      velocity.copy(respawnSample.tangent).multiplyScalar(speed)
+      wheelOmega.fill(speed / WHEEL_RADIUS)
       previousRayLength.fill(REST_LENGTH)
       yawRate = 0
-      state.speed = 0
+      state.speed = speed
       state.grounded = true
       state.stunTime = 0
       previousDriftButton = false

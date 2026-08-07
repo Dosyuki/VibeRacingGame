@@ -50,8 +50,8 @@
  *
  * Draw-call budget (§9 ceiling is 250 for the whole game): this file spends
  * FIVE. Road, two kerb colours, boost pads, cattle grid. Everything repeated is
- * an instance, and the start-line blocks ride on the kerb meshes rather than
- * asking for a sixth.
+ * an instance, the three boost pads are merged into one buffer, and the
+ * start-line blocks ride on the kerb meshes rather than asking for a sixth.
  *
  * Albedo variation lives in VERTEX COLOURS, not in extra materials. §5a wants
  * rubber lay-down along the true optimal line, sand drift creeping from both
@@ -59,16 +59,22 @@
  * more draw calls and three seams. As vertex colour it is free and it blends.
  */
 
+import { createNoise2D } from 'simplex-noise'
 import {
   BoxGeometry,
   BufferAttribute,
   BufferGeometry,
+  ClampToEdgeWrapping,
   Color,
+  DataTexture,
   InstancedMesh,
+  LinearFilter,
+  LinearMipmapLinearFilter,
   Matrix4,
   Mesh,
   MeshStandardMaterial,
   Object3D,
+  RGBAFormat,
   SRGBColorSpace,
   Vector2,
   Vector3,
@@ -94,9 +100,66 @@ const COL_LINE = 0xd9cbb4 // lane edge line — worn, never pure white
 const COL_KERB_DARK = 0x241f22 // kerb stripe A
 const COL_KERB_LIGHT = 0xf2ead6 // kerb stripe B
 const COL_GRATE = 0x6b6560 // culvert grate — a warm grey, never neutral
-/** §4b reserved gameplay band. Boost is gameplay feedback, so this is legal
- *  here and illegal on every environment surface in this file. */
-const COL_BOOST = 0x00ffa3
+
+// --- ART_DIRECTION §4b reserved gameplay band ------------------------------
+/*
+ * THE BOOST PAD IS NOT A DRIFT SPARK, AND IT MUST NOT BE THE SAME COLOUR AS ONE
+ *
+ * This constant was `#00ffa3`. That is not "a green in the reserved band" — it
+ * is the EXACT hex §4b assigns to drift tier 1: the sparks off both rear wheels
+ * and the kart's rim light. The band exists so that one glance at a hue means
+ * exactly one thing, and a stationary rectangle painted on the road wearing the
+ * same hex as a live signal fired from the kart teaches the player two meanings
+ * for one colour. The first person to play it asked "what is this green thing?",
+ * which is the entire bug in five words.
+ *
+ * §4b's table has no boost-pad row. That omission is the root cause; the row
+ * belongs in the spec, not only here.
+ *
+ * WHY 190°, AND WHY NOT SOMEWHERE ELSE IN THE BAND
+ *
+ * The band is hue 155°–320° at saturation ≥ 0.85, and four things already live
+ * inside it:
+ *
+ *   drift tier 1   158°   #00ffa3
+ *   drift tier 2   274°   #b24bff
+ *   drift tier 3   314°   #ff2fd0
+ *   the SKY        205°–228°   #b9c9d8 / #7fb0e0 / #3f77c4, up to saturation
+ *                  0.61 — §3a's own palette, and §4b's table tracks hue
+ *                  separation from it for every tier
+ *
+ * That leaves two real windows: 158→205 and 228→274. Both are ~46° wide, so the
+ * best achievable clearance from everything is about 23° either way, and the
+ * choice is decided by LUMINANCE, which is the other axis §4b's ladder escalates
+ * on. The 228→274 window is blue-violet: saturation ≥ 0.85 there forces a
+ * blue-dominant colour with low intrinsic luminance, and a dark blue plate on
+ * dark tarmac (§3b, luma 0.27) inside a shaded canyon is a pad you cannot see.
+ * The 158→205 window is cyan, whose green channel carries most of the luma, so
+ * it reads against tarmac at distance and in shade. Cyan it is.
+ *
+ * `#00c8f0` — hue 190.0°, HSL saturation 1.00, lightness 0.47. Separation:
+ *   32° from tier 1, 84° from tier 2, 124° from tier 3, 166° from sunlit sand
+ *   (40°) — very nearly its complement, which is why it reads on a road at all.
+ *
+ * 32° from tier 1 is under the 40° that separates tier 2 from tier 3, and it is
+ * the price of the sky sitting in the middle of the band. It is paid back on
+ * every other axis: this is a large static ground plane with a black outline and
+ * chevrons, held at emissive 0.5 with a mask, against small additive high-luma
+ * sparks that move with the kart. Green-cyan and cyan-blue at those two
+ * treatments are not confusable; two objects sharing a hex are.
+ */
+/** The signal itself: chevrons, edge rails, and the emissive tint. */
+const COL_BOOST = 0x00c8f0
+/** The painted deck between the chevrons. Same hue, mid value — brighter than
+ *  tarmac so the pad reads as paint ON the road rather than a hole THROUGH it,
+ *  which is what the flat near-white version was first reported as. */
+const COL_BOOST_DECK = 0x1d6b7d
+/** The outline. Every marking on a real road has one; it is what stops a bright
+ *  shape from dissolving into whatever it is painted on. §3 bans pure black. */
+const COL_BOOST_EDGE = 0x0e2026
+/** Leading-bar core. One value up the ladder, and the only near-white on the
+ *  pad — §4b keeps near-white cores for tier 3, so this stays a cyan tint. */
+const COL_BOOST_LEAD = 0x5ce3ff
 
 /** Metres of road per texture tile, before the seam snap below. */
 const ROAD_TILE_NOMINAL = 8
@@ -400,6 +463,272 @@ function buildRoadSurface(track: ITrack, opts: RoadBuildOptions): Mesh {
 }
 
 // ---------------------------------------------------------------------------
+// The boost pad decal
+// ---------------------------------------------------------------------------
+
+/*
+ * A BOOST PAD HAS TO SAY "DRIVE THROUGH HERE, POINTING THIS WAY".
+ *
+ * The old one was a flat untextured quad of one saturated colour. At the
+ * vanishing point of a dark canyon that is not a surface, it is a hole — which
+ * is literally how it was first reported. A flat rectangle carries no direction,
+ * no scale and no edge, so nothing about it says which way to cross it or where
+ * it begins.
+ *
+ * So the pad is drawn from a generated decal with four parts, and each one is
+ * doing a job:
+ *
+ *   chevrons     direction. Arrowheads whose apex leads and whose legs trail
+ *                back toward both edges, so the arrow points the way you drive
+ *                from every angle you can see it from.
+ *   edge rails   width. Two continuous bright lines say "the fast bit is
+ *                between these", which a field of arrows alone does not.
+ *   outline      contrast. A dark border all the way round. Without it the pad
+ *                shares a boundary with the tarmac and dissolves into it at the
+ *                distance you actually need to read it from.
+ *   end bars     a solid bright bar at the leading edge and a thin dim one at
+ *                the trailing edge. Asymmetric ON PURPOSE: a symmetric pad tells
+ *                you where it is but not which end you are approaching.
+ *
+ * All four are baked into one 2-channel decal instead of geometry, because
+ * geometry crisp enough for a chevron edge costs vertices per pad and still
+ * smears under vertex-colour interpolation, whereas a texel edge is a texel
+ * edge. There are no image files in this repository, so the decal is generated —
+ * see `makeBoostDecal`.
+ *
+ * ON THE UV RULE AT THE TOP OF THIS FILE. The road gets UVs in metres because it
+ * is 900 m of unbounded surface whose width changes, and a normalised UV there
+ * is the 50:1 texel stretch that comment exists to prevent. A pad is the
+ * opposite kind of thing: a discrete 18–22 m OBJECT with a start, an end and a
+ * fixed number of arrows on it. Its UVs are 0..1 across the object, so every pad
+ * carries the same eight chevrons and the same end bars regardless of how long
+ * or wide `surfaceAt` says it is, and nothing has to meet itself at a seam. The
+ * decal is 1:4, which puts the texels within a few percent of square on the pads
+ * this circuit actually has.
+ */
+
+/** Decal layout, in pad space. `q` is |lateral| as a fraction of the pad's half
+ *  width; `v` runs 0 at the leading edge to 1 at the trailing edge. */
+const PAD_OUTLINE_Q = 0.945
+const PAD_RAIL_Q = 0.855
+const PAD_OUTLINE_V = 0.008
+const PAD_LEAD_V0 = 0.008
+const PAD_LEAD_V1 = 0.055
+const PAD_TRAIL_V0 = 0.962
+const PAD_TRAIL_V1 = 0.992
+const PAD_CHEV_V0 = 0.175
+const PAD_CHEV_V1 = 0.95
+const PAD_CHEV_COUNT = 6
+/**
+ * How far a chevron's legs trail back by the time they reach the rail.
+ *
+ * MEASURED, not guessed. The first pass used 0.052 — about 25° of sweep in plan,
+ * which is a perfectly good arrow when you are standing on the pad and a row of
+ * ladder rungs from 18 m back, because a ground plane seen from 2.4 m up
+ * compresses the along-road axis by roughly 8:1 at that distance and the sweep
+ * goes with it. 0.115 of ~20 m against a ~2.1 m half width is 48° in plan, which
+ * still reads as an arrow after that compression. It was legible in the frame at
+ * 45 m, which is where the player needs the answer.
+ */
+const PAD_CHEV_SWEEP = 0.115
+/** Fraction of a chevron period that is ink. */
+const PAD_CHEV_DUTY = 0.44
+
+/*
+ * §9a caps highlight pixels (luma ≥ 0.95) at 2% of frame and clipping at 0.05%.
+ * The old pad ran emissiveIntensity 1.4 across ITS ENTIRE AREA, on a saturated
+ * near-white colour, for three stretches of a lap. Two things changed:
+ *
+ *   - the intensity came down to 0.5, and
+ *   - it is masked, so the bright part is the chevrons, the rails and the
+ *     leading bar — roughly a quarter of the pad — while the deck sits at 0.13
+ *     and the outline at zero.
+ *
+ * Peak emissive is now 36% of what it was over about a quarter of the area, and
+ * the pad `receiveShadow`s, so it goes dark in shade like the paint it is. It
+ * still lights itself in the arch, where one of the three pads lives with no sun
+ * on it at all: 0.5 against a deep-overhang niche at luma 0.070 is not subtle.
+ * This is a bright painted surface, not a light source.
+ */
+const PAD_EMISSIVE = 0.5
+const PAD_EM_DECK = 0.2
+const PAD_EM_RAIL = 0.86
+const PAD_EM_CHEV = 1.0
+const PAD_EM_LEAD = 1.0
+const PAD_EM_TRAIL = 0.42
+
+interface BoostDecal {
+  readonly map: DataTexture
+  readonly emissiveMap: DataTexture
+}
+
+/** sRGB byte triple from a palette hex. The decal is authored and blended in
+ *  display space, which is what its sRGB `colorSpace` tag then declares. */
+function srgbBytes(hex: number): readonly [number, number, number] {
+  return [(hex >> 16) & 255, (hex >> 8) & 255, hex & 255]
+}
+
+/** Rising edge at `edge`, `half` wide either side. */
+function band(x: number, lo: number, hi: number, half: number): number {
+  return smoothstep(lo - half, lo + half, x) * (1 - smoothstep(hi - half, hi + half, x))
+}
+
+function padTexture(w: number, h: number, data: Uint8Array, anisotropy: number): DataTexture {
+  const tex = new DataTexture(data, w, h, RGBAFormat)
+  // CLAMPED, not repeating. The outline is the first and last row and column of
+  // the image; a repeating wrap would filter the leading bar into the trailing
+  // one and put a ghost arrow outside the pad.
+  tex.wrapS = ClampToEdgeWrapping
+  tex.wrapT = ClampToEdgeWrapping
+  tex.magFilter = LinearFilter
+  tex.minFilter = LinearMipmapLinearFilter
+  tex.generateMipmaps = true
+  // The pad is a ground plane read at a 12° sun and a chase-camera grazing
+  // angle. Without anisotropy the chevrons mip into a smear at exactly the
+  // distance the player needs them from.
+  tex.anisotropy = anisotropy
+  tex.needsUpdate = true
+  return tex
+}
+
+/**
+ * Generate the pad decal: albedo, and a separate emissive mask.
+ *
+ * Two maps rather than one, because they genuinely disagree. The outline needs
+ * albedo (it is dark paint, and dark paint is visible) and zero emissive (an
+ * outline that glows is not an outline). The deck needs a healthy albedo and
+ * almost no emissive. Sharing one image would force the pad to glow in
+ * proportion to how light it is, which is the flat-sticker look all over again.
+ */
+function makeBoostDecal(width: number, rng: RNG, anisotropy: number): BoostDecal {
+  const height = width * 4
+  const grain = createNoise2D(rng)
+  const fleck = createNoise2D(rng.fork('fleck'))
+
+  const albedo = new Uint8Array(width * height * 4)
+  const emissive = new Uint8Array(width * height * 4)
+
+  const deck = srgbBytes(COL_BOOST_DECK)
+  const signal = srgbBytes(COL_BOOST)
+  const edge = srgbBytes(COL_BOOST_EDGE)
+  const lead = srgbBytes(COL_BOOST_LEAD)
+
+  /*
+   * Antialiasing half-widths: one and a half texels on each axis, CAPPED at a
+   * third of the narrowest feature. Anything narrower crawls when the pad is
+   * moving; anything wider is a soft-edged sticker, which is the thing being
+   * fixed. The cap is what makes `low` survive — at 32 texels across, a plain
+   * 1.5-texel ramp is wider than the 0.055 outline band and dissolves it, so the
+   * one feature holding the pad apart from the tarmac would go missing on
+   * exactly the devices that need the help. Hard edges plus the mip chain are
+   * the right failure there, not mush.
+   *
+   * `q` spans 0..1 over half the texels `u` does, hence the 2x.
+   */
+  const aaV = Math.min(1.5 / height, PAD_OUTLINE_V / 3)
+  const aaQ = Math.min(3.0 / width, (1 - PAD_OUTLINE_Q) / 3)
+  const period = (PAD_CHEV_V1 - PAD_CHEV_V0) / PAD_CHEV_COUNT
+  const aaF = aaV / period
+
+  const rgb = [0, 0, 0]
+
+  for (let y = 0; y < height; y++) {
+    // DataTexture does not flip, so row 0 is v = 0 is the LEADING edge. Getting
+    // that backwards points every arrow on the circuit the wrong way, and it is
+    // not visible in the generated image on its own.
+    const v = (y + 0.5) / height
+    for (let x = 0; x < width; x++) {
+      const u = (x + 0.5) / width
+      const q = Math.abs(u * 2 - 1)
+
+      const mOutline = Math.max(
+        smoothstep(PAD_OUTLINE_Q - aaQ, PAD_OUTLINE_Q + aaQ, q),
+        1 - smoothstep(PAD_OUTLINE_V - aaV, PAD_OUTLINE_V + aaV, v),
+        smoothstep(1 - PAD_OUTLINE_V - aaV, 1 - PAD_OUTLINE_V + aaV, v),
+      )
+      const inside = 1 - mOutline
+      const mRail = smoothstep(PAD_RAIL_Q - aaQ, PAD_RAIL_Q + aaQ, q) * inside
+      const mLead = band(v, PAD_LEAD_V0, PAD_LEAD_V1, aaV) * inside
+      const mTrail = band(v, PAD_TRAIL_V0, PAD_TRAIL_V1, aaV) * inside
+
+      /*
+       * The chevron. `p` shears the pattern coordinate by the lateral distance
+       * from the centreline, so a stripe of constant `p` sits at
+       * `v = p - sweep * q`: furthest forward at the centre, trailing back
+       * toward both edges. That is an arrowhead pointing along +v, which is the
+       * direction of travel. The sign of `sweep` is the whole thing — flip it
+       * and every pad on the circuit points backward.
+       */
+      const p = v + PAD_CHEV_SWEEP * q
+      const f = (((p - PAD_CHEV_V0) / period) % 1 + 1) % 1
+      // Fold to a signed distance from the middle of the ink, so both edges of
+      // the stripe antialias with one smoothstep and neither wraps.
+      const half = PAD_CHEV_DUTY * 0.5
+      const sd = half - Math.abs(f - half)
+      const mChev =
+        smoothstep(-aaF, aaF, sd) *
+        band(p, PAD_CHEV_V0, PAD_CHEV_V1, aaV) *
+        inside *
+        (1 - mRail) *
+        (1 - mLead) *
+        (1 - mTrail)
+
+      rgb[0] = deck[0]
+      rgb[1] = deck[1]
+      rgb[2] = deck[2]
+      let em = PAD_EM_DECK
+
+      const mix = (c: readonly [number, number, number], k: number, e: number): void => {
+        if (k <= 0) return
+        rgb[0] = rgb[0]! + (c[0] - rgb[0]!) * k
+        rgb[1] = rgb[1]! + (c[1] - rgb[1]!) * k
+        rgb[2] = rgb[2]! + (c[2] - rgb[2]!) * k
+        em += (e - em) * k
+      }
+
+      mix(signal, mChev, PAD_EM_CHEV)
+      mix(signal, mRail, PAD_EM_RAIL)
+      mix(lead, mLead, PAD_EM_LEAD)
+      mix(signal, mTrail, PAD_EM_TRAIL)
+      // Outline last: it wins over anything that ran to the border.
+      mix(edge, mOutline, 0)
+
+      /*
+       * §9b: no perfectly uniform region anywhere, and a painted pad is a prime
+       * offender — the deck between two chevrons is otherwise a single exact
+       * value over a couple of square metres. Wear and grit, applied to albedo
+       * and emissive together so the paint looks worn rather than lit unevenly.
+       * Amplitude is small; this is not camouflage.
+       */
+      const wear =
+        grain(u * 6, v * 26) * 0.6 + fleck(u * 27, v * 110) * 0.4
+      const albedoGain = 1 + wear * 0.1
+      const emGain = 1 + wear * 0.14
+
+      const i = (y * width + x) * 4
+      for (let ch = 0; ch < 3; ch++) {
+        albedo[i + ch] = Math.round(Math.min(255, Math.max(0, rgb[ch]! * albedoGain)))
+      }
+      albedo[i + 3] = 255
+      const e = Math.round(Math.min(255, Math.max(0, em * emGain * 255)))
+      emissive[i] = e
+      emissive[i + 1] = e
+      emissive[i + 2] = e
+      emissive[i + 3] = 255
+    }
+  }
+
+  const map = padTexture(width, height, albedo, anisotropy)
+  // Albedo is colour data. The emissive mask is an intensity, but three.js
+  // decodes `emissiveMap` as colour regardless, so both carry the same tag and
+  // PAD_EMISSIVE is tuned against the decoded value rather than the byte.
+  map.colorSpace = SRGBColorSpace
+  const emissiveMap = padTexture(width, height, emissive, anisotropy)
+  emissiveMap.colorSpace = SRGBColorSpace
+  return { map, emissiveMap }
+}
+
+// ---------------------------------------------------------------------------
 // Kerbs, the start line, and the surface overlays
 // ---------------------------------------------------------------------------
 
@@ -416,7 +745,7 @@ interface Placement {
  * and the failure — a boost pad you can see but not trigger, or trigger but not
  * see — is exactly the kind a screenshot review cannot catch.
  */
-function buildInstanced(track: ITrack): Object3D[] {
+function buildInstanced(track: ITrack, opts: RoadBuildOptions): Object3D[] {
   const out: Object3D[] = []
   const sample = newSample()
   const basis = new Matrix4()
@@ -426,11 +755,17 @@ function buildInstanced(track: ITrack): Object3D[] {
 
   const kerbLight: Placement[] = []
   const kerbDark: Placement[] = []
-  const boostPads: Placement[] = []
   const grates: Placement[] = []
 
   const stepCount = Math.max(8, Math.round(track.length / KERB_BLOCK))
   const step = track.length / stepCount
+
+  // Per-step pad extent, still discovered by probing `surfaceAt`. Kept as a
+  // parallel array rather than a per-step mesh because the pad is now one
+  // continuous ribbon and needs to know where its run starts and ends.
+  const padHit = new Uint8Array(stepCount)
+  const padLo = new Float64Array(stepCount)
+  const padHi = new Float64Array(stepCount)
 
   const place = (
     lateral: number,
@@ -474,7 +809,7 @@ function buildInstanced(track: ITrack): Object3D[] {
     let padMax = -Infinity
     let grateMin = Infinity
     let grateMax = -Infinity
-    for (let lat = -hw; lat <= hw; lat += 0.4) {
+    for (let lat = -hw; lat <= hw; lat += PAD_PROBE) {
       const surface = track.surfaceAt(t, lat)
       if (surface === Surface.BoostPad) {
         if (lat < padMin) padMin = lat
@@ -484,10 +819,10 @@ function buildInstanced(track: ITrack): Object3D[] {
         if (lat > grateMax) grateMax = lat
       }
     }
-    if (padMax > padMin) {
-      boostPads.push(
-        place((padMin + padMax) * 0.5, 0.012, padMax - padMin + 0.4, 0.024, step * 0.96),
-      )
+    if (padMax >= padMin) {
+      padHit[i] = 1
+      padLo[i] = padMin
+      padHi[i] = padMax
     }
     if (grateMax > grateMin) {
       grates.push(
@@ -557,24 +892,6 @@ function buildInstanced(track: ITrack): Object3D[] {
     true,
   )
   emit(
-    'boost-pad',
-    boostPads,
-    new MeshStandardMaterial({
-      color: COL_BOOST,
-      emissive: COL_BOOST,
-      /*
-       * 1.4, deliberately under §2's bloom threshold of 2.5 scene-linear. A pad
-       * that blooms is a pad that hazes the whole road ahead of it under a 12°
-       * sun, and §9a's clipping rows have no room for a light source that is on
-       * for a third of the lap.
-       */
-      emissiveIntensity: 1.4,
-      roughness: 0.35,
-      metalness: 0.0,
-    }),
-    false,
-  )
-  emit(
     'cattle-grid',
     grates,
     new MeshStandardMaterial({ color: COL_GRATE, roughness: 0.5, metalness: 0.7 }),
@@ -582,7 +899,332 @@ function buildInstanced(track: ITrack): Object3D[] {
   )
 
   if (out.length === 0) unitBox.dispose()
+
+  const pads = buildBoostPads(track, collectPadSpans(track, padHit, padLo, padHi), opts)
+  if (pads) out.push(pads)
   return out
+}
+
+// ---------------------------------------------------------------------------
+// Boost pads
+// ---------------------------------------------------------------------------
+
+/** Lateral probe pitch used to discover pads. See `collectPadSpans`. */
+const PAD_PROBE: Metres = 0.4
+/** Longitudinal spacing of the pad ribbon's rings. */
+const PAD_ROW_SPACING: Metres = 1.0
+/** Lateral stations across a pad. The decal carries every crisp feature, so
+ *  these exist only to follow the road's bank and curvature across ~5 m. */
+const PAD_STATIONS = 9
+/**
+ * Height of the pad's top face above the road, along the road normal.
+ *
+ * Not a taste value, the same argument as `ROAD_EDGE_DROP`. The road ribbon
+ * rings every `RING_SPACING` = 2 m and the pad rings every 1 m; both are
+ * polylines through the same curve with different phases, so through a vertical
+ * dip the road's coarser chord can sit above the pad's finer one by up to the
+ * 2 m sagitta, `RING_SPACING² · curvature / 8`. 3.5 cm covers every vertical
+ * radius down to 14 m, which is a ramp, not a road. Below that the pad does not
+ * z-fight — it disappears under the tarmac, and no screenshot review catches a
+ * pad that is simply not there.
+ */
+const PAD_LIFT: Metres = 0.035
+/** How far the skirt runs below the road. Buried, so the rim cannot z-fight. */
+const PAD_SKIRT_DROP: Metres = 0.02
+
+/** A discovered pad: a rectangle in `(t, lateral)`, exactly as `surfaceAt`
+ *  reports it. `t1` may exceed 1 where a pad crosses the start line. */
+interface PadSpan {
+  readonly t0: number
+  readonly t1: number
+  readonly lat0: Metres
+  readonly lat1: Metres
+}
+
+/**
+ * Walk in from a point known to be outside the pad toward one known to be
+ * inside, and return the innermost boundary the test still passes at.
+ *
+ * Fourteen halvings takes the 1 m longitudinal step to 61 µm and the 0.4 m
+ * lateral probe to 24 µm, which is exact for this purpose. The result is always
+ * a point that IS inside, so the drawn pad is a subset of the triggering pad and
+ * never the other way round.
+ */
+function bisectInward(
+  outside: number,
+  inside: number,
+  isInside: (x: number) => boolean,
+): number {
+  let lo = outside
+  let hi = inside
+  for (let n = 0; n < 14; n++) {
+    const mid = (lo + hi) * 0.5
+    if (isInside(mid)) hi = mid
+    else lo = mid
+  }
+  return hi
+}
+
+/**
+ * Group the per-step probe hits into pads, then sharpen every edge.
+ *
+ * THE CONSTRAINT THIS FILE HAS ALWAYS HAD, AND WHY THE BISECTION IS PART OF IT.
+ *
+ * Pads are found by asking `surfaceAt`, never by a second copy of `track.ts`'s
+ * table — see the note on `buildInstanced`. The failure that prevents is a pad
+ * you can see but not trigger, or trigger but not see. Asking is necessary but
+ * it is not sufficient: the probe grid is 1 m along the road and 0.4 m across
+ * it, so a pad discovered by grid alone is drawn up to a metre short at each end
+ * and up to 0.4 m narrow at each side. The old code papered over the lateral
+ * half of that by adding a flat 0.4 m to the width, which overshoots as often as
+ * it undershoots.
+ *
+ * So each of the four edges is bisected against `surfaceAt` itself. The drawn
+ * rectangle then agrees with the triggering rectangle to well under a
+ * millimetre, and it agrees because it was measured, not because two tables
+ * happen to match today.
+ */
+function collectPadSpans(
+  track: ITrack,
+  hit: Uint8Array,
+  lo: Float64Array,
+  hi: Float64Array,
+): PadSpan[] {
+  const steps = hit.length
+  const spans: PadSpan[] = []
+
+  let scanned = 0
+  // Start the scan at a step that is NOT a pad, so a pad straddling t = 0 is
+  // found as one run rather than as two half-pads with a butt joint on the
+  // start line. If every step is a pad something is very wrong; bail rather
+  // than loop.
+  let start = 0
+  while (start < steps && hit[start] === 1) start++
+  if (start === steps) return spans
+
+  for (let n = 0; n < steps; n++) {
+    const i = (start + n) % steps
+    if (hit[i] === 0) continue
+    if (n < scanned) continue
+
+    let len = 0
+    let latLo = Infinity
+    let latHi = -Infinity
+    while (len < steps && hit[(start + n + len) % steps] === 1) {
+      const j = (start + n + len) % steps
+      if (lo[j]! < latLo) latLo = lo[j]!
+      if (hi[j]! > latHi) latHi = hi[j]!
+      len++
+    }
+    scanned = n + len
+
+    // Grid t values, in an unwrapped frame so arithmetic across t = 0 is plain
+    // addition. `track.sample` and `track.surfaceAt` both wrap for us.
+    const tIn0 = (start + n) / steps
+    const tIn1 = (start + n + len - 1) / steps
+    const tOut0 = tIn0 - 1 / steps
+    const tOut1 = tIn1 + 1 / steps
+    const mid = (latLo + latHi) * 0.5
+
+    const t0 = bisectInward(tOut0, tIn0, (t) => track.surfaceAt(t, mid) === Surface.BoostPad)
+    const t1 = bisectInward(tOut1, tIn1, (t) => track.surfaceAt(t, mid) === Surface.BoostPad)
+    const tMid = (t0 + t1) * 0.5
+    const lat0 = bisectInward(
+      latLo - PAD_PROBE,
+      latLo,
+      (x) => track.surfaceAt(tMid, x) === Surface.BoostPad,
+    )
+    const lat1 = bisectInward(
+      latHi + PAD_PROBE,
+      latHi,
+      (x) => track.surfaceAt(tMid, x) === Surface.BoostPad,
+    )
+
+    if (t1 > t0 && lat1 > lat0) spans.push({ t0, t1, lat0, lat1 })
+  }
+
+  return spans
+}
+
+/**
+ * One mesh, one material, one draw call, all pads.
+ *
+ * Merged rather than one mesh per pad: three meshes would cull individually and
+ * save nothing worth having — a pad is ~500 triangles — while costing two of the
+ * five draw calls this file is allowed. The road itself is one circuit-spanning
+ * mesh for the same reason.
+ *
+ * The ribbon is a top face plus a skirt down past the road. The skirt is what
+ * makes the leading edge an EDGE rather than a printed line: it catches the 12°
+ * sun on one side and shades on the other, so the pad reads as a plate bolted to
+ * the road from any angle. Its UVs are pinned to the decal's border, so it is
+ * the outline colour all the way round without needing a second material.
+ */
+function buildBoostPads(
+  track: ITrack,
+  spans: readonly PadSpan[],
+  opts: RoadBuildOptions,
+): Mesh | null {
+  if (spans.length === 0) return null
+
+  const position: number[] = []
+  const normal: number[] = []
+  const uv: number[] = []
+  const index: number[] = []
+
+  const sample = newSample()
+  const p = new Vector3()
+  const sideNormal = new Vector3()
+  const endNormal = new Vector3()
+
+  const push = (x: Vector3, n: Vector3, u: number, v: number): number => {
+    position.push(x.x, x.y, x.z)
+    normal.push(n.x, n.y, n.z)
+    uv.push(u, v)
+    return position.length / 3 - 1
+  }
+
+  for (const span of spans) {
+    const length = (span.t1 - span.t0) * track.length
+    const rows = Math.max(4, Math.round(length / PAD_ROW_SPACING)) + 1
+    const centre = (span.lat0 + span.lat1) * 0.5
+    const half = (span.lat1 - span.lat0) * 0.5
+
+    const base = position.length / 3
+    // Skirt rings are interleaved with the top ring, row by row, so a row of the
+    // ribbon is `PAD_STATIONS` top vertices followed by two skirt vertices —
+    // one per side. Everything below indexes off `row(r)`.
+    const stride = PAD_STATIONS + 2
+    const row = (r: number): number => base + r * stride
+
+    for (let r = 0; r < rows; r++) {
+      const t = span.t0 + ((span.t1 - span.t0) * r) / (rows - 1)
+      track.sample(t, sample)
+      const v = r / (rows - 1)
+
+      for (let k = 0; k < PAD_STATIONS; k++) {
+        const u = k / (PAD_STATIONS - 1)
+        p.copy(sample.position)
+          .addScaledVector(sample.right, centre + (u * 2 - 1) * half)
+          .addScaledVector(sample.normal, PAD_LIFT)
+        push(p, sample.normal, u, v)
+      }
+
+      // The two side-skirt bottoms. Same lateral position as the outer top
+      // vertices, dropped below the road, normal pointing outboard.
+      for (const side of [-1, 1] as const) {
+        p.copy(sample.position)
+          .addScaledVector(sample.right, centre + side * half)
+          .addScaledVector(sample.normal, -PAD_SKIRT_DROP)
+        sideNormal.copy(sample.right).multiplyScalar(side)
+        push(p, sideNormal, side < 0 ? 0 : 1, v)
+      }
+    }
+
+    // --- top face ----------------------------------------------------------
+    /*
+     * Winding matches the road's, and for the same reason: `+u` is `+right` and
+     * `+v` is `+tangent`, and right × tangent is +normal, so a,b,d faces up. A
+     * pad wound the other way is invisible and still costs its draw call.
+     */
+    for (let r = 0; r < rows - 1; r++) {
+      for (let k = 0; k < PAD_STATIONS - 1; k++) {
+        const a = row(r) + k
+        const b = a + 1
+        const d = row(r + 1) + k
+        const e = d + 1
+        index.push(a, b, d, b, e, d)
+      }
+    }
+
+    // --- side skirts -------------------------------------------------------
+    for (let r = 0; r < rows - 1; r++) {
+      // Left: outward is -right.
+      const lt0 = row(r)
+      const lt1 = row(r + 1)
+      const lb0 = row(r) + PAD_STATIONS
+      const lb1 = row(r + 1) + PAD_STATIONS
+      index.push(lt0, lt1, lb0, lt1, lb1, lb0)
+      // Right: outward is +right, so the winding mirrors.
+      const rt0 = row(r) + PAD_STATIONS - 1
+      const rt1 = row(r + 1) + PAD_STATIONS - 1
+      const rb0 = row(r) + PAD_STATIONS + 1
+      const rb1 = row(r + 1) + PAD_STATIONS + 1
+      index.push(rt0, rb0, rt1, rt1, rb0, rb1)
+    }
+
+    // --- leading and trailing skirts ---------------------------------------
+    for (const end of [0, rows - 1] as const) {
+      const leading = end === 0
+      const t = span.t0 + (leading ? 0 : span.t1 - span.t0)
+      track.sample(t, sample)
+      endNormal.copy(sample.tangent).multiplyScalar(leading ? -1 : 1)
+      const v = leading ? 0 : 1
+
+      const first = position.length / 3
+      for (let k = 0; k < PAD_STATIONS; k++) {
+        const u = k / (PAD_STATIONS - 1)
+        p.copy(sample.position)
+          .addScaledVector(sample.right, centre + (u * 2 - 1) * half)
+          .addScaledVector(sample.normal, -PAD_SKIRT_DROP)
+        push(p, endNormal, u, v)
+      }
+      for (let k = 0; k < PAD_STATIONS - 1; k++) {
+        const top0 = row(end) + k
+        const top1 = row(end) + k + 1
+        const bot0 = first + k
+        const bot1 = first + k + 1
+        if (leading) index.push(top0, bot0, top1, top1, bot0, bot1)
+        else index.push(top0, top1, bot0, top1, bot1, bot0)
+      }
+    }
+  }
+
+  const geo = new BufferGeometry()
+  geo.setAttribute('position', new BufferAttribute(new Float32Array(position), 3))
+  geo.setAttribute('normal', new BufferAttribute(new Float32Array(normal), 3))
+  geo.setAttribute('uv', new BufferAttribute(new Float32Array(uv), 2))
+  geo.setIndex(index)
+  geo.computeBoundingSphere()
+
+  /*
+   * Decal resolution tracks the quality profile, but 128 x 512 is the ceiling
+   * and it is plenty: at ~5 m x 20 m that is 3.9 cm per texel on both axes, so
+   * a chevron edge is already finer than the anisotropic filter can resolve at
+   * the distance the pad has to be read from. Two RGBA maps at that size are
+   * 512 kB, against §9's 40 MB texture budget on `low` — where this drops to
+   * 64 x 256 and 128 kB. 64 is the floor rather than 32 because the outline is
+   * 5.5% of the width, and below 64 that is under two texels.
+   */
+  const decalWidth = Math.max(64, Math.min(128, Math.round(opts.textureSize / 8)))
+  const decal = makeBoostDecal(decalWidth, opts.rng.fork('boost'), opts.anisotropy)
+
+  const mesh = new Mesh(
+    geo,
+    new MeshStandardMaterial({
+      /*
+       * White for the same reason the road's is: this multiplies the decal, and
+       * the decal carries the §4b palette. Any other value tints every pad.
+       */
+      color: 0xffffff,
+      map: decal.map,
+      emissive: COL_BOOST,
+      emissiveMap: decal.emissiveMap,
+      emissiveIntensity: PAD_EMISSIVE,
+      // Paint over tarmac: smoother than the road's 0.48-0.85, not a mirror.
+      roughness: 0.5,
+      metalness: 0.0,
+    }),
+  )
+  mesh.name = 'boost-pad'
+  // Receives, and this is load-bearing rather than housekeeping: the arch pad
+  // and every pad under a cliff shadow have to go dark with the road around
+  // them. A decal that ignores shadow is a decal that reads as a light source,
+  // which is the half of the defect the colour change does not fix.
+  mesh.receiveShadow = true
+  // A 3.5 cm plate casts nothing worth a shadow-map slot.
+  mesh.castShadow = false
+  return mesh
 }
 
 // ---------------------------------------------------------------------------
@@ -600,7 +1242,7 @@ export function buildRoad(track: ITrack, opts: RoadBuildOptions): Object3D {
   const root = new Object3D()
   root.name = 'road-group'
   root.add(buildRoadSurface(track, opts))
-  for (const node of buildInstanced(track)) root.add(node)
+  for (const node of buildInstanced(track, opts)) root.add(node)
   return root
 }
 
@@ -624,6 +1266,9 @@ export function disposeRoad(root: Object3D): void {
       standard.map?.dispose()
       standard.roughnessMap?.dispose()
       standard.normalMap?.dispose()
+      // The boost pad's decal. Missed on the first pass, and a texture leaked
+      // here is leaked once per `resetRace` — see the note above.
+      standard.emissiveMap?.dispose()
       m.dispose()
     }
   })
