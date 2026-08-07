@@ -33,6 +33,7 @@ import {
   PMREMGenerator,
   Scene,
   SRGBColorSpace,
+  Vector2,
   Vector3,
   WebGLRenderer,
 } from 'three'
@@ -42,6 +43,7 @@ import { createLoop } from './core/loop'
 import { createRngFactory } from './core/rng'
 import { readFrameLumaStats, readGLReport } from './core/diagnostics'
 import { detectTier, resolveQuality } from './core/quality'
+import { makeWetSurface } from './render/procedural'
 import type {
   Ctx,
   FrameStats,
@@ -132,12 +134,41 @@ scene.add(moon)
 // Warm ground bounce from below — the city glow that keeps undersides readable.
 scene.add(new HemisphereLight(0x3a2258, 0x2a1636, 0.35))
 
+/**
+ * The wet road, with spatially varying roughness per ART_DIRECTION §4.
+ *
+ * The first version used one flat roughness value and it was wrong in a way
+ * worth naming: a uniformly mirrored road gives the eye no distance cue, so the
+ * whole ground collapses into a single flat sheet and the scene reads as having
+ * no depth at all. Puddles, dried tyre strips and drain streaks are not
+ * decoration here — the variation IS the depth cue, because the size of the
+ * features tells you how far away you are looking.
+ */
+const texSize = Math.min(1024, quality.maxTextureSize)
+const wet = makeWetSurface(texSize, rngFor('placeholder/road'), quality.maxAnisotropy)
 const ground = new Mesh(
   new PlaneGeometry(400, 400),
-  // Wet road base from ART_DIRECTION §3a. Roughness is flat here on purpose:
-  // spatially varying roughness is `render/`'s job and its absence is exactly
-  // the amateur tell the §9b rubric is written to catch.
-  new MeshStandardMaterial({ color: 0x14141c, roughness: 0.12, metalness: 0.0 }),
+  new MeshStandardMaterial({
+    color: 0x14141c,
+    metalness: 0.0,
+    /*
+     * MUST be 1.0. `roughnessMap` MULTIPLIES this value, it does not replace it.
+     *
+     * This was set to 0.12 — the wet-asphalt figure — on the reasonable-sounding
+     * theory that it was a sensible fallback. The effect was to scale the whole
+     * map down by 8x: a texture carrying 0.03 to 0.58 became 0.004 to 0.07, so
+     * every square inch of road stayed mirror-smooth and two rounds of tuning
+     * the noise field changed nothing visible. The map was correct the entire
+     * time and was being crushed on the way to the GPU.
+     *
+     * Same applies to metalnessMap, aoMap and the rest. When a map appears to
+     * do nothing, check what it multiplies before touching the map.
+     */
+    roughness: 1.0,
+    roughnessMap: wet.roughnessMap,
+    normalMap: wet.normalMap,
+    normalScale: new Vector2(wet.normalScale, wet.normalScale),
+  }),
 )
 ground.rotation.x = -Math.PI / 2
 scene.add(ground)
