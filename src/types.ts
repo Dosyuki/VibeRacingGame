@@ -132,28 +132,33 @@ export interface IInput {
 // Surfaces
 // ---------------------------------------------------------------------------
 /**
- * A wet night circuit is defined by what the road does to grip and to light.
+ * A desert circuit is defined by what the road does to grip and to sightlines.
  * Surface drives physics, particle choice, tyre audio and reflection strength,
  * so it is one shared enum rather than four private ones that drift apart.
  *
  * Plain enum, not `const enum`: the build runs with `isolatedModules`, under
  * which `const enum` is a compile error, and inlined values would let a stale
  * consumer silently disagree with a rebuilt one.
+ *
+ * ORDINALS ARE HELD ACROSS THE THEME CHANGE. Eight members before, eight after,
+ * same numbers. `Readonly<Record<Surface, SurfaceProps>>` then keeps working as
+ * a compiler-enforced checklist — miss a key and `tsc --noEmit` fails, which is
+ * the safety net you want on a table this size.
  */
 export enum Surface {
-  /** Dry lane under bridges and inside the tunnel. Reference grip. */
+  /** Clean sealed tarmac, under overhangs and in the slot canyon. Reference grip. */
   Asphalt = 0,
-  /** The default road. Slightly lower grip, mirror-like reflections. */
-  WetAsphalt = 1,
-  /** Standing water. Lowest grip, throws spray, kills reflections locally. */
-  Puddle = 2,
+  /** The default road: a sand film over tarmac. Slightly lower grip, matte. */
+  DustyAsphalt = 1,
+  /** Windblown sand across the road. Lowest grip, high drag, throws a rooster tail. */
+  SandDrift = 2,
   /** Painted kerb. Grippy, but rumbles chassis and camera. */
   Kerb = 3,
-  /** Tram rails and drain grates. Grip collapses when crossed at an angle. */
+  /** Cattle grid and culvert grates. Grip collapses when crossed at an angle. */
   Metal = 4,
-  /** Construction detour. Loose and slow; kicks dust, not spray. */
+  /** Scree and washout off the canyon wall. Loose and slow. */
   Gravel = 5,
-  /** Boost strip. Dry grip plus a forced boost on contact. */
+  /** Boost strip. Clean grip plus a forced boost on contact. */
   BoostPad = 6,
   /** Past the barrier line. Heavy drag; `game/` respawns after a grace period. */
   OffTrack = 7,
@@ -176,25 +181,44 @@ export interface SurfaceProps {
   /** Chassis perturbation amplitude in metres. Drives rumble and camera shake. */
   readonly roughness: number
   /** Particle family; `fx/` owns what each one looks like. */
-  readonly spray: 'none' | 'water' | 'dust' | 'sparks'
-  /** Mixed into reflection strength. 0 = matte, 1 = mirror. */
-  readonly wetness: number
+  readonly spray: 'none' | 'dust' | 'sand' | 'sparks'
+  /**
+   * Mixed into reflection strength. 0 = matte, 1 = mirror.
+   *
+   * Was `wetness`. The semantics were always generic — only the name was
+   * theme-specific — and leaving it called `wetness` on a dry circuit leaves a
+   * dead axis that `fx/` would multiply spray rate by and get zero from.
+   */
+  readonly reflectivity: number
 }
 
 /**
  * TUNING, not structure. Adjusting a number in this table is a balance change
  * and is NOT a contract change — it does not need the announcement ritual.
  * Adding or removing a `Surface` member is.
+ *
+ * NOTHING IN THE GRIP OR DRAG COLUMNS MOVED ACROSS THE THEME CHANGE, on purpose.
+ * The obvious instinct is that a dry road should be grippier than a wet one, so
+ * `DustyAsphalt` wants to go from 0.88 to 0.92. Resist it. This is the default
+ * road, it covers most of the lap, and a 4.5% grip rise moves every lap time,
+ * every AI corner-entry speed and the drift-initiation threshold — which is to
+ * say it moves §10c criteria 1 and 2, the two gates the whole game is judged on.
+ * A sand film over tarmac justifies 0.88 perfectly well. Raise it later, alone,
+ * measured.
+ *
+ * The only non-cosmetic changes are the two chassis-perturbation bumps
+ * (`roughness` here means bump amplitude in metres, not material roughness):
+ * sand should feel like sand, and 0.02 does not.
  */
 export const SURFACE_PROPS: Readonly<Record<Surface, SurfaceProps>> = {
-  [Surface.Asphalt]: { grip: 1.0, dragAccelAt30: 0.0, roughness: 0.01, spray: 'none', wetness: 0.15 },
-  [Surface.WetAsphalt]: { grip: 0.88, dragAccelAt30: 0.0, roughness: 0.01, spray: 'water', wetness: 0.95 },
-  [Surface.Puddle]: { grip: 0.62, dragAccelAt30: 1.6, roughness: 0.02, spray: 'water', wetness: 1.0 },
-  [Surface.Kerb]: { grip: 0.95, dragAccelAt30: 0.4, roughness: 0.06, spray: 'sparks', wetness: 0.5 },
-  [Surface.Metal]: { grip: 0.55, dragAccelAt30: 0.0, roughness: 0.02, spray: 'sparks', wetness: 1.0 },
-  [Surface.Gravel]: { grip: 0.7, dragAccelAt30: 4.5, roughness: 0.09, spray: 'dust', wetness: 0.1 },
-  [Surface.BoostPad]: { grip: 1.0, dragAccelAt30: 0.0, roughness: 0.01, spray: 'sparks', wetness: 0.8 },
-  [Surface.OffTrack]: { grip: 0.5, dragAccelAt30: 9.0, roughness: 0.12, spray: 'dust', wetness: 0.2 },
+  [Surface.Asphalt]: { grip: 1.0, dragAccelAt30: 0.0, roughness: 0.01, spray: 'none', reflectivity: 0.1 },
+  [Surface.DustyAsphalt]: { grip: 0.88, dragAccelAt30: 0.0, roughness: 0.02, spray: 'dust', reflectivity: 0.06 },
+  [Surface.SandDrift]: { grip: 0.62, dragAccelAt30: 1.6, roughness: 0.07, spray: 'sand', reflectivity: 0.03 },
+  [Surface.Kerb]: { grip: 0.95, dragAccelAt30: 0.4, roughness: 0.06, spray: 'sparks', reflectivity: 0.3 },
+  [Surface.Metal]: { grip: 0.55, dragAccelAt30: 0.0, roughness: 0.02, spray: 'sparks', reflectivity: 0.35 },
+  [Surface.Gravel]: { grip: 0.7, dragAccelAt30: 4.5, roughness: 0.09, spray: 'dust', reflectivity: 0.05 },
+  [Surface.BoostPad]: { grip: 1.0, dragAccelAt30: 0.0, roughness: 0.01, spray: 'sparks', reflectivity: 0.55 },
+  [Surface.OffTrack]: { grip: 0.5, dragAccelAt30: 9.0, roughness: 0.12, spray: 'dust', reflectivity: 0.05 },
 }
 
 // ---------------------------------------------------------------------------
@@ -699,14 +723,14 @@ export type PlainFactory = (ctx: Ctx) => Promise<Subsystem> | Subsystem
 
 export type VantageName =
   | 'grid'
-  | 'boulevard'
-  | 'market'
-  | 'underpass'
-  | 'ramp-vista'
-  | 'hairpin'
-  | 'tram'
-  | 'river-bank'
-  | 'tunnel-exit'
+  | 'dune-sweep'
+  | 'strata-wall'
+  | 'slot-narrows'
+  | 'mesa-crest'
+  | 'banked-wall'
+  | 'wash-descent'
+  | 'arch-interior'
+  | 'arch-exit'
   | 'drift-tier3'
 
 /**
@@ -717,10 +741,10 @@ export type VantageName =
  */
 export type ScenarioName =
   | 'grid-idle'
-  | 'tier3-boost-at-tunnel-exit'
+  | 'tier3-boost-at-arch-exit'
   | 'tier3-release-open-road'
-  | 'puddle-crossing'
-  | 'tram-rail-crossing'
+  | 'sand-drift-crossing'
+  | 'cattle-grid-crossing'
   | 'full-field-first-corner'
 
 export type DriverMode = 'human' | 'scripted' | 'referenceAI' | 'idle'
@@ -776,28 +800,93 @@ export interface TileLuma {
  *
  * The tiles are the point. A half-black, half-correct frame has an excellent
  * whole-image standard deviation and passes any global check — partial-black
- * present is exactly the failure that looks healthy in aggregate. Assert on
- * `worstTileBlackFraction`.
+ * present is exactly the failure that looks healthy in aggregate.
  *
  * Reading the presented frame at all requires the context to have been created
  * with `preserveDrawingBuffer`; without it `readPixels` after present returns
  * discarded contents, which reads as "100% of frames are black" and is
  * completely false. `?debug=frames` sets it, and this call throws when it is
  * absent rather than returning a confident lie.
+ *
+ * ──────────────────────────────────────────────────────────────────────────
+ * WHY THE UNPAINTED TEST KEYS ON UNIFORMITY AND NOT ON BRIGHTNESS
+ *
+ * It used to test darkness: a tile more than 98% below the black threshold
+ * failed as a partial present. Measuring a real, correct, shipped neon-night
+ * scene killed that rule outright — it had tiles at 98% and 99% black, because
+ * a dark alley wall at 2 a.m. IS black to within a 24-bit encode. The detector
+ * would have failed exactly the frame the art direction was aiming for.
+ *
+ * That measurement is kept here as calibration provenance even though the
+ * project no longer ships a night scene, because it is what sets the 1e-5
+ * threshold: the reference's darkest tiles measured standard deviations of
+ * 8.2e-4 to 1.8e-2, against exactly 0 for a cleared buffer, so 1e-5 sits about
+ * 80x below the smallest real value ever observed.
+ *
+ * The rule survived the switch to daylight; one of its clauses did not, and it
+ * failed DANGEROUSLY. The old test was `stdDev < 1e-5 && mean < 0.004`. When
+ * the clear colour is black those two conditions coincide and the second one
+ * costs nothing. Under a bright sky they diverge: `setClearColor(skyColour)` is
+ * an ordinary, defensible thing to write, and it would have silently disabled
+ * the detector entirely. A sky shader that fails to compile and falls back to a
+ * constant is the same hole. The brightness clause is gone.
+ *
+ * Daylight also brought an inverted failure that zero-variance cannot catch — a
+ * nearly-but-not-exactly flat blown sky, or a procedural sand albedo returning
+ * a constant. Hence `flatBrightTiles`.
+ *
+ * Both detectors rest on ART_DIRECTION §9b forbidding any perfectly uniform
+ * region, sky included, and on §2 mandating sky dither. Those are art rules
+ * doing double duty: remove either and the instrument starts lying.
+ * ──────────────────────────────────────────────────────────────────────────
  */
 export interface FrameLumaStats {
   readonly mean: number
   readonly stdDev: number
   /**
-   * Fraction of pixels that were never painted (luma < 0.004), NOT merely dark.
-   * A 2 a.m. sky is legitimately darker than any threshold you would pick for
-   * "dark", so this one sits below anything ART_DIRECTION §3 permits as an
-   * albedo. A tile under it did not get drawn.
+   * Fraction of pixels below the encode floor (luma < 0.004). Near zero on a
+   * sunlit scene — the deepest legitimate surface, a niche under an overhang
+   * seeing 8% of the sky and no sun, computes to luma 0.070. Reported for the
+   * record, not gated on.
    */
   readonly blackFraction: number
-  /** Fraction of pixels with luma >= 0.99. The §8 energy budget gate. */
+  /**
+   * Fraction of pixels below luma 0.05. Under a sun this is a MAXIMUM, not a
+   * minimum — the gate that inverted with the theme. Anything under 0.05 is a
+   * shadow term clamping to zero, missing skylight fill, or unlit geometry.
+   */
+  readonly darkFraction: number
+  /**
+   * Fraction of pixels at or above luma 0.5. On a night scene this measured
+   * emissive AREA and was capped at 8%. Under a sun the same threshold measures
+   * something else entirely: luma 0.5 is only 1.19x sunlit sand, so sand, rock
+   * and sky all sit above it and a correct frame reads 60-80%. It survives as a
+   * wide sanity rail — "is this actually a sunlit scene" — not as a budget.
+   */
+  readonly brightFraction: number
+  /**
+   * Fraction of pixels at or above luma 0.95. THIS is where "walks toward a
+   * white screen" lives in daylight. Derived: 0.95 requires 6.6x sunlit sand,
+   * about +2.7 stops, which only the near-sun haze band, the disc, specular
+   * glints and bloom can reach.
+   */
+  readonly highlightFraction: number
+  /** Fraction of pixels with luma >= 0.99. The §9a clipping gate. */
   readonly clippedFraction: number
   readonly tiles: readonly TileLuma[]
+  /**
+   * Tiles with `stdDev < 1e-5`, AT ANY BRIGHTNESS. Anything above zero means
+   * part of the frame was never drawn. THIS is the partial-present assertion;
+   * `worstTileBlackFraction` is not, and neither is darkness.
+   */
+  readonly unpaintedTiles: number
+  /**
+   * Tiles with `stdDev < 2e-3` and `mean >= 0.5` — painted, but with nothing in
+   * them. A blown sky, a constant-colour fallback, an untextured sand plane.
+   * Budget is at most one of 64: a single tile of open sky near the zenith can
+   * legitimately be very smooth, and that allowance has not been measured.
+   */
+  readonly flatBrightTiles: number
   readonly worstTileBlackFraction: number
   readonly worstTileClippedFraction: number
 }

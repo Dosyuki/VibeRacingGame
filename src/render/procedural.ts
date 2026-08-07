@@ -1,5 +1,12 @@
 import { createNoise2D } from 'simplex-noise'
-import { DataTexture, LinearFilter, LinearMipmapLinearFilter, RGBAFormat, RepeatWrapping } from 'three'
+import {
+  DataTexture,
+  LinearFilter,
+  LinearMipmapLinearFilter,
+  RGBAFormat,
+  RepeatWrapping,
+  SRGBColorSpace,
+} from 'three'
 import type { RNG } from '../types'
 
 /**
@@ -77,7 +84,82 @@ function makeTexture(size: number, data: Uint8Array, anisotropy: number): DataTe
   return tex
 }
 
-export interface WetSurfaceMaps {
+/**
+ * Concrete / rendered facade. Subtle, and mandatory.
+ *
+ * A flat box face lit by a hemisphere term has a constant normal and therefore
+ * a constant colour: the whole face comes out as one exact value, variance
+ * zero. That is an ART_DIRECTION §4 failure (uniform roughness reads as
+ * plastic) and an §8b failure at the same time — the partial-present detector
+ * keys on uniformity, so a perfectly flat facade is indistinguishable from a
+ * region the GPU never painted. The energy check caught exactly that here,
+ * reporting two unpainted tiles on a frame where everything had in fact been
+ * drawn correctly.
+ *
+ * Weathering streaks, patch variation and grain, all low-contrast. Enough to
+ * break the uniformity, not enough to look like camouflage.
+ */
+export function makeRockSurface(
+  size: number,
+  rng: RNG,
+  anisotropy: number,
+): { map: DataTexture; roughnessMap: DataTexture } {
+  const patch = createNoise2D(rng)
+  const grain = createNoise2D(rng.fork('grain'))
+  const albedo = new Uint8Array(size * size * 4)
+  const rough = new Uint8Array(size * size * 4)
+
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const u = x / size
+      const v = y / size
+
+      const blotch = fbm(patch, u * 3, v * 3, 4)
+      /*
+       * HORIZONTAL bedding, not vertical weathering.
+       *
+       * This band was stretched the other way when the theme was a rain-slick
+       * city, because rain runs down a facade. Sedimentary rock is laid down in
+       * horizontal beds, so the axes swap — and getting this backwards is not a
+       * subtle error, it reads immediately as a cliff made of dripping concrete.
+       */
+      const bedding = fbm(patch, u * 2.5, v * 26, 3)
+      const speck = grain(u * 200, v * 200)
+
+      // Sandstone is bright in sun. The city version sat at 0.78 because it was
+      // meant to disappear into the dark.
+      const tint = 1 + blotch * 0.26 + bedding * 0.16 + speck * 0.05
+      const a = Math.round(Math.min(1, Math.max(0, tint * 0.94)) * 255)
+
+      // ART_DIRECTION §5a: rock 0.62-0.88, driven by strata hardness. Caprock
+      // is wind-polished and smooth; shale bands are matte.
+      const r = Math.round(
+        Math.min(1, Math.max(0, 0.75 + bedding * 0.13 + blotch * 0.06 + speck * 0.04)) * 255,
+      )
+
+      const i = (y * size + x) * 4
+      albedo[i] = a
+      albedo[i + 1] = a
+      albedo[i + 2] = a
+      albedo[i + 3] = 255
+      rough[i] = r
+      rough[i + 1] = r
+      rough[i + 2] = r
+      rough[i + 3] = 255
+    }
+  }
+
+  const map = makeTexture(size, albedo, anisotropy)
+  // Albedo is colour data; roughness is not. Getting this backwards double-
+  // applies the sRGB curve and quietly changes every material in the scene.
+  map.colorSpace = SRGBColorSpace
+  const roughnessMap = makeTexture(size, rough, anisotropy)
+  map.repeat.set(2, 2)
+  roughnessMap.repeat.set(2, 2)
+  return { map, roughnessMap }
+}
+
+export interface RoadSurfaceMaps {
   readonly roughnessMap: DataTexture
   readonly normalMap: DataTexture
   /** Feed to `MeshStandardMaterial.normalScale`. Kept low on purpose. */
@@ -97,7 +179,7 @@ export interface WetSurfaceMaps {
  *   wet asphalt 0.12   the default road
  *   dried strip 0.42   where tyres have cleared the water
  */
-export function makeWetSurface(size: number, rng: RNG, anisotropy: number): WetSurfaceMaps {
+export function makeRoadSurface(size: number, rng: RNG, anisotropy: number): RoadSurfaceMaps {
   const base = createNoise2D(rng)
   const detail = createNoise2D(rng.fork('detail'))
 
@@ -149,23 +231,37 @@ export function makeWetSurface(size: number, rng: RNG, anisotropy: number): WetS
       const i = (y * size + x) * 4
       const hv = at(x, y)
 
-      // Water gathers in the low ground; raised asphalt dries first. The bands
-      // are tight and they overlap nothing: a wide, gentle ramp between wet and
-      // dry averages back into the uniform sheet this whole file exists to
-      // avoid. Puddles need edges.
-      const puddle = smoothstep(-0.02, -0.28, hv)
-      const dried = smoothstep(0.06, 0.38, hv)
+      /*
+       * Sand collects in the low ground; the racing line is where tyres have
+       * polished the tarmac. Bands stay tight — a wide, gentle ramp averages
+       * back into the uniform sheet this whole file exists to avoid.
+       *
+       * ART_DIRECTION §5a: road 0.48-0.85. The whole range shifted upward and
+       * compressed when the theme went dry. Nothing here is a mirror any more,
+       * which is what lets the fine detail below come back.
+       */
+      const sanded = smoothstep(-0.02, -0.28, hv)
+      const polished = smoothstep(0.06, 0.38, hv)
 
-      let rough = 0.14
-      rough += (0.03 - rough) * puddle
-      rough += (0.58 - rough) * dried
+      let rough = 0.66
+      rough += (0.85 - rough) * sanded
+      rough += (0.48 - rough) * polished
 
       /*
-       * Aggregate grain is gated by `dried`. This is rule 2 above: fine detail
-       * is only allowed where roughness is high enough to average it out. Adding
-       * it to the mirror regions is precisely what produced the static.
+       * Fine grain, applied EVERYWHERE now rather than gated to the rough
+       * regions. Rule 2 in the header bounds detail frequency by roughness, and
+       * the bound has gone slack: at roughness 0.48-0.85 the specular lobe is
+       * broad, so a few degrees of normal swing between texels moves the sample
+       * within a lobe that is already integrating a large solid angle, and
+       * mipmaps average it correctly. The gate that used to be here was
+       * suppressing exactly the aggregate detail a dry road needs.
+       *
+       * The rule has NOT gone away — it moved onto the kart. Chrome at
+       * roughness 0.18 and clearcoat at 0.07, under a single very small very
+       * bright sun, is a harsher aliasing driver than forty neon signs ever
+       * were.
        */
-      rough += detail(x / size * 90, y / size * 90) * 0.05 * dried
+      rough += detail((x / size) * 90, (y / size) * 90) * 0.06
 
       const g = Math.round(Math.min(1, Math.max(0, rough)) * 255)
       roughData[i] = g
@@ -204,8 +300,9 @@ export function makeWetSurface(size: number, rng: RNG, anisotropy: number): WetS
   return {
     roughnessMap: makeTexture(size, roughData, anisotropy),
     normalMap: makeTexture(size, normData, anisotropy),
-    // Low. A wet road is nearly flat; overdriving this turns the mirror back
-    // into sandpaper and every reflection breaks up again.
-    normalScale: 0.35,
+    // Raised from 0.35. That value existed to keep a mirror from turning back
+    // into sandpaper; a matte road has no such constraint and needs the relief
+    // to read at all under a raking 12-degree sun.
+    normalScale: 0.85,
   }
 }

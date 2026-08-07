@@ -48,28 +48,60 @@ export function readGLReport(
 const TILES = 8
 
 /**
- * "Black" means UNPAINTED, not dark.
- *
- * A night game needs this distinction to be sharp. ART_DIRECTION section 3
- * forbids pure `#000000` as an albedo anywhere and the sky gradient bottoms out
- * well above this value, so a tile below it was not drawn — which is the only
- * thing this number is allowed to mean. Set it any higher and it starts
- * reporting a correctly-lit 2 a.m. sky as a rendering failure.
- *
- * Worth recording how this number got picked, because the reasoning was wrong
- * the first time: the threshold started at 0.02, the very first smoke run
- * failed on it, and the initial conclusion was that the instrument was
- * miscalibrated for a dark scene. It was not. The screenshot showed a ground
- * plane lit by nothing at all — `MeshStandardMaterial` with no light in the
- * scene renders pure black, and the detector had found a genuine defect on its
- * first run. The threshold change was defensible on its own merits and was
- * kept; the diagnosis that motivated it was not. Look at the frame before
- * concluding the instrument is lying.
+ * Thresholds, all of them calibrated against a measured reference rather than
+ * chosen by eye. See FrameLumaStats in types.ts for the full reasoning.
  */
+
+/** Below the 24-bit encode floor. On a night scene, 6-24% of pixels sit here. */
 const BLACK_LUMA = 0.004
 
-/** Fully clipped. The section 8 additive energy budget gates on this. */
+/**
+ * Under a sun this is a CEILING, not a floor. The deepest legitimate surface in
+ * the scene — a niche under an overhang seeing 8% of sky and no sun — computes
+ * through the ACES fit to luma 0.070, so anything below 0.05 is a shadow term
+ * clamping to zero or geometry that never got lit.
+ */
+const DARK_LUMA = 0.05
+
+/**
+ * A wide sanity rail, no longer a budget. At night this threshold separated
+ * light SOURCES from lit surfaces and was capped at 8%. Under a 12-degree sun,
+ * luma 0.5 is only 1.19x sunlit sand, so sand, rock and sky are all above it.
+ */
+const BRIGHT_LUMA = 0.5
+
+/**
+ * Where "walks toward a white screen" lives in daylight. Derived: reaching 0.95
+ * takes 6.6x sunlit sand, roughly +2.7 stops, which only the near-sun haze band,
+ * the sun disc, specular glints and bloom can do.
+ */
+const HIGHLIGHT_LUMA = 0.95
+
+/** Fully clipped. The section 9a energy budget gates on this. */
 const CLIPPED_LUMA = 0.99
+
+/**
+ * Painted, but with nothing in it — the daylight inversion of an unpainted tile.
+ * A blown sky, a constant-colour shader fallback, a procedural sand albedo that
+ * returned one value.
+ *
+ * The threshold is only safe because ART_DIRECTION section 2 mandates at least
+ * +/-2 code values of blue-noise dither in the sky gradient. That dither puts a
+ * correct sky at stdDev around 4.5e-3, which is 2.3x above this gate. Remove the
+ * dither mandate and this detector starts lying. The value itself is a GUESS and
+ * belongs in the first measurement round.
+ */
+const FLAT_STDDEV = 2e-3
+
+/**
+ * A tile below this standard deviation was not rendered — it was cleared.
+ *
+ * The darkest tiles of a real shipped neon-night scene measure 8.2e-4 to
+ * 1.8e-2. A cleared buffer measures exactly 0. This sits about 80x below the
+ * smallest real value observed, which is the margin that keeps a legitimately
+ * black alley wall from being reported as a rendering failure.
+ */
+const UNPAINTED_STDDEV = 1e-5
 
 /**
  * Luma statistics over the PRESENTED image, on an 8x8 tile grid.
@@ -124,6 +156,9 @@ export function readFrameLumaStats(
   let sum = 0
   let sumSq = 0
   let black = 0
+  let dark = 0
+  let bright = 0
+  let highlight = 0
   let clipped = 0
   let n = 0
 
@@ -143,6 +178,9 @@ export function readFrameLumaStats(
       sum += luma
       sumSq += luma * luma
       if (luma < BLACK_LUMA) black++
+      if (luma < DARK_LUMA) dark++
+      if (luma >= BRIGHT_LUMA) bright++
+      if (luma >= HIGHLIGHT_LUMA) highlight++
       if (luma >= CLIPPED_LUMA) clipped++
       n++
 
@@ -160,6 +198,8 @@ export function readFrameLumaStats(
   const tiles: TileLuma[] = []
   let worstBlack = 0
   let worstClip = 0
+  let unpainted = 0
+  let flatBright = 0
   for (let ty = 0; ty < TILES; ty++) {
     for (let tx = 0; tx < TILES; tx++) {
       const ti = ty * TILES + tx
@@ -167,11 +207,17 @@ export function readFrameLumaStats(
       if (c === 0) continue
       const m = tileMean[ti]! / c
       const v = Math.max(0, tileSq[ti]! / c - m * m)
+      const sd = Math.sqrt(v)
       const bf = tileBlack[ti]! / c
       const cf = tileClip[ti]! / c
       if (bf > worstBlack) worstBlack = bf
       if (cf > worstClip) worstClip = cf
-      tiles.push({ x: tx, y: ty, mean: m, stdDev: Math.sqrt(v), blackFraction: bf, clippedFraction: cf })
+      // Uniform, at ANY brightness. The `m < BLACK_LUMA` clause that used to be
+      // here made this detector silently inoperative the moment anything cleared
+      // to a bright colour — see the note on FrameLumaStats in types.ts.
+      if (sd < UNPAINTED_STDDEV) unpainted++
+      else if (sd < FLAT_STDDEV && m >= BRIGHT_LUMA) flatBright++
+      tiles.push({ x: tx, y: ty, mean: m, stdDev: sd, blackFraction: bf, clippedFraction: cf })
     }
   }
 
@@ -179,8 +225,13 @@ export function readFrameLumaStats(
     mean,
     stdDev: Math.sqrt(variance),
     blackFraction: n > 0 ? black / n : 0,
+    darkFraction: n > 0 ? dark / n : 0,
+    brightFraction: n > 0 ? bright / n : 0,
+    highlightFraction: n > 0 ? highlight / n : 0,
     clippedFraction: n > 0 ? clipped / n : 0,
     tiles,
+    unpaintedTiles: unpainted,
+    flatBrightTiles: flatBright,
     worstTileBlackFraction: worstBlack,
     worstTileClippedFraction: worstClip,
   }

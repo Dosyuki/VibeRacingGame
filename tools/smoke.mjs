@@ -111,11 +111,12 @@ try {
   console.log(`triangles    ${stats.triangles}`)
   console.log(
     `luma         mean ${luma.mean.toFixed(4)}  sd ${luma.stdDev.toFixed(4)}  ` +
-      `black ${(luma.blackFraction * 100).toFixed(1)}%  clipped ${(luma.clippedFraction * 100).toFixed(2)}%`,
+      `dark ${(luma.darkFraction * 100).toFixed(1)}%  bright ${(luma.brightFraction * 100).toFixed(2)}%  ` +
+      `clipped ${(luma.clippedFraction * 100).toFixed(2)}%`,
   )
   console.log(
-    `worst tile   black ${(luma.worstTileBlackFraction * 100).toFixed(1)}%  ` +
-      `clipped ${(luma.worstTileClippedFraction * 100).toFixed(2)}%`,
+    `tiles        unpainted ${luma.unpaintedTiles}  ` +
+      `(worst tile black ${(luma.worstTileBlackFraction * 100).toFixed(0)}% — reported, not gated)`,
   )
 
   // --- assertions ---------------------------------------------------------
@@ -127,10 +128,18 @@ try {
   // A frame that is a flat colour is what every black-screen failure looks like.
   if (luma.stdDev < 0.02) fail(`frame is nearly flat (sd ${luma.stdDev.toFixed(4)}) — nothing is being drawn`)
 
-  // The tile check is the one that matters. A half-black frame has an excellent
-  // whole-image standard deviation and would sail past the check above.
-  if (luma.worstTileBlackFraction > 0.98) {
-    fail(`a tile is fully black (${(luma.worstTileBlackFraction * 100).toFixed(1)}%) — partial present`)
+  /*
+   * The tile check is the one that matters, and it keys on UNIFORMITY, not
+   * darkness. This assertion used to read `worstTileBlackFraction > 0.98`.
+   * Measuring a real shipped neon-night scene retired that outright: it has
+   * tiles at 98% and 99% black which are entirely correct, so the old rule
+   * would have failed exactly the frame the art direction is aiming for.
+   *
+   * A region the GPU never painted has zero variance. A dark alley wall does
+   * not. See ART_DIRECTION §8b.
+   */
+  if (luma.unpaintedTiles > 0) {
+    fail(`${luma.unpaintedTiles} tile(s) are uniform and black — part of the frame was never drawn`)
   }
 
   if (stats.drawCalls === 0) fail('zero draw calls')

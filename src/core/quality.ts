@@ -42,7 +42,11 @@ const REQUESTS: Readonly<Record<QualityTier, QualityRequest>> = {
     renderScale: 1.0,
     shadows: true,
     shadowCascades: 2,
-    ssr: false,
+    // ART_DIRECTION §8c: SSR is required from medium upward. A probe-only
+    // reflection belongs to no location — it slides with the camera and gives
+    // nothing a contact point — and a wet road without anchored reflections is
+    // just a mirror with a texture on it.
+    ssr: true,
     ssao: false,
     bloom: true,
     motionBlur: false,

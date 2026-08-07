@@ -50,8 +50,8 @@ One concern per directory:
 | path | what lives there |
 |---|---|
 | `src/core/` | clock, RNG, events, input, settings, quality, diagnostics, prewarm |
-| `src/render/` | renderer, post chain, procedural textures/materials, sky, rain |
-| `src/world/` | circuit spline + geometry, buildings, signage, water |
+| `src/render/` | renderer, post chain, procedural textures/materials, sky, haze |
+| `src/world/` | circuit spline + geometry, cliffs, strata, scatter, vegetation |
 | `src/kart/` | chassis, suspension, tyres, kart model, liveries |
 | `src/game/` | race state, AI, camera rig, items, projectiles |
 | `src/fx/` | particles, trails, decals, screen effects |

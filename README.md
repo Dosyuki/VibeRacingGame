@@ -1,11 +1,13 @@
-# Neon Drift
+# Vermilion Nine
 
 A browser kart racer built in TypeScript and Three.js with **zero art assets**.
 No textures, no models, no fonts, no audio files. Every mesh, material, sound and
 reflection is generated in code at load time.
 
-A rain-slick neon city at 2 a.m. Wet asphalt mirrors the signs above it, which
-is what makes the racing line readable at night.
+A desert canyon an hour before sundown. The sun sits at 12°, so every shadow runs
+4.7× the height of the thing casting it, and the racing line is legible by value
+alone — dark tarmac at luma 0.27 against sand at 0.65 — before a single marking
+is drawn.
 
 **Play:** https://dosyuki.github.io/VibeRacingGame/ · no sign-in, no install
 
