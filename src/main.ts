@@ -29,7 +29,6 @@ import {
   PMREMGenerator,
   Scene,
   SRGBColorSpace,
-  Vector2,
   Vector3,
   WebGLRenderer,
 } from 'three'
@@ -39,14 +38,18 @@ import { createLoop } from './core/loop'
 import { createRngFactory } from './core/rng'
 import { readFrameLumaStats, readGLReport } from './core/diagnostics'
 import { detectTier, resolveQuality } from './core/quality'
-import { buildPlaceholderCanyon } from './render/placeholder-canyon'
-import { makeRoadSurface } from './render/procedural'
+import { makeRockSurface } from './render/procedural'
+import { buildSky } from './render/sky'
+import { buildRoad } from './world/road'
+import { buildCanyonTerrain } from './world/terrain'
+import { createTrack } from './world/track'
 import type {
   Ctx,
   FrameStats,
   HarnessAPI,
   QualityTier,
   Settings,
+  TrackSample,
 } from './types'
 
 const params = new URLSearchParams(location.search)
@@ -102,7 +105,10 @@ const scene = new Scene()
 // canyon vista has a legitimate 400 m+ sightline.
 scene.fog = new FogExp2(0xd8b892, 0.0025)
 
-const camera = new PerspectiveCamera(62, 1, 0.1, 800)
+// far reaches the outermost mesa ring, which sits about 745 m from the near
+// side of the circuit; near is lifted off 0.1 to keep depth precision usable
+// across that range.
+const camera = new PerspectiveCamera(62, 1, 0.3, 2400)
 camera.position.set(0, 2.3, 0)
 camera.lookAt(0, 3.2, -40)
 
@@ -223,58 +229,68 @@ scene.add(bounce)
  */
 scene.add(new HemisphereLight(0x86b4e8, 0xd9a068, 1.35))
 
+/*
+ * THE WORLD.
+ *
+ * Three subsystems, built by three agents that never saw each other's code, and
+ * wired together here because `src/main.ts` is the only composition root. They
+ * agree because they all coded against `ITrack` in the contract and nothing
+ * else — which is the entire reason that file was frozen before any of them
+ * started.
+ *
+ * Order is a real dependency, not a preference: the road is extruded along the
+ * spline and the canyon walls are swept from it, so the track exists first.
+ */
+// TrackFactory permits an async build; this one is synchronous, but the
+// composition root must not assume that.
 const texSize = Math.min(1024, quality.maxTextureSize)
+const sky = buildSky(rngFor('render/sky'))
+scene.add(sky.mesh)
+
+const track = await createTrack(ctx)
 
 /*
- * MUST be 1.0 on every material below. `roughnessMap` MULTIPLIES this value, it
- * does not replace it.
+ * The open sand, textured — and it has to be.
  *
- * This was once set to a "sensible fallback" of 0.12, which scaled the whole map
- * down by 8x: a texture carrying 0.03 to 0.58 arrived as 0.004 to 0.07, every
- * square inch stayed mirror-smooth, and two rounds of tuning the noise field
- * changed nothing visible. The map was correct the entire time and was being
- * crushed on the way to the GPU. Same applies to metalnessMap and aoMap. When a
- * map appears to do nothing, check what it multiplies before touching the map.
+ * The first version was one flat colour on a 2400 m plane, and the flat-bright
+ * tile detector caught it on its first real use: two tiles painted, uniform,
+ * and bright. That is precisely the failure ART_DIRECTION §9b Trap 3 predicts
+ * ("an untextured ground plane under a directional light is genuinely uniform
+ * across a large fraction of frame, and it is easy to ship by accident"), and it
+ * is the daylight inverse of the black-tile failure the night theme had.
+ *
+ * The rock toolkit stands in for a real sand material until `render/` builds
+ * one with the §5b sheen term. Tiled at 40 m so dune-scale variation reads
+ * without the repeat becoming visible.
  */
-
-// Sand, everywhere. ART_DIRECTION §5b: the signature material, and harder than
-// the wet road was, because sand has no reflection to carry it.
+const sandMaps = makeRockSurface(texSize, rngFor('world/sand'), quality.maxAnisotropy)
+for (const m of [sandMaps.map, sandMaps.roughnessMap]) m.repeat.set(60, 60)
 const sand = new Mesh(
-  new PlaneGeometry(1400, 1400),
-  new MeshStandardMaterial({ color: 0xe3c893, roughness: 1.0, metalness: 0.0 }),
+  new PlaneGeometry(2400, 2400),
+  new MeshStandardMaterial({
+    color: 0xe3c893,
+    map: sandMaps.map,
+    roughnessMap: sandMaps.roughnessMap,
+    roughness: 1.0,
+    metalness: 0.0,
+  }),
 )
 sand.rotation.x = -Math.PI / 2
+sand.position.y = -0.05
 sand.receiveShadow = true
 scene.add(sand)
 
-// The road, laid on top. §3b: sunlit sand at luma 0.65 against tarmac at 0.27 is
-// the racing line, and it works before a single marking is drawn.
-const road = makeRoadSurface(texSize, rngFor('placeholder/road'), quality.maxAnisotropy)
-/*
- * The road plane is 18 m across and 900 m long, and PlaneGeometry hands out UVs
- * of 0..1 on both axes regardless. Left alone that stretches every texel 50:1
- * along the direction of travel, which does not read as a rough surface — it
- * reads as motion blur baked into a still frame. Repeat is set so texels come
- * out roughly square at about 9 m per tile.
- */
-for (const map of [road.roughnessMap, road.normalMap]) map.repeat.set(2, 100)
-const roadMesh = new Mesh(
-  new PlaneGeometry(2 * 9, 900),
-  new MeshStandardMaterial({
-    color: 0x4b4340,
-    metalness: 0.0,
-    roughness: 1.0,
-    roughnessMap: road.roughnessMap,
-    normalMap: road.normalMap,
-    normalScale: new Vector2(road.normalScale, road.normalScale),
+scene.add(track.group)
+scene.add(
+  buildRoad(track, {
+    rng: rngFor('world/road'),
+    textureSize: texSize,
+    anisotropy: quality.maxAnisotropy,
   }),
 )
-roadMesh.rotation.x = -Math.PI / 2
-roadMesh.position.y = 0.02
-roadMesh.receiveShadow = true
-scene.add(roadMesh)
 
-const canyon = buildPlaceholderCanyon(scene, rngFor('placeholder/canyon'), quality.maxAnisotropy)
+const terrain = buildCanyonTerrain(ctx, track)
+scene.add(terrain.group)
 
 /**
  * The wet road is the signature material of this project, and it taught the
@@ -337,6 +353,24 @@ window.addEventListener('resize', resize)
 resize()
 
 const cameraPath = new Vector3()
+const lookTarget = new Vector3()
+
+// Caller-owned TrackSample instances. `sample` writes into these and returns
+// them; the contract makes that the caller's job precisely so the hot path
+// allocates nothing.
+function makeSample(): TrackSample {
+  return {
+    position: new Vector3(),
+    tangent: new Vector3(),
+    normal: new Vector3(),
+    right: new Vector3(),
+    halfWidth: 0,
+    bank: 0,
+    curvature: 0,
+  }
+}
+const camHere = makeSample()
+const camAhead = makeSample()
 
 const loop = createLoop({
   fixedUpdate(): void {
@@ -362,23 +396,39 @@ const loop = createLoop({
     }
 
     /*
-     * A dolly down the canyon, not an orbit.
+     * The camera now drives the actual circuit rather than a straight line.
      *
-     * The camera is a depth cue in its own right: travelling along the axis the
-     * marker posts and kerbs converge on is what makes the vanishing point
-     * readable. Orbiting shows the same scene from every angle and never lets
-     * the eye resolve how far away anything is.
+     * It rides the racing line at a fixed speed, looking a fixed arc-length
+     * ahead. That look-ahead is what makes a corner readable: aiming at a point
+     * a fixed distance down the road is roughly what a driver does, and it is
+     * also the cheapest possible check that the spline's frame is coherent —
+     * a track whose tangent or normal quietly goes wrong makes this camera
+     * lurch, and no still frame would show it.
      *
      * Driven by the simulation clock, never the wall clock, so a screenshot at
      * tick N is the same image on every machine.
      */
-    const t = loop.clock.simTime * 7
-    const z = ((t % canyon.length) + canyon.length) % canyon.length - canyon.length / 2
-    cameraPath.set(Math.sin(loop.clock.simTime * 0.25) * 3.0, 2.1, z)
+    const LAP_SECONDS = 68
+    const t = (loop.clock.simTime / LAP_SECONDS) % 1
+    track.sample(t, camHere)
+    track.sample(t + 0.018, camAhead)
+
+    const lateral = track.racingLine(t)
+    cameraPath
+      .copy(camHere.position)
+      .addScaledVector(camHere.right, lateral)
+      .addScaledVector(camHere.normal, 2.4)
     camera.position.copy(cameraPath)
-    camera.lookAt(cameraPath.x * 0.4, 3.6, z - 40)
+    camera.up.copy(camHere.normal)
+    lookTarget
+      .copy(camAhead.position)
+      .addScaledVector(camAhead.right, track.racingLine(t + 0.018))
+      .addScaledVector(camAhead.normal, 1.6)
+    camera.lookAt(lookTarget)
+    sky.mesh.position.copy(camera.position)
+
     // The shadow frustum follows the camera; a fixed one centred on the origin
-    // loses every shadow the moment the dolly leaves the middle of the canyon.
+    // loses every shadow the moment the dolly leaves the middle of the map.
     sun.position.copy(cameraPath).addScaledVector(SUN_DIR, 240)
     sun.target.position.copy(cameraPath)
     sun.target.updateMatrixWorld()
@@ -411,6 +461,10 @@ const harness: HarnessAPI = {
   ready,
   get playerKartId(): number {
     return notYet('playerKartId')
+  },
+
+  get track() {
+    return track
   },
 
   resetRace: () => notYet('resetRace'),

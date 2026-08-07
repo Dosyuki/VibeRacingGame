@@ -71,7 +71,15 @@ export async function startServer(options = {}) {
       cwd: ROOT,
       stdio: ['ignore', 'pipe', 'pipe'],
       detached: process.platform !== 'win32',
-      env: { ...process.env, FORCE_COLOR: '0' },
+      /*
+       * NO_COLOR as well as FORCE_COLOR. vite prints its banner as
+       * `localhost:<ESC>[1m4173<ESC>[22m/`, and FORCE_COLOR=0 does not suppress
+       * that — the port regex below then fails to match and the harness dies
+       * thirty seconds later claiming the server never reported a URL. It has
+       * not bitten on this machine, but it is a one-word defence against a
+       * failure whose message points at entirely the wrong thing.
+       */
+      env: { ...process.env, FORCE_COLOR: '0', NO_COLOR: '1' },
     },
   )
 

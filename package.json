@@ -12,8 +12,9 @@
     "check:fps": "node tools/fps-bench.mjs",
     "check:energy": "node tools/energy-check.mjs",
     "check:contract": "node tools/contract-check.mjs",
-    "check": "npm run check:contract && npm run check:smoke && npm run check:energy && npm run check:fps",
-    "selftest": "node tools/smoke.mjs --broken && node tools/energy-check.mjs --broken && node tools/fps-bench.mjs --force-software"
+    "check": "npm run check:contract && npm run check:smoke && npm run check:track && npm run check:energy && npm run check:fps",
+    "selftest": "node tools/smoke.mjs --broken && node tools/energy-check.mjs --broken && node tools/track-check.mjs --broken && node tools/fps-bench.mjs --force-software",
+    "check:track": "node tools/track-check.mjs"
   },
   "repository": {
     "type": "git",

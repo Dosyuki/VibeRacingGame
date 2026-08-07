@@ -948,6 +948,25 @@ export interface HarnessAPI {
   readonly playerKartId: number
 
   /**
+   * The live circuit, BY REFERENCE — the one exception to the deep-copy rule
+   * two paragraphs up, and it is a considered one.
+   *
+   * That rule exists because a live handle on CHANGING state goes stale between
+   * the call and the assertion, and the resulting flakiness reads as a game bug.
+   * A track is built once and immutable for the life of the world, so that
+   * failure cannot occur here. A copy would also defeat the purpose: `locate`'s
+   * per-call cost and its allocation-freedom are properties of the real
+   * function, and they are exactly what needs measuring. The track is the one
+   * subsystem whose serious bugs — a spline parameterised by anything other than
+   * arc length, a lateral sign inverted, a frame that quietly stops being
+   * orthonormal — are all completely invisible in a rendered frame.
+   *
+   * This hands out no privilege that `GameServices.track` does not already give
+   * every subsystem.
+   */
+  readonly track: ITrack
+
+  /**
    * Full deterministic rebuild. Async because changing seed or quality replaces
    * GPU resources and regenerates the world; a synchronous `setSeed` would
    * leave `Ctx.seed` and every cached material disagreeing about which world
