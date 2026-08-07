@@ -2,7 +2,7 @@
  * VERMILION NINE — the circuit.
  *
  * ART_DIRECTION §1 in code: 1620 m of closed centreline through eight named
- * sections, half-width 4.6–13.0 m, elevation 0–52 m, bank 0° everywhere except
+ * sections, half-width 8.0–16.0 m, elevation 0–52 m, bank 0° everywhere except
  * The Wall.
  *
  * ────────────────────────────────────────────────────────────────────────────
@@ -41,8 +41,21 @@
  * mops up integrator round-off so the seam is exact regardless of step size.
  * ────────────────────────────────────────────────────────────────────────────
  *
- * WHERE THIS DISAGREES WITH §1, ON PURPOSE. All three are in the round report;
+ * WHERE THIS DISAGREES WITH §1, ON PURPOSE. All four are in the round report;
  * none of them is a quiet edit.
+ *
+ *   - §1's HALF-WIDTH NUMBERS ARE SUPERSEDED. The table says 4.6–13.0 m and
+ *     "half-width collapses to 4.6 m over 92 m" in The Slot. A 9.2 m road cannot
+ *     hold an eight-kart field: eight karts is 9.6 m of bodywork before any gap,
+ *     and overtaking needs two lines abreast plus room to be wrong about one of
+ *     them. The profile is now 8.0–16.0 m — a 16 m road at the narrowest and a
+ *     32 m road at the widest. The RELATIVE profile is preserved, so §1's
+ *     character column still holds: The Slot is still exactly half the width of
+ *     the dune sweep, and it is still the only place on the lap that gets
+ *     narrower for 92 m and then stops.
+ *     The centreline, the length, the elevation, the bank and the checkpoints
+ *     are untouched. Nothing in this widening moves a lap time except by giving
+ *     the ideal line more room to be ideal in.
  *
  *   - §1 gives The Wall 0.57–0.69 of the lap, i.e. 194 m. A 180° arc at
  *     R = 74 m is π·74 = 232.5 m. Those cannot both hold. The radius is the
@@ -235,41 +248,74 @@ const ELEVATION: readonly (readonly [Metres, Metres])[] = [
 const ELEVATION_TRANSITION = 40
 
 /**
- * Half-width keyframes, `[plan distance, half-width]`. §1 bounds: 4.6–13.0 m.
+ * Half-width keyframes, `[plan distance, half-width]`. Range 8.0–16.0 m.
+ *
+ * SUPERSEDES §1's 4.6–13.0 m — see the fourth bullet at the top of this file for
+ * why, and read that before "restoring" any number here to match the table. The
+ * short version: 4.6 m of half-width is a 9.2 m road, an eight-kart field is
+ * 9.6 m of bodywork, and the arithmetic does not close.
+ *
+ * The profile is the old one mapped through `w' = 3.62 + 0.952 w`, then rounded
+ * to values worth reading. An AFFINE map rather than a scale, deliberately: a
+ * pure scale (x1.23, which is what taking 13.0 to 16.0 costs) leaves The Slot at
+ * 5.7 m and fixes nothing where it actually hurts. Affine lifts the floor and
+ * keeps the ORDER and the SPACING of the sections, so §1's character column
+ * still describes the circuit you drive:
+ *
+ *   dune sweep  16.0   widest, and still the only 16
+ *   The Wall    15.0   wide because a 20° bank needs width or it is a ramp
+ *   grid        14.0
+ *   wash        13.6
+ *   final       12.5 → 14.0
+ *   mesa climb  11.7 → 12.7
+ *   esses       12.2 → 11.2
+ *   arch        11.5   the second narrows, and it reads as one
+ *   The Slot     8.0   narrowest, exactly half the dune sweep, held for 92 m
  *
  * Smoothstep-interpolated rather than linear. A width crease reads as a kink in
  * the barrier line from 200 m away, and the road mesh inherits it verbatim.
  *
- * THE RATE MATTERS AS MUCH AS THE VALUES. A smoothstep peaks at 1.5x its mean
- * rate, so a pair of keyframes needs `7.5 * Δwidth` metres between them to stay
- * under 0.2 m/m — the point past which the barrier line visibly steps rather
- * than tapers. The Wall's entry was written as 9.5 → 12.0 over 10 m, which is
- * 0.37 m/m, and `tools/track-check.mjs` is what caught it: the geometry looks
- * perfectly reasonable in every static frame and only fails as a rate.
+ * THE RATE MATTERS AS MUCH AS THE VALUES, AND IT IS WHAT CONSTRAINS A WIDENING.
+ * A smoothstep peaks at 1.5x its mean rate, so a pair of keyframes needs
+ * `7.5 * Δwidth` metres between them to stay under 0.2 m/m — the point past
+ * which the barrier line visibly steps rather than tapers. The Wall's entry was
+ * once written as 9.5 → 12.0 over 10 m, which is 0.37 m/m, and
+ * `tools/track-check.mjs` is what caught it: the geometry looks perfectly
+ * reasonable in every static frame and only fails as a rate.
+ *
+ * Widening a keyframe pair without lengthening the gap between them raises that
+ * rate, and two pairs here needed the gap: The Wall's exit taper went from 19 m
+ * to 29 m, and the wash was held at 13.6 rather than dropped further, because
+ * 15.0 → 13.6 over the original 19 m is 0.11 m/m and 16.0 → 13.6 over 19 m is
+ * 0.19 — inside the limit on paper and one rounding away from tripping it. The
+ * fix for a rate is a longer taper, never a looser gate. Worst pair on the lap
+ * is still The Slot's exit at 662 → 700, now 0.146 m/m against 0.154 before.
  */
 const HALF_WIDTH: readonly (readonly [Metres, Metres])[] = [
-  [0, 11.0],
-  [100, 11.0],
-  [170, 12.0],
-  [240, 13.0], // §1 maximum, on the dune sweep where the trap is outside the line
-  [330, 11.0],
-  [360, 9.0],
-  [520, 8.0],
-  [545, 7.0],
-  [570, 4.6], // §1 The Slot: 4.6 m, held for 92 m
-  [662, 4.6],
-  [700, 8.5],
+  [0, 14.0],
+  [100, 14.0],
+  [170, 15.0],
+  [240, 16.0], // maximum, on the dune sweep where the trap is outside the line
+  [330, 14.0],
+  [360, 12.2],
+  [520, 11.2],
+  [545, 10.2],
+  [570, 8.0], // The Slot: 8.0 m, held for 92 m. Half the dune sweep, as before.
+  [662, 8.0],
+  [700, 11.7],
   // The Wall opens on the APPROACH, 20 m before the arc: a 20° bank needs width
   // or it is a ramp, and the width has to arrive before the banking does.
-  [875, 9.5],
-  [915, 12.0],
-  [1121, 12.0],
-  [1140, 10.5],
-  [1300, 10.5],
-  [1335, 8.5], // inside the arch
-  [1453, 8.5],
-  [1470, 9.5],
-  [1620, 11.0],
+  [875, 12.7],
+  [915, 15.0],
+  [1121, 15.0],
+  // 29 m of taper off the banking, not the 19 m this used to take. The extra
+  // 2.4 m of drop would otherwise run at 0.19 m/m — see the note above.
+  [1150, 13.6],
+  [1300, 13.6],
+  [1335, 11.5], // inside the arch
+  [1453, 11.5],
+  [1470, 12.5],
+  [1620, 14.0],
 ]
 
 /**

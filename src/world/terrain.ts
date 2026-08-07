@@ -71,6 +71,26 @@ import {
 import { BARRIER_MARGIN, Surface } from '../types'
 import type { Ctx, ITrack, RNG, StartSlot, TrackLocation, TrackSample } from '../types'
 import { makeRockSurface } from '../render/procedural'
+/*
+ * THE ONE THING THIS FILE IMPORTS FROM A SIBLING, AND WHY.
+ *
+ * `road.ts` and this file both used to draw the ground immediately beside the
+ * road, each from its own idea of where the road stops. They disagreed, and the
+ * disagreement is the grey z-fighting stripe along the road edge in
+ * tools/out/lap-0.png. Two authors cannot converge on a shared edge by writing
+ * the same number twice; one of them has to own it.
+ *
+ * `road.ts` owns it, because it is the file that draws the thing the edge is an
+ * edge OF. This file consumes `roadEdgePoint`/`roadEdgeTuck` and derives nothing
+ * of its own — so when another agent widens the track, both surfaces move
+ * together, and `tools/seam-check.mjs` proves it at every station.
+ *
+ * This is not a violation of the "no implementation of ITrack reaches this
+ * file" rule at the top. `road.ts` is not a track; it is a peer surface, and
+ * these two functions are pure geometry over a `TrackSample` the caller
+ * supplies.
+ */
+import { roadEdgePoint, roadEdgeTuck } from './road'
 
 // ---------------------------------------------------------------------------
 // Public surface
@@ -86,6 +106,16 @@ export interface TerrainStats {
   readonly triangles: number
   readonly instances: number
   readonly stations: number
+  /**
+   * Scatter placements dropped because their bounding sphere could not clear
+   * `halfWidth + BARRIER_MARGIN` and still land on the talus.
+   *
+   * Reported rather than swallowed. A build where this is large is a build
+   * where the sections have no shoulder left, which is a track-width problem
+   * wearing a scatter-density costume, and the number is the only place it
+   * would show up before somebody noticed the scree had gone.
+   */
+  readonly scatterRejected: number
 }
 
 /**
@@ -641,6 +671,37 @@ interface Station {
   /** Unit "driver's right", horizontalised. Walls stand on world up. */
   readonly rx: number
   readonly rz: number
+  /**
+   * The two components of the UNFLATTENED right vector that were thrown away
+   * by horizontalising it, kept because scatter clearance is measured in the
+   * ROAD's frame and not in this file's.
+   *
+   * `TrackLocation.lateral` — which is what `BARRIER_MARGIN` is defined
+   * against, and what tools/seam-check.mjs measures — is the component along
+   * the banked `right`. A rock placed `u` metres out horizontally and `dy`
+   * metres up is at lateral `u·rightXZ + dy·rightY`, and through The Wall's
+   * bank that second term is over a metre. Placing on `u` alone put boulders
+   * a metre inside the barrier line while every number in this file said they
+   * were clear.
+   */
+  readonly rightY: number
+  readonly rightXZ: number
+  /**
+   * The world height the ground on this side stands on. `[left, right]`.
+   *
+   * NOT `py`. The road banks 20° through The Wall, so its outer edge is metres
+   * above the centreline and its inner edge metres below — and a canyon floor
+   * datumed on the centreline meets neither. Before this existed the apron had
+   * to fall about five metres between the road edge and a scree toe 1.5 m away,
+   * which seam-check reported as 186 stations of run-off outside its band and
+   * which reads, from a kart, as the ground dropping away beside you.
+   *
+   * The walls still STAND on world up — only their base height moves. A wall
+   * that leaned with the bank would be a canyon that tips over when the road
+   * does, which is the thing `sampleStations` horizontalises `right` to
+   * prevent, and this does not undo it.
+   */
+  readonly baseY: [number, number]
   readonly halfWidth: number
   readonly racingLine: number
   /** Per side (0 = left, 1 = right). */
@@ -650,6 +711,21 @@ interface Station {
   readonly faceTopU: [number, number]
   readonly talusH: [number, number]
   readonly sand: [number, number]
+  /**
+   * The road edge, and the point the apron tucks under it to, in WORLD space
+   * and on the ROAD's banked frame. Both come from `road.ts` — see the import
+   * note at the top. `[side][x, y, z]`.
+   *
+   * These are the only two points in this file that are not built on world up.
+   * They must not be: the road banks 20° through The Wall, and an apron that
+   * meets a banked road edge with a horizontalised right vector misses it by
+   * `sin(bank) · halfWidth`. Measured before the fix: 0.80 m of daylight
+   * between the road edge and the apron's inner edge at t = 0.58.
+   */
+  readonly seam: [[number, number, number], [number, number, number]]
+  readonly edge: [[number, number, number], [number, number, number]]
+  /** Metres the apron overlaps under the road here. `road.ts` decides this. */
+  readonly seamTuck: [number, number]
   readonly facePower: number
   readonly backGrade: number
   /** Metres the bedding stack is displaced by the §5c 2.4° dip at this point. */
@@ -931,7 +1007,7 @@ export function buildCanyonTerrain(
       const i1 = Math.floor(((c + 1) * stationCount) / CHUNKS)
       const builder = new SurfaceBuilder()
       for (let side = 0; side < 2; side++) {
-        emitApronStrip(builder, stations, i0, i1, side, uvU, fields)
+        emitApronStrip(builder, stations, i0, i1, side, uvU, fields, lapLength)
       }
       const geo = builder.build()
       if (!geo) continue
@@ -952,7 +1028,14 @@ export function buildCanyonTerrain(
   // -------------------------------------------------------------------------
   // Scatter — §5c talus boulders, §1 Trap 3 pebbles, §3a vegetation.
   // -------------------------------------------------------------------------
-  const scatter = buildScatter(ctx, stations, stationCount, spacing, options.scatterDensity ?? 1)
+  /*
+   * The geometries are built BEFORE the placements, and that ordering is the
+   * fix for the boulders-on-the-road defect rather than an aesthetic choice.
+   * A placement is only legal relative to how big the thing being placed is,
+   * and the only honest source for that is the geometry's own bounding sphere.
+   * Placing first and measuring later is what produced "0 intrusions inside
+   * halfWidth" over a screenshot with rocks on the racing line.
+   */
   const lodSplit = Math.min(60, ctx.quality.lodDistance)
 
   const boulderRng = ctx.rngFor('world/terrain/boulder-shapes')
@@ -974,6 +1057,12 @@ export function buildCanyonTerrain(
   const sageGeo = makeTuftGeometry(tuftRng.fork('sage'), 7, 0.62, 0.5)
   const brushGeo = makeTuftGeometry(tuftRng.fork('brush'), 5, 0.9, 0.85)
   geometries.push(...boulderGeos, ...pebbleGeos, sageGeo, brushGeo)
+
+  const scatter = buildScatter(ctx, stations, stationCount, spacing, options.scatterDensity ?? 1, {
+    boulder: maxBoundingRadius(boulderGeos),
+    pebble: maxBoundingRadius(pebbleGeos),
+    plant: maxBoundingRadius([sageGeo, brushGeo]),
+  })
 
   const boulderBuckets: Matrix4[][] = [[], [], [], [], [], []]
   for (const b of scatter.boulders) {
@@ -1072,6 +1161,7 @@ export function buildCanyonTerrain(
     triangles: Math.round(triangles),
     instances,
     stations: stationCount,
+    scatterRejected: scatter.rejected,
   }
 
   return {
@@ -1119,6 +1209,7 @@ function sampleStations(
     backGrade: 0.35,
   }
 
+  const seamV = new Vector3()
   const out: Station[] = []
   for (let i = 0; i <= stationCount; i++) {
     // The wrap is what closes the lap: station `stationCount` samples t = 0.
@@ -1152,6 +1243,16 @@ function sampleStations(
     const faceBaseU: [number, number] = [0, 0]
     const faceTopU: [number, number] = [0, 0]
     const talusH: [number, number] = [0, 0]
+    const seam: [[number, number, number], [number, number, number]] = [
+      [0, 0, 0],
+      [0, 0, 0],
+    ]
+    const edge: [[number, number, number], [number, number, number]] = [
+      [0, 0, 0],
+      [0, 0, 0],
+    ]
+    const seamTuck: [number, number] = [0, 0]
+    const baseY: [number, number] = [0, 0]
 
     for (let side = 0; side < 2; side++) {
       // Crest line. Two octaves plus an occasional notch — §1 Trap 4 is about
@@ -1173,9 +1274,14 @@ function sampleStations(
       const base = halfWidth + Math.max(0.6, resolved.setback[side]! * (1 + setJitter))
       let tH = Math.min(resolved.talusFrac[side]! * h, 7)
       let run = tH * TALUS_RUN_PER_METRE
-      // BARRIER_MARGIN is the shoulder a kart may legally be on. Nothing this
-      // module emits starts inboard of it.
-      const minToe = halfWidth + BARRIER_MARGIN * 0.4
+      /*
+       * BARRIER_MARGIN is the shoulder a kart may legally be on. Nothing this
+       * module emits starts inboard of it — and that used to be a comment over
+       * `BARRIER_MARGIN * 0.4`, which let the scree toe sit 0.6 m off the road
+       * on a 1.5 m margin. The comment was right and the code was not; a kart
+       * inside its own legal run-off was inside a talus slope. Full margin.
+       */
+      const minToe = halfWidth + BARRIER_MARGIN
       if (base - run < minToe) {
         run = Math.max(0, base - minToe)
         tH = run / TALUS_RUN_PER_METRE
@@ -1184,6 +1290,19 @@ function sampleStations(
       toeU[side] = base - run
       faceBaseU[side] = base
       faceTopU[side] = Math.max(0.8, base * resolved.topScale[side]!)
+
+      // The seam, taken whole from its owner. `spacing` is this module's
+      // station spacing and is the only input road.ts cannot already see; it is
+      // what sizes the corner term in the overlap.
+      const s = side === 0 ? -1 : 1
+      // The road edge height on this side: what the ground here stands on.
+      baseY[side] = sample.position.y + sample.right.y * s * halfWidth
+      const tuck = roadEdgeTuck(sample, spacing)
+      seamTuck[side] = tuck
+      roadEdgePoint(sample, s, tuck, seamV)
+      seam[side] = [seamV.x, seamV.y, seamV.z]
+      roadEdgePoint(sample, s, 0, seamV)
+      edge[side] = [seamV.x, seamV.y, seamV.z]
     }
 
     out.push({
@@ -1194,6 +1313,9 @@ function sampleStations(
       pz: sample.position.z,
       rx,
       rz,
+      baseY,
+      rightY: sample.right.y,
+      rightXZ: Math.max(1e-3, Math.hypot(sample.right.x, sample.right.z)),
       halfWidth,
       racingLine: track.racingLine(t),
       wallH,
@@ -1202,6 +1324,9 @@ function sampleStations(
       faceTopU,
       talusH,
       sand: [resolved.sand[0]!, resolved.sand[1]!],
+      seam,
+      edge,
+      seamTuck,
       facePower: resolved.facePower,
       backGrade: resolved.backGrade,
       dip: 0,
@@ -1256,7 +1381,6 @@ function buildProfiles(stations: Station[], fields: Fields, lapLength: number, f
       const faceBase = st.faceBaseU[side]!
       const faceTop = st.faceTopU[side]!
       const faceH = Math.max(0.25, wallH - talusH)
-      const talusRun = faceBase - toeU
 
       // --- band boundary fractions of the exposed face ----------------------
       /*
@@ -1342,6 +1466,29 @@ function buildProfiles(stations: Station[], fields: Fields, lapLength: number, f
       }
 
       // --- talus ------------------------------------------------------------
+      /*
+       * THE TALUS RUNS TO WHERE THE FACE ACTUALLY STARTS, NOT TO `faceBase`.
+       *
+       * `faceU(0, 1)` is `faceBase` PLUS `erosionAt(0)`, and erosion is signed:
+       * where it is positive the face's bottom row sits outboard of `faceBase`.
+       * Laying the talus to `faceBase` then left a horizontal strip between the
+       * top of the scree and the foot of the cliff with no geometry in it at
+       * all — a slot up to 1.8 m wide running the length of the wall, open to
+       * the sky above and to nothing below. That is the hole.
+       *
+       * It was not visible in `emitBandStrip`, because each band closes against
+       * its own neighbours correctly; the only junction in the whole profile
+       * between two DIFFERENT generators is this one, and it was the only one
+       * nobody joined. Measured by tools/seam-check.mjs as 1283 downward rays
+       * that hit nothing whatsoever.
+       *
+       * Solving it the other way — forcing erosion to zero at phi = 0 — would
+       * flatten the base of every gully into the cliff and is a visible loss.
+       * The talus following the face costs nothing.
+       */
+      const faceRoot = faceU(0, 1)
+      const talusEnd = Math.max(toeU + 0.2, faceRoot)
+      const talusRunEff = talusEnd - toeU
       const tRows = BANDS[BAND_TALUS]!.rows
       const tOff = BAND_ROW_OFFSET[BAND_TALUS]!
       for (let r = 0; r < tRows; r++) {
@@ -1349,7 +1496,10 @@ function buildProfiles(stations: Station[], fields: Fields, lapLength: number, f
         // Repose slopes are slightly concave; the exponent is what stops a scree
         // cone reading as a ramp.
         const jitter = ringNoise2(fields.setback, st.t + phase + f * 0.7, lapLength, 26)
-        u[tOff + r] = toeU + talusRun * f + jitter * 0.35 * (1 - Math.abs(2 * f - 1))
+        // The jitter is windowed to zero at BOTH ends: row 0 has to be exactly
+        // `toeU` for the apron to meet it, and the last row has to be exactly
+        // `faceRoot` for the cliff to meet it. `1 - |2f - 1|` is that window.
+        u[tOff + r] = toeU + talusRunEff * f + jitter * 0.35 * (1 - Math.abs(2 * f - 1))
         h[tOff + r] = talusH * Math.pow(f, 1.35)
       }
 
@@ -1397,7 +1547,7 @@ function buildProfiles(stations: Station[], fields: Fields, lapLength: number, f
        * deep into each other; where they do still meet, rock intersecting rock
        * is a ridge, not an artefact.
        */
-      const drop = wallH - capDrop - (floorY + 1 - st.py)
+      const drop = wallH - capDrop - (floorY + 1 - st.baseY[side]!)
       const run = clamp(drop / Math.max(0.05, st.backGrade), 20, 70)
       const totalDrop = run * st.backGrade
       const bOff = BAND_ROW_OFFSET[BAND_BACKSLOPE]!
@@ -1467,7 +1617,7 @@ function emitBandStrip(
       const u = st.rowU[side]![off + r]!
       const hh = st.rowH[side]![off + r]!
       const x = st.px + st.rx * sign * u
-      const y = st.py + hh
+      const y = st.baseY[side]! + hh
       const z = st.pz + st.rz * sign * u
       bandColour(_c, st, side, band, r / Math.max(1, rows - 1), hh, x, y, z, fields)
       ring.push(out.vertex(x, y, z, st.arc * uvU, st.rowV[side]![off + r]!, _c))
@@ -1569,6 +1719,40 @@ function bandColour(
   out.multiplyScalar(contact * mottle)
 }
 
+/**
+ * The shoulder apron: the ONE surface between the road edge and the wall toe.
+ *
+ * It has exactly two neighbours and it is defined entirely by them, because a
+ * surface that computes its own version of where its neighbours are is a
+ * surface that will disagree with them:
+ *
+ *   row 0      `st.seam` — under the road, on the road's own banked frame,
+ *              at whatever tuck `road.ts` asked for at this station.
+ *   row 1      `st.edge` — the road edge itself, same plane. Rows 0-1 are the
+ *              overlap; nothing between them is ever seen.
+ *   rows 2..5  a straight run from the road edge to the talus toe, which is
+ *              `(toeU, py)` — the SAME expression `emitBandStrip` writes for
+ *              row 0 of BAND_TALUS, so the two meet to the last bit rather than
+ *              to a tolerance.
+ *
+ * WHAT THIS REPLACES. The previous version anchored to `halfWidth - 0.25` and
+ * `py + dh` on the horizontalised frame, and ended at `toeU` with `dh` still
+ * non-zero. Three separate failures, all measured, none visible from inside
+ * this file:
+ *
+ *   - the inner edge missed a banked road edge by up to 0.80 m;
+ *   - `dh` at the seam ran from -0.32 m to +0.12 m, so the apron sometimes
+ *     poked UP through the road (27 mm at worst) and z-fought it;
+ *   - `dh` at the outer edge was likewise non-zero, leaving an open vertical
+ *     step of up to 0.31 m where the apron should have met the scree — 155
+ *     stations of it, both sides, the whole lap.
+ *
+ * AND THE NOISE IS KEYED ON `t`, NOT ON `arc`. That rule is in this file's
+ * header and this function broke it: `fields.mottle(u, st.arc * 0.07, …)` is
+ * not periodic over the lap, so the ring at arc = length came out 107-136 mm
+ * away from the ring at arc = 0. They are the same ground. The apron did not
+ * close at the start line, and there is no geometry across the step.
+ */
 function emitApronStrip(
   out: SurfaceBuilder,
   stations: Station[],
@@ -1577,29 +1761,71 @@ function emitApronStrip(
   side: number,
   uvU: number,
   fields: Fields,
+  lapLength: number,
 ): void {
-  const ROWS = 5
+  const ROWS = 6
   const sign = side === 0 ? -1 : 1
   let prev: number[] | null = null
 
   for (let i = i0; i <= i1; i++) {
     const st = stations[i]!
-    // Start slightly UNDER the road rather than beside it. A butt joint between
-    // two independently generated surfaces is a hairline of background colour at
-    // grazing incidence; an overlap is not.
-    const inner = st.halfWidth - 0.25
-    const outer = Math.max(inner + 0.4, st.toeU[side]!)
+    const seam = st.seam[side]!
+    const edge = st.edge[side]!
+    const toeU = st.toeU[side]!
+    // Verbatim the talus toe. If this expression and the one in `buildProfiles`
+    // ever stop matching, seam-check's `apron-toe` goes red.
+    const toeX = st.px + st.rx * sign * toeU
+    const toeY = st.baseY[side]!
+    const toeZ = st.pz + st.rz * sign * toeU
+
+    /*
+     * The swale depth is capped by how much room there is. A 0.29 m ditch is
+     * scenery when the toe is 20 m out and a trap when it is 1.5 m out, and
+     * `BARRIER_MARGIN` says a kart may legally be on the first 1.5 m of it.
+     */
+    const room = Math.max(0.4, toeU - st.halfWidth)
+
     const ring: number[] = []
     for (let r = 0; r < ROWS; r++) {
-      const f = r / (ROWS - 1)
-      const u = lerp(inner, outer, f)
-      const n = fields.mottle(u * 0.11 + side * 40, st.arc * 0.07, 3.3)
-      // A shallow swale: water runs off the road, so the ground beside it is
-      // lower than both the road and the toe of the scree.
-      const dh = -0.1 - 0.28 * Math.sin(Math.PI * f) + n * 0.22
-      const x = st.px + st.rx * sign * u
-      const y = st.py + dh
-      const z = st.pz + st.rz * sign * u
+      let x: number
+      let y: number
+      let z: number
+      let u: number
+      let f: number
+      let n = 0
+      if (r === 0) {
+        x = seam[0]!
+        y = seam[1]!
+        z = seam[2]!
+        u = st.halfWidth - st.seamTuck[side]!
+        f = 0
+      } else {
+        const g = (r - 1) / (ROWS - 2)
+        // Periodic in t. See the file header, and see what happened when it
+        // was not.
+        n = ringNoise3(fields.mottle, st.t, lapLength, 26, g * 3.1 + side * 40)
+        const swale = Math.min(0.2 + n * 0.09, room * 0.12) * Math.sin(Math.PI * g)
+        /*
+         * PLAN IS LINEAR, HEIGHT IS EASED, and the difference matters through
+         * The Wall.
+         *
+         * The canyon walls stand on world up from the CENTRELINE height and the
+         * road banks 20 degrees, so on the high side of the bank the road edge
+         * is metres above the toe the apron has to reach. A straight
+         * interpolation puts that whole descent into the first metre beside the
+         * road — inside `BARRIER_MARGIN`, which is run-off a kart is allowed
+         * to be on. Smoothstepping the HEIGHT alone leaves a level verge at the
+         * road and a level landing at the scree, and puts the drop in the
+         * middle where nothing drives. The plan stays linear so the strip is
+         * still a straight run in map view.
+         */
+        const gy = g * g * (3 - 2 * g)
+        x = lerp(edge[0]!, toeX, g)
+        y = lerp(edge[1]!, toeY, gy) - swale
+        z = lerp(edge[2]!, toeZ, g)
+        u = lerp(st.halfWidth, toeU, g)
+        f = g
+      }
 
       _c.copy(C_SAND_COMPACT).lerp(C_SCREE, smoothstep(0.15, 0.95, f))
       const sandW = st.sand[side]! * (1 - smoothstep(0.55, 1, f))
@@ -1627,6 +1853,14 @@ function emitApronStrip(
          * apron for the whole lap and leaves a hole you can see the hinterland
          * through. It fails on exactly one side, which is what makes it easy to
          * miss in a screenshot taken from the other one.
+         *
+         * This is now MEASURED rather than argued. tools/seam-check.mjs reads
+         * each triangle's geometric winding and reports an upward ray that
+         * lands on a back face as a hole, distinctly from one that lands on
+         * nothing. Both sides came back front-facing at every station, so the
+         * reversed-winding theory for the reported hole is dead — which is
+         * worth knowing, because it was the first thing everyone suspected and
+         * it was not the bug.
          */
         if (sign < 0) out.quad(A, B, C, D)
         else out.quad(A, D, C, B)
@@ -1656,6 +1890,41 @@ interface ScatterResult {
   readonly boulders: ScatterItem[]
   readonly pebbles: ScatterItem[]
   readonly plants: PlantItem[]
+  /** Placements dropped because nothing legal was left to place them in. */
+  readonly rejected: number
+}
+
+/**
+ * Unit-sphere radius of each scatter family's geometry, read off the geometry
+ * itself rather than asserted here.
+ *
+ * This is the number the previous version of this file did not have, and its
+ * absence is the whole of defect three. Talus was placed by ORIGIN — `u` was
+ * clamped so the centre of a boulder cleared the road — and the build report
+ * duly said "0 intrusions inside halfWidth". Meanwhile `makeRockChunk`
+ * displaces an icosahedron out to 1.57× its nominal radius, and the largest
+ * boulder is scaled by 4.1, so a rock whose centre was legally 2 m off the
+ * road had six metres of itself sitting on the racing line. The screenshots
+ * showed it; the check could not, because the check was measuring a point.
+ *
+ * Nothing here is a constant: the radii are computed from the geometries that
+ * were actually built, so re-tuning `makeRockChunk`'s lumpiness moves the
+ * clearance automatically instead of silently invalidating a magic number.
+ */
+interface ScatterRadii {
+  /** Max over all boulder LOD shapes. */
+  readonly boulder: number
+  readonly pebble: number
+  readonly plant: number
+}
+
+function maxBoundingRadius(geos: readonly BufferGeometry[]): number {
+  let r = 0
+  for (const g of geos) {
+    if (!g.boundingSphere) g.computeBoundingSphere()
+    r = Math.max(r, g.boundingSphere ? g.boundingSphere.radius : 0)
+  }
+  return r
 }
 
 const DENSITY_BY_TIER: Readonly<Record<string, number>> = {
@@ -1671,6 +1940,7 @@ function buildScatter(
   stationCount: number,
   spacing: number,
   extra: number,
+  radii: ScatterRadii,
 ): ScatterResult {
   const rng = ctx.rngFor('world/terrain/scatter')
   const rBoulder = rng.fork('boulders')
@@ -1681,6 +1951,7 @@ function buildScatter(
   const boulders: ScatterItem[] = []
   const pebbles: ScatterItem[] = []
   const plants: PlantItem[] = []
+  let rejected = 0
 
   const m = () => new Matrix4()
   const q = new Quaternion()
@@ -1706,6 +1977,26 @@ function buildScatter(
    * corridor until the arithmetic works.
    */
   const PEBBLES_PER_SQM = 0.14
+
+  /*
+   * THE ONLY RULE ABOUT WHERE SCATTER MAY GO.
+   *
+   * `halfWidth + BARRIER_MARGIN` is the outside of the run-off a kart is
+   * allowed to be on, and it moves when another agent widens the track. A
+   * placement is legal when its BOUNDING SPHERE clears that line — centre minus
+   * radius, not centre. Anything that cannot be placed legally is dropped and
+   * counted, never nudged: nudging piles a hundred rocks against an invisible
+   * line and reads as a wall.
+   *
+   * Returns the smallest HORIZONTAL offset that satisfies it, converted out of
+   * this file's horizontalised frame into the road's banked one — see
+   * `Station.rightY`. `dy` is the largest vertical excursion the instance can
+   * have from the road plane; the bank term is signed either way, so its
+   * magnitude is what has to be paid for on both sides.
+   */
+  const legalInner = (st: Station, worldRadius: number, dy: number): number =>
+    (st.halfWidth + BARRIER_MARGIN + worldRadius + Math.abs(dy * st.rightY)) / st.rightXZ
+
   for (let i = 0; i < stationCount; i++) {
     const st = stations[i]!
     for (let side = 0; side < 2; side++) {
@@ -1725,17 +2016,37 @@ function buildScatter(
         // running to the vanishing point is the loudest tell that this is
         // primitives.
         const f = Math.pow(rBoulder(), 1.7)
-        const u = toe - 1.2 + f * (talusRun * 1.25 + 2.2)
-        const h = talusH * Math.pow(clamp((u - toe) / Math.max(0.2, talusRun), 0, 1), 1.35)
         const s = (0.45 + Math.pow(rBoulder(), 2) * 2.3) * scale
+        const yStretch = 0.62 + rBoulder() * 0.4
+        // Worst-case radius after the non-uniform scale. The longest axis is
+        // what a bounding sphere sees, so that is what has to clear the line.
+        const worldRadius = radii.boulder * s * Math.max(1, yStretch)
+        // Size is drawn BEFORE the position, because the size is what decides
+        // which positions are legal.
+        // `h` below never exceeds `talusH`, and the boulder is sunk 0.3·s.
+        const uLo = legalInner(st, worldRadius, Math.max(talusH, s * 0.3))
+        const uHi = toe + talusRun * 1.25 + 1.0
+        if (uLo >= uHi) {
+          rejected++
+          // Burn the same number of draws either way, or a rejection shifts
+          // every subsequent placement on the lap and the field stops being
+          // reproducible from the seed.
+          rBoulder()
+          rBoulder()
+          rBoulder()
+          rBoulder()
+          continue
+        }
+        const u = uLo + f * (uHi - uLo)
+        const h = talusH * Math.pow(clamp((u - toe) / Math.max(0.2, talusRun), 0, 1), 1.35)
         axis.set(rBoulder() * 2 - 1, rBoulder() * 2 - 1, rBoulder() * 2 - 1)
         if (axis.lengthSq() < 1e-6) axis.set(0, 1, 0)
         axis.normalize()
         q.setFromAxisAngle(axis, rBoulder() * Math.PI * 2)
         // Sunk 30% into the ground. A sphere resting exactly on a plane reads as
         // a ball placed there; a buried one reads as a rock.
-        scl.set(s, s * (0.62 + rBoulder() * 0.4), s)
-        pos.set(st.px + st.rx * sign * u, st.py + h - s * 0.3, st.pz + st.rz * sign * u)
+        scl.set(s, s * yStretch, s)
+        pos.set(st.px + st.rx * sign * u, st.baseY[side]! + h - s * 0.3, st.pz + st.rz * sign * u)
         const mat = m().compose(pos, q, scl)
         boulders.push({
           matrix: mat,
@@ -1746,22 +2057,31 @@ function buildScatter(
       }
 
       // --- pebbles (§1 Trap 3) --------------------------------------------
-      const inner = st.halfWidth + 0.2
+      /*
+       * `inner` used to be `halfWidth + 0.2`, which is 1.3 m INSIDE the legal
+       * run-off. A 20 cm stone is not a hazard the way a 3 m boulder is, but
+       * "nothing is on the drivable surface" is not a rule with a size
+       * exemption — the moment there is one, the next author picks a different
+       * size for it.
+       */
+      const inner = st.halfWidth + BARRIER_MARGIN
       const span = Math.max(1.5, toe + 3 - inner)
       const pebbleN = PEBBLES_PER_SQM * spacing * Math.min(span, 26) * density
       const nP = Math.floor(pebbleN) + (rPebble() < pebbleN % 1 ? 1 : 0)
       for (let k = 0; k < nP; k++) {
-        const u = inner + Math.pow(rPebble(), 1.5) * span
+        const uf = Math.pow(rPebble(), 1.5)
+        const s = 0.05 + Math.pow(rPebble(), 2) * 0.24
+        // Longest axis of scl below is `s * 1.3`.
+        const u = legalInner(st, radii.pebble * s * 1.3, 0.16 + s * 0.35) + uf * span
         const d = Math.abs(sign * u - st.racingLine)
         // Falls off to nothing by 40 m, per Trap 3's shape if not its magnitude.
         if (rPebble() > 1 - smoothstep(40, 4, d)) continue
-        const s = 0.05 + Math.pow(rPebble(), 2) * 0.24
         axis.set(rPebble() * 2 - 1, rPebble() * 2 - 1, rPebble() * 2 - 1)
         if (axis.lengthSq() < 1e-6) axis.set(0, 1, 0)
         axis.normalize()
         q.setFromAxisAngle(axis, rPebble() * Math.PI * 2)
         scl.set(s, s * 0.55, s * (0.8 + rPebble() * 0.5))
-        pos.set(st.px + st.rx * sign * u, st.py - 0.16 + s * 0.35, st.pz + st.rz * sign * u)
+        pos.set(st.px + st.rx * sign * u, st.baseY[side]! - 0.16 + s * 0.35, st.pz + st.rz * sign * u)
         pebbles.push({ matrix: m().compose(pos, q, scl), shape: k % 2, distanceToLine: d, size: s })
       }
 
@@ -1776,17 +2096,21 @@ function buildScatter(
       const plantN = 0.62 * spacing * density * veg * clamp(span / 8, 0.3, 2.2)
       const nV = Math.floor(plantN) + (rPlant() < plantN % 1 ? 1 : 0)
       for (let k = 0; k < nV; k++) {
-        const u = inner + 1.2 + rPlant() * Math.max(1, span * 0.9)
+        const uf = rPlant()
         const s = 0.6 + Math.pow(rPlant(), 1.6) * 1.1
+        // A shrub is mostly air, but it is drawn double-sided and its blades
+        // reach further than its stem — the bounding sphere is the honest
+        // number and it is the one the rule is written about.
+        const u = legalInner(st, radii.plant * s * 1.4, 0.16) + uf * Math.max(1, span * 0.9)
         q.setFromAxisAngle(axis.set(0, 1, 0), rPlant() * Math.PI * 2)
         scl.set(s, s * (0.7 + rPlant() * 0.7), s)
-        pos.set(st.px + st.rx * sign * u, st.py - 0.16, st.pz + st.rz * sign * u)
+        pos.set(st.px + st.rx * sign * u, st.baseY[side]! - 0.16, st.pz + st.rz * sign * u)
         plants.push({ matrix: m().compose(pos, q, scl), kind: rPlant() < 0.55 ? 0 : 1 })
       }
     }
   }
 
-  return { boulders, pebbles, plants }
+  return { boulders, pebbles, plants, rejected }
 }
 
 /** Triangles in a geometry, indexed or not. Used only for the build report. */
