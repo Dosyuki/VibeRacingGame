@@ -1,0 +1,15 @@
+node_modules/
+dist/
+.vite/
+
+# Harness output. Screenshots and measurement runs are regenerated on demand and
+# would otherwise dominate the diff of every round.
+tools/out/
+docs/shots/*.png
+*.webm
+
+# Local editor / OS noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

@@ -1,0 +1,37 @@
+{
+  "name": "vibe-racing-game",
+  "version": "1.0.0",
+  "description": "Neon Drift - a browser kart racer with zero art assets.",
+  "main": "index.js",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Dosyuki/VibeRacingGame.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "bugs": {
+    "url": "https://github.com/Dosyuki/VibeRacingGame/issues"
+  },
+  "homepage": "https://github.com/Dosyuki/VibeRacingGame#readme",
+  "dependencies": {
+    "postprocessing": "^6.39.4",
+    "simplex-noise": "^4.0.3",
+    "three": "^0.185.1"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.2",
+    "@types/three": "^0.185.4",
+    "playwright": "^1.62.1",
+    "typescript": "^7.0.2",
+    "vite": "^8.2.1"
+  },
+  "private": true
+}
