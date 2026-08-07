@@ -107,6 +107,18 @@ const AIM_AHEAD_MAX = 42
  */
 const AIM_ROAD_WEIGHT = 0.55
 
+/**
+ * Speeds, in m/s, over which the follow direction ramps from pure chassis
+ * heading to the full blend toward the direction of travel.
+ *
+ * Below the floor the velocity vector carries no usable direction — on the grid
+ * it is exactly (0,0,0), and normalising it yields NaN — so the chassis is the
+ * only defined answer. The ramp exists so that crossing the floor is not a step
+ * change in where the camera sits; see the blend in `follow`.
+ */
+const TRAVEL_BLEND_FLOOR = 2.5
+const TRAVEL_BLEND_FULL = 6.0
+
 // ---------------------------------------------------------------------------
 // Spring constants — the numbers that decide whether this is nauseating
 // ---------------------------------------------------------------------------
@@ -454,11 +466,21 @@ export const createCameraRig: CameraFactory = (ctx: Ctx): ICameraRig & Subsystem
        * reason. Sitting behind the velocity vector leaves the chassis visibly
        * rotated in frame, which is the read. It is only a partial blend because
        * a full one turns the camera into a spectator of a spin.
+       *
+       * The blend RAMPS IN over `TRAVEL_BLEND_FLOOR`..`TRAVEL_BLEND_FULL` rather
+       * than switching on at a threshold. A hard switch is a degenerate input in
+       * disguise: a kart nudged sideways on the grid crosses 2.5 m/s with a
+       * velocity that can point anywhere relative to the chassis, and the follow
+       * direction then jumps by up to `blend` × that angle in a single tick — a
+       * visible snap at the one moment the player is looking hardest. Below the
+       * floor the velocity is not a direction at all (at the grid it is exactly
+       * the zero vector) and the chassis is the only honest answer.
        */
       const vlen = state.velocity.length()
-      if (vlen > 2.5) {
+      if (vlen > TRAVEL_BLEND_FLOOR) {
         travelForward.copy(state.velocity).multiplyScalar(1 / vlen)
-        const blend = state.drift.active ? 0.6 : 0.25
+        const u = clamp((vlen - TRAVEL_BLEND_FLOOR) / (TRAVEL_BLEND_FULL - TRAVEL_BLEND_FLOOR), 0, 1)
+        const blend = (state.drift.active ? 0.6 : 0.25) * u * u * (3 - 2 * u)
         followForward.copy(chassisForward).lerp(travelForward, blend)
       } else {
         followForward.copy(chassisForward)
@@ -466,22 +488,51 @@ export const createCameraRig: CameraFactory = (ctx: Ctx): ICameraRig & Subsystem
       if (followForward.lengthSq() < 1e-6) followForward.copy(chassisForward)
       followForward.normalize()
 
+      // Distance the aim leads by. Hoisted above both users — it was computed
+      // twice from the same inputs, and two copies of one number is how the
+      // road aim and the nose aim end up leading by different amounts.
+      const aimDist = Math.min(AIM_AHEAD_BASE + speed * AIM_AHEAD_PER_SPEED, AIM_AHEAD_MAX)
+
       // --- 2. where the road is -------------------------------------------
       let haveRoad = false
       if (track !== null) {
         track.locate(state.position, loc)
         track.sample(loc.t, here)
-        const aimDist = Math.min(
-          AIM_AHEAD_BASE + speed * AIM_AHEAD_PER_SPEED,
-          AIM_AHEAD_MAX,
-        )
         // Look-behind samples BEHIND on the same axis, so a reversed camera
         // still aims down the road rather than at the inside of a cliff.
+        // `sample` wraps `t`; the seam needs no special case here.
         const dirSign = lookBack > 0.5 ? -1 : 1
         track.sample(loc.t + (dirSign * aimDist) / track.length, ahead)
+        /*
+         * The lateral offset carried down the road is the KART'S OWN, not
+         * `ITrack.racingLine`.
+         *
+         * This is the whole reason the grid frame was wrong. `racingLine` is
+         * where the IDEAL line runs, and at the start line that is 12.5 m right
+         * of the centreline on a 14 m half-width road. A kart in slot 0 sits at
+         * lateral -2.7, so the road aim point was 15 m sideways — and because
+         * the lead distance bottoms out at AIM_AHEAD_BASE (9 m) when the kart is
+         * stationary, atan(15/9) put the aim 29° off the road at exactly the
+         * moment the player first sees the game. It shrinks as speed lengthens
+         * the lead, which is why it never showed up in a mid-circuit screenshot.
+         *
+         * Aiming at the racing line is also wrong in principle: it yaws the
+         * camera at any player who is not on the ideal line, permanently, in
+         * proportion to how far off it they are. The corner lead the rig wants
+         * comes from `ahead.position` following the centreline round the bend,
+         * which it does regardless of the lateral term. (The `racingLine` idiom
+         * came from the composition root's `applyVantage`, where there is no
+         * kart to take a lateral offset from and the ideal line is the only
+         * sensible answer.)
+         *
+         * Clamped to the road at the AHEAD sample: a kart 60 m out in the desert
+         * must not drag the "where the road goes" point 60 m out with it, or the
+         * one term that still knows where the road is stops knowing.
+         */
+        const carried = clamp(loc.lateral, -ahead.halfWidth, ahead.halfWidth)
         roadAim
           .copy(ahead.position)
-          .addScaledVector(ahead.right, track.racingLine(loc.t + (dirSign * aimDist) / track.length))
+          .addScaledVector(ahead.right, carried)
           .addScaledVector(ahead.normal, AIM_HEIGHT)
         haveRoad = true
       }
@@ -531,7 +582,6 @@ export const createCameraRig: CameraFactory = (ctx: Ctx): ICameraRig & Subsystem
         .addScaledVector(followForward, -distance * faceSign)
         .addScaledVector(smoothUp, height)
 
-      const aimDist = Math.min(AIM_AHEAD_BASE + speed * AIM_AHEAD_PER_SPEED, AIM_AHEAD_MAX)
       noseAim
         .copy(state.position)
         .addScaledVector(followForward, aimDist * faceSign)

@@ -24,7 +24,6 @@ import {
   Mesh,
   MeshStandardMaterial,
   PCFSoftShadowMap,
-  PerspectiveCamera,
   PlaneGeometry,
   PMREMGenerator,
   Scene,
@@ -126,12 +125,6 @@ const scene = new Scene()
 // canyon vista has a legitimate 400 m+ sightline.
 scene.fog = new FogExp2(0xd8b892, 0.0025)
 
-// far reaches the outermost mesa ring, which sits about 745 m from the near
-// side of the circuit; near is lifted off 0.1 to keep depth precision usable
-// across that range.
-const camera = new PerspectiveCamera(62, 1, 0.3, 2400)
-camera.position.set(0, 2.3, 0)
-camera.lookAt(0, 3.2, -40)
 
 const settings: Settings = {
   quality: tier,
@@ -377,6 +370,31 @@ const identities: KartIdentity[] = LIVERIES.map((colours, i) => ({
 
 const input = createInput(ctx)
 const cameraRig = createCameraRig(ctx)
+
+/*
+ * THERE MUST BE EXACTLY ONE CAMERA, AND IT IS THE RIG'S.
+ *
+ * This file used to construct its own `PerspectiveCamera` for the placeholder
+ * dolly, and never stopped: `renderer.render(scene, camera)` and the harness
+ * getter both pointed at that module-local object, while `cameraRig` quietly
+ * maintained a second one that was never rendered, never resized and never read.
+ *
+ * The rig was working correctly the entire time. Nobody was looking at its
+ * output. At the grid the kart faces +X and the abandoned dolly still looked
+ * down -Z, which is the 90-degree across-the-road view every player saw as the
+ * first frame of the game.
+ *
+ * Seven harnesses missed it because `vantage()` writes this same module-local
+ * camera, so every mid-circuit review shot was taken through the object that
+ * was actually being rendered and looked perfectly fine.
+ */
+const camera = cameraRig.camera
+// far reaches the outermost mesa ring, about 745 m from the near side of the
+// circuit; near is lifted off 0.1 to keep depth precision usable across it.
+camera.fov = 62
+camera.near = 0.3
+camera.far = 2400
+camera.updateProjectionMatrix()
 const race = createRace(ctx)
 const items = createItems(ctx)
 
@@ -696,8 +714,14 @@ const loop = createLoop({
       karts[i]!.step(step, frame)
     }
 
-    race.step(step)
-    items.step(step)
+    /*
+     * `race` and `items` are stepped by their own `fixedUpdate` below, through
+     * the subsystem loop. Calling `race.step` here as well ran the whole race
+     * at double rate — the three-second countdown finished in 1.55 s, and every
+     * lap time the project has recorded was against a clock running twice as
+     * fast as the simulation. `camera.ts` guards this exact hazard with a
+     * `lastFollowTick` check; nothing in `race.ts` did.
+     */
 
     // Stall detection. `Standing.progress` is NOT monotonic — it decreases on a
     // reverse or a respawn — which is exactly why the contract carries
@@ -814,7 +838,9 @@ const harness: HarnessAPI = {
     aiDrift = options?.aiDrift ?? 'seek'
     for (let i = 0; i < drivers.length; i++) {
       const mode = options?.drivers?.[karts[i]!.identity.id]
-      drivers[i]!.mode = mode ?? (karts[i]!.identity.isPlayer ? 'referenceAI' : 'referenceAI')
+      // The contract's default: referenceAI for every kart INCLUDING the player,
+      // because a harness benchmark wants a full field of reference drivers.
+      drivers[i]!.mode = mode ?? 'referenceAI'
       drivers[i]!.ai.reset()
     }
     scriptedInput = null

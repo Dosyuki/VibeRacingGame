@@ -17,7 +17,8 @@
     "check:track": "node tools/track-check.mjs",
     "check:seam": "node tools/seam-check.mjs",
     "check:steer": "node tools/steer-test.mjs",
-    "check:autoplay": "node tools/autoplay.mjs"
+    "check:autoplay": "node tools/autoplay.mjs",
+    "check:grid": "node tools/grid-start.mjs"
   },
   "repository": {
     "type": "git",
