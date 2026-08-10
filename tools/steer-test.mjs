@@ -227,6 +227,32 @@ const CFG = {
    * against the measured half-width at run time.
    */
   aiOffsetM: 2.5,
+  /*
+   * DERIVED from what the check claims to be testing. The probe asserts "the
+   * racing line is to your right, for the whole look-ahead". A 200 m radius
+   * bends by 5.7° over the 20 m the AI looks down, which cannot move the line
+   * across the kart. Anything tighter can, and then a correct AI reads red.
+   */
+  aiMinRadiusM: 200,
+  /*
+   * DERIVED from how far the kart actually goes: 36 ticks at the 18.2 m/s probe
+   * speed is 5.5 m. 15 m covers that with room to spare and is deliberately
+   * NOT `straightWindowM` — straightness has to hold over the AI's look-ahead,
+   * but the road only has to be wide enough where the KART is. Requiring both
+   * over the same 60 m found a best room of 1.62 m on this circuit and put the
+   * whole check into PENDING for no measurement reason.
+   */
+  aiRoomWindowM: 15,
+  /*
+   * guess. Below this the two placements are closer together than the kart is
+   * wide and the AI is being asked to distinguish something it cannot. The
+   * probe reports PENDING rather than shrinking further — a gate measuring
+   * nothing must not print a pass.
+   */
+  aiMinOffsetM: 0.8,
+  /** guess. Tarmac left beyond the kart at the probe placement, so the AI is
+   *  choosing a line rather than recovering from the gravel. */
+  aiEdgeMarginM: 1.0,
   /** DERIVED: 36 ticks is 0.30 s — long enough for a controller to commit, short
    *  enough that the kart has not yet reached the line and stopped steering. */
   aiTicks: 36,
@@ -441,12 +467,84 @@ async function battery(CFG) {
       `${sAt0.halfWidth.toFixed(2)} m. Every number below is a DIFFERENCE against a steer=0 run from this same seek, ` +
       `so whatever the road does here cancels exactly and only steering is left.`,
   )
-  if (!(sAt0.halfWidth > CFG.aiOffsetM + 1)) {
-    straight.notes.push(
-      `halfWidth ${sAt0.halfWidth.toFixed(2)} m is narrower than the ${CFG.aiOffsetM} m AI offset probe, so the ` +
-        `offset was clamped to fit. Reported because it shrinks the AI's error signal and therefore its command.`,
-    )
+  /*
+   * WHERE THE AI PROBE GOES, WHICH IS NOT WHERE THE CHASSIS PROBE GOES.
+   *
+   * The chassis checks want the flattest road on the lap and do not care where
+   * the racing line sits across it — they measure a DIFFERENCE against a
+   * steer=0 run from the same seek, so the road cancels. The AI check cannot
+   * borrow that t, because it places a kart a fixed distance either side of the
+   * LINE, and the line is not the centreline.
+   *
+   * On this circuit `racingLine` reaches 12.54 m on a 14.00 m half-width
+   * straight. That is legitimate and `track-check` gates it — `racing-line`
+   * reports `worstOverhangM: 0` — but it leaves 1.46 m of road on the right of
+   * the line and 26.5 m on the left. Probing ±2.5 m there puts the mirror run a
+   * metre into the gravel, `ai.ts` sets `recovering` because `loc.onTrack` is
+   * false, and BOTH runs then command full lock back toward the tarmac. Two
+   * identical -1.0000 readings, which look exactly like an inverted AI and are
+   * nothing of the kind. The probe was measuring its own placement.
+   *
+   * So the AI window is chosen on ROOM AROUND THE LINE, not width of road,
+   * subject to being straight enough that "the line is to your right" holds for
+   * the whole look-ahead.
+   */
+  const hasLine = typeof track.racingLine === 'function'
+  const lineAt = new Float64Array(N)
+  if (hasLine) for (let i = 0; i < N; i++) lineAt[i] = track.racingLine(i / N)
+
+  /*
+   * Two windows, and they are different lengths on purpose.
+   *
+   * STRAIGHTNESS has to hold over the AI's look-ahead, because the claim being
+   * tested is "the line is to your right at every look-ahead distance" — that
+   * is the 60 m `win` the chassis probe already computed.
+   *
+   * ROOM only has to hold where the KART is. 36 ticks at the probe speed is
+   * 5.5 m of travel. Demanding both over the same 60 m is what a first version
+   * did, and on this circuit the best window then had 1.62 m of room, which put
+   * the check into PENDING for a reason that had nothing to do with the AI.
+   */
+  const roomWin = Math.max(2, Math.round(CFG.aiRoomWindowM / ds))
+  const entryOffset = Math.round(win * CFG.straightEntryFrac)
+
+  /** Metres of road on the TIGHTER side of the racing line, worst over `count`. */
+  function roomFrom(start, count) {
+    let minRoom = Infinity
+    for (let k = 0; k < count; k++) {
+      const j = (start + k) % N
+      const r = Math.min(hw[j] - lineAt[j], hw[j] + lineAt[j])
+      if (r < minRoom) minRoom = r
+    }
+    return minRoom
   }
+
+  let aiEntry = -1
+  let aiRoom = -Infinity
+  for (let i = 0; i < N; i++) {
+    let worstC = 0
+    for (let k = 0; k < win; k++) {
+      const c = curv[(i + k) % N]
+      if (c > worstC) worstC = c
+    }
+    if (worstC > 1 / CFG.aiMinRadiusM) continue
+    const entry = (i + entryOffset) % N
+    const r = roomFrom(entry, roomWin)
+    if (r > aiRoom) {
+      aiRoom = r
+      aiEntry = entry
+    }
+  }
+  // No window is straight enough at all: fall back to the flattest one and let
+  // the offset floor below decide whether anything is still measurable there.
+  const aiFellBack = aiEntry < 0
+  if (aiFellBack) {
+    aiEntry = (bestStart + entryOffset) % N
+    aiRoom = roomFrom(aiEntry, roomWin)
+  }
+  const tAI = wrap01(aiEntry / N)
+  const sAtAI = mkSample()
+  track.sample(tAI, sAtAI)
 
   const needed = ['playerKartId', 'setInput', 'stepTicks', 'seek', 'kartSnapshot']
   const lack = needed.filter((n) => !have[n])
@@ -817,30 +915,65 @@ async function battery(CFG) {
     pend(aiCommand, 'requires setDriver; it is not available in this build')
     pend(aiOutcome, 'requires setDriver; it is not available in this build')
   } else {
-    const offset = Math.min(CFG.aiOffsetM, Math.max(0.5, sAt0.halfWidth - 1.5))
-    const lineAt0 = typeof track.racingLine === 'function' ? track.racingLine(t0) : 0
-    aiCommand.metrics.racingLineM = lineAt0
+    const lineAtAI = hasLine ? track.racingLine(tAI) : 0
+    const offset = Math.min(CFG.aiOffsetM, aiRoom - CFG.aiEdgeMarginM)
+    aiCommand.metrics.racingLineM = lineAtAI
     aiCommand.metrics.offsetM = offset
+    aiCommand.metrics.tAI = tAI
+    aiCommand.metrics.roomM = aiRoom
+    aiCommand.metrics.halfWidthM = sAtAI.halfWidth
+    aiCommand.metrics.fellBackToFlattest = aiFellBack
 
     /*
-     * Place the kart to the LEFT of the racing line on the flattest section of
-     * the lap. There is then exactly one correct action and no ambiguity about
-     * what "the racing line calls for a right-hand move" means: the line is to
-     * the kart's right, at every look-ahead distance, for the whole probe.
-     * Then the mirror.
+     * If there is not enough road either side of the line to place the kart on
+     * tarmac, this measures NOTHING and must say so. It routes through the same
+     * `blocked` path a dead run uses, so the PENDING wording stays in one place.
+     * The alternative — clamping the offset down and probing anyway — is how
+     * this check spent a round reporting an inverted AI that did not exist.
      */
-    const fromLeft = await run(0, {
-      driver: 'referenceAI',
-      lateral: lineAt0 - offset,
-      ticks: CFG.aiTicks,
-      slice: CFG.aiSliceTicks,
-    })
-    const fromRight = await run(0, {
-      driver: 'referenceAI',
-      lateral: lineAt0 + offset,
-      ticks: CFG.aiTicks,
-      slice: CFG.aiSliceTicks,
-    })
+    const tooTight =
+      offset >= CFG.aiMinOffsetM
+        ? null
+        : `the roomiest straight window on the lap leaves ${aiRoom.toFixed(2)} m of road on the tighter side of ` +
+          `the racing line (t=${tAI.toFixed(4)}, halfWidth ${sAtAI.halfWidth.toFixed(2)} m, line ` +
+          `${lineAtAI.toFixed(2)} m off centre` +
+          `${aiFellBack ? `; no window met the ${CFG.aiMinRadiusM} m straightness floor at all` : ''}). After a ` +
+          `${CFG.aiEdgeMarginM} m edge margin the offset would be ${offset.toFixed(2)} m, under the ` +
+          `${CFG.aiMinOffsetM} m floor. Placing the kart anyway would put it off the road, where the AI is ` +
+          `correctly recovering and its command says nothing about which side the line is on`
+
+    /*
+     * Place the kart to the LEFT of the racing line. There is then exactly one
+     * correct action and no ambiguity about what "the racing line calls for a
+     * right-hand move" means: the line is to the kart's right, at every
+     * look-ahead distance, for the whole probe. Then the mirror.
+     *
+     * `lateral` here is RELATIVE TO THE RACING LINE, because that is what
+     * `HarnessAPI.seek` does with it: `main.ts` hands `racingLine(t) + lateral`
+     * to `IKart.placeAt`, whose contract IS centreline-relative. This file used
+     * to pass `racingLine(t0) - offset`, so the line went on twice and the kart
+     * was placed 22.6 m across a 14.0 m half-width road. `seek`'s `lateral` is
+     * undocumented in `types.ts`, which is how two readings of it lived side by
+     * side in the same repository without either looking wrong.
+     */
+    const fromLeft = tooTight
+      ? { blocked: tooTight }
+      : await run(0, {
+          driver: 'referenceAI',
+          t: tAI,
+          lateral: -offset,
+          ticks: CFG.aiTicks,
+          slice: CFG.aiSliceTicks,
+        })
+    const fromRight = tooTight
+      ? { blocked: tooTight }
+      : await run(0, {
+          driver: 'referenceAI',
+          t: tAI,
+          lateral: offset,
+          ticks: CFG.aiTicks,
+          slice: CFG.aiSliceTicks,
+        })
     if (have.setInput) h.setDriver(pid, 'scripted')
 
     if (fromLeft.blocked || fromRight.blocked) {

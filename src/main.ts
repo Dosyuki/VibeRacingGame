@@ -891,10 +891,34 @@ const harness: HarnessAPI = {
     if (i >= 0 && drivers[i]!.mode !== 'scripted') drivers[i]!.mode = 'scripted'
   },
 
+  /**
+   * Releases the SCRIPTED OVERRIDE, and nothing else.
+   *
+   * This used to end `drivers[i].mode = 'human'` unconditionally, which made it
+   * the exact hazard `seek` documents forty lines above and guards against: a
+   * player left in a driver mode nobody asked for, reading a commanded steer of
+   * exactly 0.0000 against a perfectly working AI. `seek` restores the mode it
+   * found and then `steer-test` does this, which is the only ordering that
+   * matters:
+   *
+   *     h.seek(...)                       // mode restored
+   *     h.setDriver(pid, 'referenceAI')   // mode := referenceAI
+   *     h.releaseInput()                  // mode := human   <- clobbered
+   *
+   * The AI was never asked for a frame, so `lastInput` reported the live
+   * keyboard — all zeros in a headless run. Two gates went red on `game/` and
+   * the defect was here, in `core`'s side of the harness surface.
+   *
+   * `setInput` is documented in the contract as switching the player to
+   * `'scripted'`; the symmetric release is therefore to undo THAT, not to
+   * impose a third mode. An explicit `setDriver` outranks us — if the caller
+   * put this kart under a driver, releasing scripted input must not take it
+   * away. Only a player still sitting in `'scripted'` goes back to `'human'`.
+   */
   releaseInput(): void {
     scriptedInput = null
     const i = karts.findIndex((k) => k.identity.isPlayer)
-    if (i >= 0) drivers[i]!.mode = 'human'
+    if (i >= 0 && drivers[i]!.mode === 'scripted') drivers[i]!.mode = 'human'
   },
 
   injectInput: () => notYet('injectInput'),
