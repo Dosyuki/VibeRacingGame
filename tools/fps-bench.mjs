@@ -147,7 +147,7 @@ try {
     console.log(`60 fps     ${avg <= BUDGET_MS ? 'PASS' : 'FAIL'}  (budget ${BUDGET_MS.toFixed(2)} ms)`)
 
     const draws = results[0].drawCalls
-    console.log(`draw calls ${draws <= 250 ? 'PASS' : 'FAIL'}  ${draws} / 250  (ART_DIRECTION §8)`)
+    console.log(`draw calls ${draws <= 250 ? 'PASS' : 'FAIL'}  ${draws} / 250  (ART_DIRECTION §9)`)
 
     if (avg > BUDGET_MS || draws > 250) process.exitCode = 1
 

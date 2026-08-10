@@ -7,7 +7,7 @@ frames rather than source, and harnesses answer the questions a screenshot
 cannot.
 
 Read `README.md` for what this is and `ART_DIRECTION.md` for what it must look
-like. **§9 of that file is the rubric, and it is the bar.**
+like. **§10 of that file is the rubric, and it is the bar.**
 
 ## Commands
 
@@ -131,7 +131,7 @@ question that is genuinely hard to answer by looking.
 |---|---|---|
 | `smoke.mjs` | Did a frame actually reach the screen, all of it? | `--broken` scissor-clears half the buffer |
 | `fps-bench.mjs` | What does a frame cost, on a GPU we can name? | `--force-software` must be refused |
-| `energy-check.mjs` | Is the frame inside the §8 additive budget? | `--broken` blows a quarter to white |
+| `energy-check.mjs` | Is the frame inside the §9a frame-energy budget? | `--broken` blows a quarter to white |
 | `contract-check.mjs` | Does every harness method work, or refuse honestly? | reports its own coverage ledger |
 
 ```bash

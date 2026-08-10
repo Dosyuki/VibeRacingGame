@@ -1,21 +1,31 @@
 /**
- * ART_DIRECTION §8 — the additive energy budget, enforced as a number.
+ * ART_DIRECTION §9a — the frame-energy budget, enforced as a number.
  *
  *   node tools/energy-check.mjs
  *   node tools/energy-check.mjs --broken   # self-test: the clip gate must fire
  *
- * A city built out of emitters, plus bloom, walks toward a white screen one
- * defensible commit at a time. No single change looks wrong, every reviewer
- * says "a little brighter is fine", and four rounds later the frame is a
- * magenta blob. Taste cannot hold that line across parallel agents who never
- * see each other's work. A measured ceiling can.
+ * A frame drifts one defensible commit at a time. No single change looks wrong,
+ * every reviewer says "a little brighter is fine" or "the shadows are hard to
+ * read", and four rounds later the image has no range left in it. Taste cannot
+ * hold that line across parallel agents who never see each other's work. A
+ * measured ceiling can.
  *
- *   mean frame luma        <= 0.42
- *   clipped pixels         <= 3.0%    (luma >= 0.99)
- *   worst-case clipped     <= 6.0%    (tier-3 boost at the tunnel exit)
- *   frame luma std-dev     >= 0.11    (a flat frame fails even when it is dark)
+ * WHICH WAY THE FRAME DRIFTS DEPENDS ON THE THEME, AND THIS FILE HAS CHANGED
+ * THEME ONCE. Under the night circuit the failure was a white screen creeping
+ * in. Under a 12° sun it is the opposite: a desert is *supposed* to be bright,
+ * and its failure is a FLAT frame — high mean luma with collapsing variance,
+ * which is what happens when shadows get lightened one commit at a time to
+ * answer a readability complaint. The std-dev floor and the shadow-occupancy
+ * floor are the two rows a flat frame cannot pass, and the two most likely to
+ * be argued away. See §9a.
  *
- * It walks every §10 vantage. Those that need subsystems which do not exist yet
+ * The numbers are NOT restated here. They live in `LIMITS` below, each one
+ * labelled derived or guess, because the previous version of this comment
+ * carried the night tier's mean/clip/std-dev long after `LIMITS` had moved to
+ * the desert tier — and a docblock that contradicts the gate it documents will
+ * eventually be "fixed" in the wrong direction.
+ *
+ * It walks every §11 vantage. Those that need subsystems which do not exist yet
  * are reported as PENDING, not silently skipped — a gate that quietly covers
  * nothing reads exactly like a gate that passed.
  */
@@ -302,7 +312,7 @@ try {
     console.error(`ENERGY BUDGET EXCEEDED (${failures.length})`)
     process.exitCode = 1
   } else {
-    console.log('PASS — within the §8 energy budget.')
+    console.log('PASS — within the §9a frame-energy budget.')
   }
 } finally {
   await browser.close()

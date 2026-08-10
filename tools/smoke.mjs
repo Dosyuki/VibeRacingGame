@@ -135,11 +135,22 @@ try {
    * tiles at 98% and 99% black which are entirely correct, so the old rule
    * would have failed exactly the frame the art direction is aiming for.
    *
-   * A region the GPU never painted has zero variance. A dark alley wall does
-   * not. See ART_DIRECTION §8b.
+   * DARKNESS SURVIVED AS A SIGNAL FOR EXACTLY ONE THEME, AND IT IS NOT THIS
+   * ONE. At night a correct frame was full of near-black tiles; under a 12° sun
+   * §9a puts the deepest legitimate surface at luma 0.070 and there are no
+   * legitimately black tiles at all. The question "was this drawn?" is answered
+   * by variance in both cases, which is why the detector outlived the theme.
+   *
+   * A region the GPU never painted has zero variance, AT ANY BRIGHTNESS — the
+   * darkness clause was removed from the detector itself (see the note in
+   * `diagnostics.ts` beside `UNPAINTED_STDDEV`), because `setClearColor(sky)`
+   * is an ordinary thing to write under a bright sky and would otherwise
+   * disable it. Do not put "and black" back into this message: a blown flat sky
+   * trips this gate and describing it as black sends the reader to the wrong
+   * subsystem. See ART_DIRECTION §9b.
    */
   if (luma.unpaintedTiles > 0) {
-    fail(`${luma.unpaintedTiles} tile(s) are uniform and black — part of the frame was never drawn`)
+    fail(`${luma.unpaintedTiles} tile(s) are uniform — part of the frame was never drawn`)
   }
 
   if (stats.drawCalls === 0) fail('zero draw calls')
