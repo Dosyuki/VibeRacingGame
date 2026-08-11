@@ -256,6 +256,142 @@ would make `steer-test`'s `ai-command` read `0.0000` against a working AI outsid
 
 ---
 
+## 4. "Too slippery, like it drifts by itself" was three separate bugs and one wrong guess
+
+**Round 8 → 9. Found by:** driving the deployed build.
+
+> The road is too slippery. It's kind of like it drifts by itself.
+
+and, a few minutes later:
+
+> The road when it curves should use the same setting as the normal road.
+
+**The second sentence was wrong, and it was still worth having.** Per-wheel grip in
+corners measures **0.896** against **0.772** on the straights — corners are the
+grippier part of this circuit, because the line rides the 0.95 kerb through
+apexes. Applying the reporter's own proposed fix would have made it worse. But
+the report correctly localised *something* to corners, and it was the thing that
+sent one agent to a constant-radius constant-surface bench where the vehicle
+defect was finally isolated. A wrong diagnosis attached to a real observation is
+still evidence; what it is not is a work order.
+
+Three defects, none of them the tyre grip table everyone reaches for first.
+
+### The racing line was laid inside the sand
+
+`track.ts` clamps the racing line to `halfWidth − RACING_MARGIN` with
+`RACING_MARGIN = 1.35`. `surfaceAt` returns `SandDrift`, grip **0.62**, within
+`SAND_EDGE_WIDTH = 1.7` of the edge. **The two constants had never been compared
+to each other.** Wherever the clamp bit — 925 m of a 1624 m lap — the line sat
+0.35 m inside the sand, and a kart of real width sat with its outer wheel 0.99 m
+into it and its inner wheel 0.29 m outside.
+
+Result: a permanent, one-sided 0.88 / 0.62 axle split across **85.2% of straight-
+line distance**, mean signed asymmetry **+0.2216**. That is "it drifts by itself",
+literally: the kart is pulled one way, all the time, with nothing commanded.
+
+`road.ts` paints the rubber lay-down *along* `racingLine`, so the dark line a
+human naturally aims at was exactly the sand. The game was inviting the player
+onto its slipperiest surface.
+
+**It also closes a red that had been blamed on the chassis.** `steer-test`'s
+check 6 asymmetry — 8.4%, then 17.2% after the suspension fix restored tyre load
+— was measured by a probe that `seek`s to `lateral: 0`, which resolves to the
+racing *line*, not the centreline. Placed on the centreline instead, the same
+build measures **0.00% asymmetry and 2.8e-8 m of zero-steer drift.** The kart is
+bit-exactly symmetric: `dRight +1.4418569242656136`, `dLeft −1.4418569242656136`.
+Two agents spent hours looking for a yaw moment inside a vehicle that did not
+have one, because the instrument was standing with one axle on each of two
+surfaces and nothing said so.
+
+### The chassis oversteered by construction, and a fake damper hid it
+
+`FRONT_AXLE = 0.72`, `REAR_AXLE = −0.68` — the mass centre sits *behind* the
+wheelbase midpoint on a rear-driven kart. And because chassis attitude is taken
+from the averaged road normal there is **no pitch or roll degree of freedom**:
+all four springs sit at the same length, static load is **637.65 N on every
+wheel, exactly 50/50, with zero load transfer under cornering**. So the rear has
+50% of the capacity and is asked for 51.4% of the force. At saturation the net
+yaw moment is `(a−b)·F_peak = +45 N·m` — **pro-spin, with no restoring term at
+all.**
+
+Every steady-state measurement said understeer. That reading was manufactured by
+`yawRate *= 1 − step·1.65`, a yaw-rate damper with no physical counterpart. The
+measured understeer gradient varies **3.25× with speed** — a real one does not
+vary at all — and fits `K₀ + A/v` with **K₀ = −0.0159**, negative, oversteering.
+The entire apparent stability was the 1/v term. Remove the damper and the kart
+departs at every speed and every steer tried. Above 26 m/s it was supplying more
+yaw damping than all four tyres combined.
+
+**A fictitious term that makes a broken model look right is worse than the break
+it hides**, because every instrument agrees with it.
+
+### The engine could ask for 3.1× what the rear tyres could transmit
+
+`ENGINE_FORCE = 3450` N against a rear-axle budget of `2 × 637.65 × 0.88 = 1122`
+N. Below 21.3 m/s at full throttle the rear was in gross wheelspin — contact
+patch at **278.7 m/s while the kart did 21.2**, slip-saturated for **99.9%** of a
+0→25 run — and the friction circle correctly took the lateral force away. This is
+the leg the player actually felt, because it fires the moment you use the
+throttle in a corner.
+
+### What the numbers did
+
+| | before | after |
+|---|---|---|
+| cross-axle grip step ≥0.2, straights | 85.2% | **0.00%** |
+| zero-steer drift in 0.75 s | +0.0548 m | 2.8e-8 m |
+| step-steer 0.4 at 24 m/s, peak body slip | **74.7°** | 6.5° |
+| …and on releasing the wheel | **90.0°** (spins) | 5.7° |
+| understeer gradient K₀ | −0.0159 (oversteer) | **+0.0741** |
+| max usable steer at 22 m/s | 0.343 | 0.791 |
+| `slip-check` corner compliance | 2.792 deg/(m/s²) | **0.640** |
+| 0→25 m/s | 6.97 s | **6.97 s** |
+| `steer-test` check 6 asymmetry | 17.2% | 4.2% |
+| `grid-start` corner-onroad | FAIL | **PASS** |
+
+### Why the gates missed it
+
+- **`steer-test` probes for 0.75 s.** Step steer at 20 m/s looks *settled* at 1 s
+  and departs between 2 and 3. A short probe does not merely risk missing a slow
+  divergence — here it reliably reported the stable-looking part of a divergent
+  response.
+- **Its probe stood on a grip discontinuity**, so the one number that could have
+  exposed the sand — `baselineDrift.lateral`, +0.1396 m of movement at zero steer
+  — was printed in every report and read by nobody as a defect.
+- **No harness had a reference vehicle.** "Is 2.79 deg/(m/s²) of body slip a lot?"
+  is unanswerable without one. `slip-check`'s bicycle model measures 0.37, and
+  that ratio is what turned a taste argument into a defect.
+- **`autoplay` gates outcomes.** Both builds respawn ~85 times a race; stock
+  completes *fewer* laps. A field that is uniformly broken satisfies every
+  outcome threshold that has no baseline.
+- **Nothing compared two constants in the same file.** `RACING_MARGIN` and
+  `SAND_EDGE_WIDTH` are 3 lines apart in `track.ts` and describe the same
+  geometry. There is no harness class for "two numbers that must be related and
+  are not", and this project now has two instances: these, and the damper hiding
+  the axle split.
+
+### Recorded against ourselves
+
+- The `--broken` self-test for `grid-start` cannot prove six of its detectors
+  while their checks are red on a clean build, and says so rather than passing.
+- `slip-check` caps at ~25 m/s, so it **never reached** the throttle-limited
+  corner; `slip-corner` reads identically across all three engine variants. The
+  gate that graded this fix could not see one third of it.
+- `slip-corner`'s peak of 70.6° is unchanged and is **the harness's own
+  controller** saturating at ±1.00 and leaving the road at 4 m/s, in both builds.
+  It was not tuned to.
+- The user asked for all three engine options and got two. Stacking the traction
+  limit onto the engine reduction costs **+43% on 0→25 for zero steering gain**,
+  because pinning `driveForce` at exactly the longitudinal limit leaves the
+  friction circle no lateral budget at all — the same lost corner, by a different
+  route. Reporting that back was worth more than executing the instruction.
+- Deliberate drift still reaches tier 3 at 18 and 24 m/s, but the AI's tier-3
+  rate fell **14.8% → 8.9%**. That is the one number that moved the wrong way and
+  it is written here rather than left in a log.
+
+---
+
 ## Standing gaps — what nobody has done yet
 
 These are not findings. They are the honest shape of what this file does *not*
