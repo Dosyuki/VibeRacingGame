@@ -56,6 +56,14 @@ interface Racer {
   lastLapStartedAt: Seconds
   offTrackFor: Seconds
   stalledFor: Seconds
+  /**
+   * Forward travel along the centreline, in laps, accumulated one tick at a
+   * time. NOT a position: a teleport contributes nothing to it, which is the
+   * whole reason it exists. See the stall detector in `updateRacer`.
+   */
+  travelled: number
+  /** High-water mark of `travelled`. The stall detector's only reference. */
+  bestTravelled: number
   initialX: number
   initialY: number
   initialZ: number
@@ -215,6 +223,14 @@ export const createRace: RaceFactory = (ctx: Ctx): StandingRace => {
     racer.kart.respawn(t)
     racer.offTrackFor = 0
     racer.stalledFor = 0
+    /*
+     * A respawn moves the kart BACKWARDS, deliberately, and the stall detector
+     * must not then spend the next twelve seconds asking it to make up ground
+     * the game itself took away.  Re-baselining here is what stops a rescue
+     * from becoming the cause of the next rescue.  `travelled` survives — only
+     * the bar it has to beat comes down to where the kart actually is.
+     */
+    racer.bestTravelled = racer.travelled
     rebaseline(racer)
   }
 
@@ -262,12 +278,79 @@ export const createRace: RaceFactory = (ctx: Ctx): StandingRace => {
      * high-water mark is monotonic.  Before the first legitimate start crossing
      * the grid's t ~= 1 must not become that high-water mark: doing so would
      * classify the whole first lap as stalled because no value can exceed it.
+     *
+     * `bestProgress` is on the contract and is published telemetry — `main.ts`
+     * derives `KartTelemetry.ticksWithoutProgress` from it and both
+     * `autoplay.mjs` and `grid-start.mjs` reason about the lap-1 latch above in
+     * writing.  It keeps exactly the meaning it had.  What it no longer does is
+     * DECIDE anything: see the stall detector below.
      */
     if (
       racer.armed &&
       racer.standing.progress > racer.standing.bestProgress + PROGRESS_EPSILON
     ) {
       racer.standing.bestProgress = racer.standing.progress
+    }
+
+    /*
+     * THE STALL DETECTOR RUNS ON TRAVEL, NOT ON POSITION, AND THAT IS THE FIX.
+     *
+     * It used to reset `stalledFor` only when `progress` beat its own
+     * high-water mark, and `progress` is a POSITION — so every route by which
+     * the game itself moves a kart backwards handed the kart a debt it then had
+     * to re-drive inside `STALL_SECONDS` or be respawned for not driving.  The
+     * comment above already names one such route and guards it with `armed`.
+     * There were three more, and the middle one is what a human hit:
+     *
+     *   1. RESPAWN.  `respawn` puts the kart 1 m past the last checkpoint it
+     *      crossed, at zero speed, while `bestProgress` stays out where the
+     *      kart left the road.  MEASURED on this circuit: driven at a pace that
+     *      holds the road for 100% of a run, a standing start covers a section
+     *      in 10.4-18.1 s, and SIX OF THE SEVEN sections a scripted controller
+     *      could traverse take longer than the 12 s stall grace — so the debt
+     *      is normally UNPAYABLE.  One legitimate off-track respawn was followed
+     *      by a stall respawn to the SAME checkpoint 12.0 s later, and another
+     *      12.0 s after that, for ever — the kart on the centreline at 18 m/s
+     *      every single time.  Reproduced end to end: one deliberate mistake at
+     *      30 s, then respawns at 34.0 (off-track, correct) and then 46.0, 58.1,
+     *      70.1, 82.1, 94.1, 106.1, 118.1 s, all stall, all while driving
+     *      perfectly, with the lap counter frozen at zero.  That is the "after
+     *      driving a while it resets itself and starts again" report exactly.
+     *   2. A LAP THE ANTI-CUT VALIDATION REFUSES.  `crossForward` only credits a
+     *      lap if the whole checkpoint sequence was walked, and a crossing is
+     *      only seen while `onTrack` holds on BOTH sides of it.  Miss one and
+     *      `completedLaps` does not increment while `t` wraps to 0, so
+     *      `progress` drops by a whole lap that no amount of driving can make
+     *      up inside 12 s.
+     *   3. `crossBackward` DISARMING a kart at checkpoint zero.  With `armed`
+     *      false the branch above could never reset the timer at all, so the
+     *      kart was respawned 12 s later no matter how it was driving.
+     *
+     * BE HONEST ABOUT THE EVIDENCE FOR EACH: 1 is measured, reproduced and
+     * quoted above.  2 and 3 are read off this file rather than caught in the
+     * act — eleven minutes of scripted driving over five runs contained no
+     * checkpoint transition taken while off track and no backward crossing of
+     * checkpoint zero.  They are named because the fix below removes them for
+     * free and because a later reader is owed the reason this is not simply
+     * "re-baseline on respawn", which would have left both standing.
+     *
+     * Accumulated forward travel has none of those failure modes, because it is
+     * not a place: a teleport contributes nothing to it, the seam is already
+     * wrapped out of `deltaT`, and it owes nothing to `completedLaps` or to
+     * `armed`.  A kart that is genuinely wedged still accumulates nothing and is
+     * still rescued at 12 s, which is the only thing this detector is for.
+     *
+     * `continuous` gates the accumulation for the same reason it gates the
+     * crossing detector, and the second clause is belt and braces: a `locate`
+     * that resolved to the wrong branch of the loop for one tick would otherwise
+     * bank a jump the kart never drove, and the high-water mark would keep it
+     * for the rest of the race.
+     */
+    if (continuous && Math.abs(deltaT) * track.length <= MAX_CONTINUOUS_STEP_METRES) {
+      racer.travelled += deltaT
+    }
+    if (racer.travelled > racer.bestTravelled + PROGRESS_EPSILON) {
+      racer.bestTravelled = racer.travelled
       racer.stalledFor = 0
     } else {
       racer.stalledFor += step
@@ -319,6 +402,8 @@ export const createRace: RaceFactory = (ctx: Ctx): StandingRace => {
     racer.lastLapStartedAt = 0
     racer.offTrackFor = 0
     racer.stalledFor = 0
+    racer.travelled = 0
+    racer.bestTravelled = 0
     racer.standing.place = 1
     racer.standing.completedLaps = 0
     racer.standing.progress = 0
@@ -390,6 +475,8 @@ export const createRace: RaceFactory = (ctx: Ctx): StandingRace => {
           lastLapStartedAt: 0,
           offTrackFor: 0,
           stalledFor: 0,
+          travelled: 0,
+          bestTravelled: 0,
           initialX: position.x,
           initialY: position.y,
           initialZ: position.z,
