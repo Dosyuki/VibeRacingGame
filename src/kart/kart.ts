@@ -31,8 +31,40 @@ const YAW_INERTIA = 185
 const WHEEL_RADIUS = 0.36
 const WHEEL_INERTIA = 1.55
 const HALF_TRACK = 0.64
-const FRONT_AXLE = 0.72
-const REAR_AXLE = -0.68
+/*
+ * The mass centre sits AHEAD of the wheelbase midpoint, and those four
+ * centimetres are the whole reason this kart stopped spinning.
+ *
+ * Chassis attitude is taken from the averaged road normal (see the basis built
+ * at the end of `step`), so there is NO pitch or roll degree of freedom: all
+ * four springs sit at the same ray length and carry 637.65 N each, statically
+ * and at 7.5 m/s^2 of lateral acceleration alike. Measured load transfer is
+ * exactly zero — 1275 N front, 1275 N rear, cornering or not. Both axles
+ * therefore have exactly half the grip, always.
+ *
+ * With capacity fixed at half each, whichever axle is ASKED for more than half
+ * lets go first, and that split is pure lever arithmetic: the rear carries
+ * FRONT_AXLE / wheelbase of the cornering force. At the old 0.72 / -0.68 the
+ * rear was asked for 51.4% against its 50%, so on a rear-driven kart the rear
+ * saturated first — and past saturation both axles make the same peak force,
+ * leaving a net yaw moment of (0.72 - 0.68) * 1122 N = +45 N.m INTO the turn
+ * with no restoring term at any slip angle beyond it. The kart was divergent by
+ * construction, and a human playing it reported exactly that: "the road is too
+ * slippery, it's kind of like it drifts by itself".
+ *
+ * Swapping the two makes the rear share 48.6% against its 50% and turns that
+ * +45 N.m into -45 N.m of restoring moment. The wheelbase is unchanged at
+ * 1.40 m, so no geometry, model, suspension or camera number moves with it.
+ * Measured: understeer gradient K0 -0.0159 -> +0.0741 deg/(m/s^2) (it was
+ * OVERSTEERING), usable steer while holding 22 m/s 0.343 -> 0.675, and
+ * acceleration bit-identical.
+ *
+ * If load transfer is ever given a degree of freedom, re-measure BOTH numbers
+ * together. A rearward mass centre is only wrong here because the springs
+ * cannot tell the two axles apart.
+ */
+const FRONT_AXLE = 0.68
+const REAR_AXLE = -0.72
 
 // Section 6 fixes total travel at 0.09 m.  REST_LENGTH sits inside that range;
 // the remaining constants merely name its hard endpoints.
@@ -49,7 +81,33 @@ const STATIC_SAG = MASS * GRAVITY / (4 * SPRING_RATE)
 const STATIC_RAY_LENGTH = REST_LENGTH - STATIC_SAG
 const RIDE_HEIGHT = WHEEL_RADIUS + STATIC_RAY_LENGTH
 
-const ENGINE_FORCE = 3_450
+/*
+ * 2200 N, and the number to read next to it is 1122: two rear wheels times
+ * 637.65 N of static load times 0.88 grip is the ENTIRE longitudinal budget the
+ * rear axle has. Anything the engine asks for beyond that is not thrust, it is
+ * wheelspin, and the friction circle below pays for it out of the rear's
+ * LATERAL force — the axle the kart corners on.
+ *
+ * At the old 3450 N the demand was 3.1x that budget: the contact patch ran at
+ * 278.7 m/s while the kart did 21.2, the rear was slip-saturated for 99.9% of a
+ * 0 -> 25 m/s run, and the spin stored in the wheels then discharged back into
+ * the chassis as a top-speed overshoot to 42.3 m/s that took 150 s of held
+ * throttle to decay to its real 28.97 — the stock kart never reached steady
+ * state inside a race at all. 0 -> 25 m/s is UNCHANGED at 6.97 s by this
+ * reduction, because the 1250 N removed was never doing any of the
+ * accelerating. What moves is genuine terminal speed, 28.97 -> 27.80 m/s
+ * (reached in 20 s, and flat), and usable steer at full throttle: 0.087 -> 0.389 at
+ * 14 m/s, and 0.288 -> full lock at 26 m/s.
+ *
+ * Do NOT instead clamp `driveForce` to the rear's capacity and keep 3450. That
+ * was measured: it pins the rear at exactly its longitudinal limit whenever the
+ * engine asks for more, so the friction circle has ZERO lateral budget left
+ * below 21.3 m/s — the same lost corner wheelspin was causing — while also
+ * costing 0 -> 25 m/s 6.97 -> 7.98 s. Both together are worse than either
+ * (9.95 s, no extra steer). Lowering the DEMAND is the only version of this
+ * that frees lateral force.
+ */
+const ENGINE_FORCE = 2_200
 const REVERSE_FORCE = 1_450
 const BRAKE_TORQUE = 620
 const BASE_TOP_SPEED = 31.5
@@ -343,7 +401,26 @@ export const createKart: KartFactory = (
       const speedForward = velocity.dot(forward)
       state.speed = speedForward
       const speedAbs = velocity.length()
-      const steerFade = clamp(1 - Math.abs(speedForward) / STEER_FADE_SPEED, 0.38, 1)
+      /*
+       * The fade is a function of the speed the TYRES see, which is the
+       * chassis-PLANE speed, not its forward projection.
+       *
+       * Taken from `speedForward` it RELAXED as the kart slid: forward speed
+       * falls during a slide while road speed does not, so the front wheel
+       * angle grew at exactly the moment the front was already asking for too
+       * much. That is a positive feedback loop, and it sat on top of a
+       * divergent yaw mode. At 22 m/s commanding 0.35 the cap is 0.0638 rad;
+       * the sliding kart was measured averaging 0.0735.
+       *
+       * `speedAbs` is deliberately NOT used here even though it is right
+       * above: it carries the vertical component, and a landing is not extra
+       * road speed for a steered wheel to fade against.
+       */
+      const steerFade = clamp(
+        1 - Math.hypot(speedForward, velocity.dot(right)) / STEER_FADE_SPEED,
+        0.38,
+        1,
+      )
       const frontSteer = steerIntent * MAX_STEER * steerFade * (drift.active ? 1.12 : 1)
 
       const driftPressed = input.drift && !previousDriftButton
@@ -581,6 +658,41 @@ export const createKart: KartFactory = (
 
       if (state.grounded) {
         yawRate += yawMoment / YAW_INERTIA * step
+        /*
+         * This term is doing physical work now. It was not before, and the
+         * difference is the reason it is documented rather than deleted.
+         *
+         * It used to be the only thing between the player and a chassis that
+         * was divergent by construction (see FRONT_AXLE). ALL of the apparent
+         * understeer was this line: the fitted gradient K0 was NEGATIVE at
+         * -0.0159 deg/(m/s^2), and with the term removed the kart departed at
+         * every speed and steer tried, including 0.15 at 14 m/s. Above ~26 m/s
+         * it supplied more yaw damping than all four tyres combined.
+         *
+         * With the axle balance fixed, K0 is +0.0741 at every damper value from
+         * 0 to 1.65 — the STEADY state no longer needs it. The TRANSIENT does.
+         * The brush model is a tanh, so past saturation it returns a constant
+         * force and contributes neither yaw stiffness nor yaw damping, and
+         * nothing else in the kart contributes either. Step steer 0.4 held for
+         * 4 s on the fixed chassis, peak |body slip| in degrees:
+         *
+         *   damper   16 m/s   20 m/s   24 m/s   31 m/s
+         *   0.00       89.8     89.8     90.0     89.9
+         *   0.40       89.8     89.8     89.9     14.7
+         *   0.60       76.4     89.8     63.5     12.6
+         *   0.80        7.3      8.3      9.6     11.3
+         *   1.65        4.9      5.6      6.5      8.0
+         *
+         * Below 0.8 the yaw mode swings the kart to 90 degrees of slip and back
+         * again, and 0.80 still costs usable steer at 22 m/s (0.404 against
+         * 0.791 here). So the value stands, measured rather than inherited.
+         *
+         * Raising it is the trap that has already been sprung once here: yaw
+         * damping that does not fall off with speed reads as grip and can hide
+         * a real balance fault underneath, which is precisely how the axle bug
+         * survived a round. If this number ever seems to want to go UP, what
+         * actually changed is somewhere else.
+         */
         yawRate *= Math.max(0, 1 - step * (drift.active ? 0.75 : 1.65))
 
         const nl = Math.hypot(normalX, normalY, normalZ)
