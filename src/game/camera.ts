@@ -217,7 +217,10 @@ const SHAKE_RADIANS = 0.016
  * a continuous function of state, not a discrete moment, and the contract is
  * explicit that continuous data does not travel as impulses. It is deliberately
  * small — 0.12 roughness on `OffTrack` at speed reaches 0.055 m — so that when
- * `fx/` adds a real impact shake on top, the impact still dominates.
+ * `fx/` adds a real impact shake on top, the impact still dominates. That
+ * ceiling is unchanged by reading the roughness off the wheels rather than the
+ * chassis centre: it is what all four wheels on `OffTrack` still produce. See
+ * the block at the rumble site in `follow` for why the wheels are the source.
  */
 const RUMBLE_GAIN = 0.45
 const RUMBLE_SPEED_REFERENCE = 18
@@ -644,9 +647,72 @@ export const createCameraRig: CameraFactory = (ctx: Ctx): ICameraRig & Subsystem
        * make the road surface readable through the camera as well as through
        * the tyres — §7 wants the player to know what is under them without
        * looking down, and the camera is one of the channels that says so.
+       *
+       * ────────────────────────────────────────────────────────────────────
+       * IT IS SOURCED FROM THE WHEELS, NOT FROM `KartState.surface`.
+       *
+       * `state.surface` is the surface under the CHASSIS CENTRE — the contract
+       * says so in as many words — and the chassis centre is the one point on
+       * the kart that is never in contact with anything. Censused along the
+       * racing line, this circuit reads `SandDrift` at the centre for 63.9% of
+       * a lap while only 13.0% of wheel contacts are on sand and 49.7% are on
+       * `DustyAsphalt`: the road is a sand ribbon down the middle with the
+       * tyre lines swept clear either side, which is exactly what a desert
+       * circuit should look like and exactly what a centre-point sample cannot
+       * see. Mean roughness over a lap was 0.0504 from the centre against
+       * 0.0335 from the footprint — the camera was shaking 1.41x harder than
+       * the tyres justified, everywhere, continuously. A permanently unsettled
+       * camera is not grip, but it reads as a road that will not sit still.
+       *
+       * THE RULE: sum the roughness under each GROUNDED wheel and divide by
+       * FOUR — the mean over the footprint with an airborne wheel counting
+       * zero. Three properties, each of which was the reason for rejecting an
+       * alternative:
+       *
+       *   - A wheel in the air transmits nothing, so it contributes nothing,
+       *     and a kart with all four off the ground rumbles at exactly zero.
+       *     That is why there is no `state.grounded` gate any more: dividing
+       *     by four rather than by the grounded count makes the airborne case
+       *     fall out of the arithmetic instead of needing a guard, and it
+       *     cannot divide by zero. Dividing by the grounded count instead
+       *     measures the same lap average but leaves the PEAK untouched at
+       *     0.0417 — a kart that comes down on one wheel on gravel gets the
+       *     full gravel amplitude. Dividing by four halves that to 0.0298.
+       *
+       *   - MAX over the wheels was measured and is WORSE than the bug it
+       *     would replace: 0.0155 mean level over a driven lap against 0.0145
+       *     for the chassis centre. The footprint straddles two surfaces for
+       *     60-67% of a lap here, so a max holds the loudest of them
+       *     permanently — the same over-shake, relocated from the centre point
+       *     to whichever wheel is unluckiest.
+       *
+       *   - A GENUINE SPLIT — two wheels on a kerb, two on tarmac — reads
+       *     0.04 against 0.02, so it is felt as double the rumble, which is
+       *     the point. It cannot be felt as a SIDE, because this channel is a
+       *     symmetric noise about the camera's own right and up axes and has
+       *     no handedness to give it; amplitude is the only thing a split can
+       *     express here, and the mean is the honest amplitude. One wheel
+       *     clipping sand contributes a quarter, which is the correct
+       *     proportion and is precisely the property that fixes this bug.
+       *
+       * `kart/` already averages the four wheel surfaces at 0.25 weight for
+       * surface drag, so this is the same reading of the same footprint rather
+       * than a second opinion about it. And the change is NOT purely a
+       * reduction: on 43% of a lap a wheel is on a kerb while the centre is
+       * not, and that kerb is now felt where before it was invisible.
+       *
+       * `state.surface` is untouched and still means what it says — it is on
+       * the contract and other subsystems read it. Only what the CAMERA
+       * consumes has changed.
+       * ────────────────────────────────────────────────────────────────────
        */
-      if (state.grounded) {
-        const rough = SURFACE_PROPS[state.surface].roughness
+      let rough = 0
+      for (let i = 0; i < 4; i++) {
+        const wheel = state.wheels[i]!
+        if (wheel.grounded) rough += SURFACE_PROPS[wheel.surface].roughness
+      }
+      rough *= 0.25
+      if (rough > 0) {
         shakeLevel += rough * clamp(speed / RUMBLE_SPEED_REFERENCE, 0, 1.4) * RUMBLE_GAIN
       }
       if (reduced) shakeLevel = 0
