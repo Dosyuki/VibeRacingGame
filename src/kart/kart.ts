@@ -37,20 +37,35 @@ const HALF_TRACK = 0.64
  *
  * Chassis attitude is taken from the averaged road normal (see the basis built
  * at the end of `step`), so there is NO pitch or roll degree of freedom: all
- * four springs sit at the same ray length and carry 637.65 N each, statically
- * and at 7.5 m/s^2 of lateral acceleration alike. Measured load transfer is
- * exactly zero — 1275 N front, 1275 N rear, cornering or not. Both axles
- * therefore have exactly half the grip, always.
+ * four springs sit at the same ray length whenever the road under all four of
+ * them is flat, and carry 637.65 N each, statically and at 7.5 m/s^2 of lateral
+ * acceleration alike. ON A FLAT PLANE load transfer is therefore exactly zero —
+ * 1275 N front, 1275 N rear, cornering or not — and both axles have exactly
+ * half the grip.
  *
- * With capacity fixed at half each, whichever axle is ASKED for more than half
- * lets go first, and that split is pure lever arithmetic: the rear carries
- * FRONT_AXLE / wheelbase of the cornering force. At the old 0.72 / -0.68 the
- * rear was asked for 51.4% against its 50%, so on a rear-driven kart the rear
- * saturated first — and past saturation both axles make the same peak force,
- * leaving a net yaw moment of (0.72 - 0.68) * 1122 N = +45 N.m INTO the turn
- * with no restoring term at any slip angle beyond it. The kart was divergent by
- * construction, and a human playing it reported exactly that: "the road is too
- * slippery, it's kind of like it drifts by itself".
+ * That qualifier is load-bearing and an earlier version of this comment did not
+ * have it: it claimed zero transfer as a measured fact about the kart, when the
+ * only instrument that had been pointed at it was a flat-plane bench, which
+ * cannot show pitch-curvature transfer by construction. The rays are cast from
+ * four points 1.40 m apart in the ROAD's frame, so road pitch curvature lands
+ * entirely as axle load transfer, and on this circuit it is large. Measured per
+ * wheel from the published `compression`, with a controller holding the line:
+ *
+ *   where                                front    rear   rear's share
+ *   t=0.02  hardpan straight, flat      1315 N  1275 N       49%
+ *   t=0.15  dune-sweep, elevation       1582 N   971 N       38%
+ *   t=0.62  The Wall, +20 deg bank      1274 N  1821 N       59%
+ *
+ * With capacity fixed at half each on the flat, whichever axle is ASKED for
+ * more than half lets go first, and that split is pure lever arithmetic: the
+ * rear carries FRONT_AXLE / wheelbase of the cornering force. At the old
+ * 0.72 / -0.68 the rear was asked for 51.4% against its 50%, so on a
+ * rear-driven kart the rear saturated first — and with both axles then making
+ * the same peak force, that left a net yaw moment of
+ * (0.72 - 0.68) * 1122 N = +45 N.m INTO the turn with no restoring term at any
+ * slip angle beyond it. The kart was divergent by construction, and a human
+ * playing it reported exactly that: "the road is too slippery, it's kind of
+ * like it drifts by itself".
  *
  * Swapping the two makes the rear share 48.6% against its 50% and turns that
  * +45 N.m into -45 N.m of restoring moment. The wheelbase is unchanged at
@@ -59,9 +74,32 @@ const HALF_TRACK = 0.64
  * OVERSTEERING), usable steer while holding 22 m/s 0.343 -> 0.675, and
  * acceleration bit-identical.
  *
+ * Two things that arithmetic does NOT survive, both since fixed elsewhere:
+ *
+ *  - "both axles then make the same peak force" is only true off the throttle.
+ *    Under throttle the friction circle in `step` used to cut the DRIVEN rear
+ *    to peak/sqrt(2) while the undriven front kept all of it, which turns the
+ *    -45 N.m back into +192 N.m the wrong way — 4.3x the magnitude, opposite
+ *    sign, and it does not decay. That is fixed where the circle is applied,
+ *    because it is a property of the circle and not of these two numbers.
+ *  - at t=0.15 the rear holds 38% of the grip while the levers ask it for
+ *    48.6%, and holding the racing line there at 20 m/s DID depart — after
+ *    2.56 s, through a corner of 83 m radius, well inside the 7.4 m/s^2 the
+ *    same kart sustains on the flat. That departure was the friction-circle
+ *    bug above, arriving early because the rear started with a quarter less
+ *    grip than the levers assume; with the circle fixed the same run holds the
+ *    line for the full 4 s at |body slip| under 5 deg. Moving the mass centre
+ *    forward to cover the transfer itself was measured too (0.58 / -0.82,
+ *    wheelbase held): it costs max sustained lateral acceleration
+ *    7.68 -> 6.65 m/s^2 and pushes the minimum stable radius at 20 m/s from
+ *    52.7 m to 60.4 m, which puts more of the circuit out of reach than the
+ *    load transfer does. These two stay where they are — but they are now a
+ *    choice made against a road, not against a flat plane.
+ *
  * If load transfer is ever given a degree of freedom, re-measure BOTH numbers
- * together. A rearward mass centre is only wrong here because the springs
- * cannot tell the two axles apart.
+ * together, and re-measure them at t=0.02, t=0.15 and t=0.62 rather than on the
+ * bench. A rearward mass centre is only wrong here because the springs cannot
+ * tell the two axles apart on a flat road.
  */
 const FRONT_AXLE = 0.68
 const REAR_AXLE = -0.72
@@ -106,6 +144,14 @@ const RIDE_HEIGHT = WHEEL_RADIUS + STATIC_RAY_LENGTH
  * costing 0 -> 25 m/s 6.97 -> 7.98 s. Both together are worse than either
  * (9.95 s, no extra steer). Lowering the DEMAND is the only version of this
  * that frees lateral force.
+ *
+ * Re-measured since, against a version of the clamp that subtracts the LATERAL
+ * demand first rather than clamping to the whole circle: it does fix the
+ * throttle-triggered departure, and it costs 0 -> 25 m/s 6.96 -> 9.94 s at the
+ * plain budget and 8.28 s at 1.3x it. The friction circle's allocation carries
+ * that fix for nothing instead — see the note where the circle is applied.
+ * 1122 is still the number to read next to 2200, and the rear is still asked
+ * for twice what it has; what changed is only what the tyre does about it.
  */
 const ENGINE_FORCE = 2_200
 const REVERSE_FORCE = 1_450
@@ -586,11 +632,86 @@ export const createKart: KartFactory = (
         let lateralForce = -Math.tanh(slipAngle / (TYRE_SLIP_ANGLE / rearDriftScale)) * peakForce
         let longitudinalForce = Math.tanh(slipRatio / TYRE_SLIP_RATIO) * peakForce
 
+        /*
+         * The friction circle, and WHICH of the two components pays for it is
+         * the difference between a kart that can be caught and one that ignores
+         * the wheel entirely.
+         *
+         * Scaling both by peak/combined projects the demand radially, which
+         * keeps whatever direction the two INDEPENDENT tanh curves happened to
+         * land on. When both are saturated that direction is exactly 45
+         * degrees, so a longitudinally-saturated driven rear kept only
+         * peak/sqrt(2) = 0.707 of its lateral force while the undriven front
+         * kept all of it. The lever balance (see FRONT_AXLE) then reads
+         *
+         *   2 * (0.68 * peak - 0.72 * 0.707 * peak) = +0.342 * peak = +192 N.m
+         *
+         * INTO the turn, against the -45 N.m the axle split exists to provide,
+         * and 192 / (YAW_INERTIA * 1.65) = 0.629 rad/s is a yaw rate the damper
+         * at the bottom of `step` balances but cannot remove. Measured on the
+         * flat bench at 20 m/s: 0.615 rad/s, held for 5.5 s with the steer at
+         * ZERO, 184 degrees of heading gone; off the throttle the same step
+         * steer peaks at 5.2 degrees of body slip and is straight again in
+         * 0.63 s. It is a THROTTLE-triggered departure, invisible to every
+         * steady-state sweep in this file's history, and a human playing it
+         * reported it as "then it's like I can't control anything" — which is
+         * literal: going from steer 0 to FULL OPPOSITE LOCK with the throttle
+         * still down moved the sustained yaw rate by under 0.02 rad/s, because
+         * past saturation the front cannot out-lever a rear that has been
+         * handed a 29% grip cut it never asked for. Lifting off recovered in
+         * 1.88 s and braking in 1.97 s; with the throttle still down, nothing
+         * done with the wheel recovered at all.
+         *
+         * So the overage comes out of LONGITUDINAL only. The two demands are
+         * not equally meaningful past their peaks: slip ANGLE is kinematic —
+         * it is where the kart is actually going relative to where it points,
+         * and it is what the driver steers with — whereas slip RATIO past
+         * saturation is wheelspin, an artefact of an engine asking the rear for
+         * 2200 N against the 1122 N budget named at ENGINE_FORCE, carrying no
+         * information about how much thrust the tyre should make. The total is
+         * still bounded by the same circle. Only the allocation changes.
+         *
+         * Measured against every alternative, same bench, same tick: step steer
+         * 0.85 held 3 s at 20 m/s under throttle, then the steer RELEASED to
+         * zero with the throttle still down.
+         *
+         *   allocation                        turns after release   0->25 m/s
+         *   radial, both scaled                     184.0 deg         6.96 s
+         *   normalised combined slip                171.6 deg         6.96 s
+         *   drive demand capped at rear budget        5.8 deg         9.94 s
+         *   drive demand capped at 1.3x budget        5.4 deg         8.28 s
+         *   lateral priority (this)                   5.7 deg         6.96 s
+         *
+         * The second row is the textbook answer — force magnitude from the
+         * combined slip, direction along the slip vector — and it is WORSE, not
+         * better: it sends nearly all of a spinning rear's force longitudinal
+         * and leaves the front's yaw moment completely unopposed. Being the
+         * physically honest tyre model does not make it the right one for a
+         * chassis with no pitch freedom and a tanh that has no falling branch.
+         * Rows three and four are the demand clamp already rejected at
+         * ENGINE_FORCE, re-measured: it works, and it still costs exactly what
+         * that note says it costs. This one is free, and it does not touch the
+         * steady state at all — K0 is bit-identical, and usable steer while
+         * holding 22 m/s goes 0.70 -> full lock.
+         *
+         * What it does NOT fix, so that the next person does not read the good
+         * numbers above as a clean bill: while the rear is laterally saturated
+         * its longitudinal force is now near zero, so `wheelOmega` below has
+         * almost nothing to react the drive torque against and runs away, and
+         * the stored spin discharges as thrust once the slide ends. That is the
+         * ENGINE_FORCE=3450 top-speed-overshoot failure, and it was ALREADY
+         * here — a 3 s deliberate drift then held throttle peaks at 37.1 m/s
+         * against a 27.8 m/s terminal with radial clipping and 38.5 with this.
+         * Short drifts get better, not worse (0.8 s: 33.6 -> no overshoot at
+         * all), because the kart no longer departs on the exit. Fixing the
+         * discharge is a change to the wheel model, not to the circle, and it
+         * wants its own measurement.
+         */
         const combined = Math.hypot(lateralForce, longitudinalForce)
         if (combined > peakForce) {
-          const scale = peakForce / combined
-          lateralForce *= scale
-          longitudinalForce *= scale
+          longitudinalForce =
+            Math.sign(longitudinalForce) *
+            Math.sqrt(Math.max(0, peakForce * peakForce - lateralForce * lateralForce))
         }
 
         const topSpeed = BASE_TOP_SPEED * (boost.active ? boost.strength : 1)
