@@ -568,6 +568,88 @@ function driverFrame(index: number, step: number): Readonly<InputFrame> {
   }
 }
 
+/*
+ * THE STARTING LIGHTS. Found by a human pressing START, not by a harness.
+ *
+ * `driverFrame` above was handed straight to `IKart.step` on every tick with no
+ * reference to `IRace.phase`, so the player could drive during 3-2-1 and so
+ * could the seven reference AI karts. Measured by `tools/grid-start.mjs` on the
+ * build before this function existed: the field covered 17.8 m and reached
+ * 11.9 m/s BEFORE GO.
+ *
+ * IT TAKES TWO CHANGES TO HOLD A STANDING START AND THIS IS ONLY ONE OF THEM.
+ * Stopping the input is not enough on its own, because momentum the karts
+ * already had carries straight through the countdown: with this gate alone the
+ * field still coasted 2.605 m and peaked at 1.07 m/s before GO. The other half
+ * is `game/race.ts:start`, which establishes the grid when the race begins;
+ * together they measure 0.000 m. Neither is redundant and removing either one
+ * brings the creep back.
+ *
+ * WHY HERE. The gate is a cross-subsystem rule — `game/`'s race phase deciding
+ * what `kart/` is allowed to receive — and the contract bans a `src/game/`
+ * import into `src/kart/` for exactly that shape of coupling. `src/main.ts` is
+ * the only composition root, it already owns update order, and `race` is one of
+ * the objects it assembled. Inside `IKart.step` this would give every kart
+ * implementation a dependency on race policy; inside `game/ai.ts` it would gate
+ * the AI and leave the human ungated, which is the same bug with fewer symptoms.
+ *
+ * 'countdown' AND ONLY 'countdown'. THE OTHER THREE PHASES ARE NOT THIS BUG, AND
+ * GATING THEM COSTS MORE THAN IT BUYS.
+ *
+ *   'idle' — the first version of this gate DID hold input here, on the argument
+ *     that a field driving away before anybody presses START is the same defect
+ *     and makes the grid's state depend on how long the machine took to boot the
+ *     page. That argument is real. It is outweighed: every measuring harness in
+ *     this repo drives a kart in whatever phase the game happens to be in, and a
+ *     gate here turns a probe that drove into a probe that measured a parked
+ *     kart AND REPORTED NO ERROR. It cost another agent a live investigation
+ *     before this comment was written. That is the identical failure the
+ *     `releaseInput` note ninety lines below is about — a harness reading a
+ *     confident 0.0000 against a subsystem that was working perfectly — and
+ *     re-creating it one commit later in a different file is not a trade worth
+ *     making for a cosmetic improvement to the attract screen. What the grid
+ *     actually costs in 'idle' is measured and printed by `grid-start.mjs`, and
+ *     `grid-karts` asserts the field is still exactly on its slots.
+ *
+ *   'finished' — nobody has reported it, no harness has measured it, and
+ *     freezing eight karts on the instant the last one crosses the line is a
+ *     GAMEPLAY decision about what the results screen looks like, not a bug fix.
+ *     It also carries the same silent-freeze hazard as 'idle' for any future
+ *     harness that measures after a race. Left alone deliberately.
+ *
+ *   'racing' — the phase a kart is supposed to be driven in.
+ *
+ * 'scripted' BYPASSES THE GATE, and that is not an exception to the rule so much
+ * as what the rule is about. `DriverMode` 'scripted' exists solely so a harness
+ * can seize the controls, and `HarnessAPI.setInput` is documented as switching
+ * the player into it. A caller who has explicitly taken the wheel being silently
+ * overridden by race phase is a trap, not a safety feature: it produces exactly
+ * the reading — commanded full throttle, zero metres, no error — that this
+ * project keeps paying to discover. The gate's job is the player's KEYBOARD and
+ * the AI drivers, which are the two paths that actually had the bug, and both
+ * are still gated. `tools/grid-start.mjs` proves it on those paths because it
+ * presses START and never calls `seek()` or `setInput()`.
+ *
+ * NO ROCKET START. The gate means "the countdown holds the field" and nothing
+ * more: no charge accumulates and no held throttle is banked. A player still
+ * holding throttle at GO gets full throttle on the first racing tick anyway,
+ * because that tick reads `input.frame` normally — so the simple rule already
+ * produces the only launch behaviour the code implies, and a launch-timing
+ * mechanic would be a feature, not this fix.
+ *
+ * ONE TICK OF LAG, AND IT IS DELIBERATE. `race.fixedUpdate` runs in the
+ * subsystem loop BELOW the kart loop, so on the tick the countdown expires the
+ * karts have already stepped against phase 'countdown' and input starts on the
+ * NEXT tick. That is one SIMULATION_STEP, it is identical on every machine, and
+ * closing it would mean stepping `race` before the karts — which reverses the
+ * order the contract fixes ("input -> kart physics -> race -> items -> camera")
+ * and would compute standings from where the karts were last tick.
+ */
+function inputReachesKart(index: number): boolean {
+  if (race.phase !== 'countdown') return true
+  return drivers[index]!.mode === 'scripted'
+}
+
 // ---------------------------------------------------------------------------
 // Frame loop
 // ---------------------------------------------------------------------------
@@ -701,17 +783,44 @@ const loop = createLoop({
     input.sample(loop.clock)
 
     for (let i = 0; i < karts.length; i++) {
-      const frame = driverFrame(i, step)
-      // Record the COMMAND, not the outcome. This is what makes the steering
-      // sign convention falsifiable — see HarnessAPI.lastInput.
+      const command = driverFrame(i, step)
+      /*
+       * Record the COMMAND, not the outcome. This is what makes the steering
+       * sign convention falsifiable — see HarnessAPI.lastInput.
+       *
+       * THE COMMAND IS RECORDED UNGATED, AND THE COUNTDOWN GATE IS APPLIED ONLY
+       * TO WHAT REACHES `IKart.step`. The two differ for exactly the 360 ticks
+       * of a countdown and the choice is deliberate in that direction:
+       *
+       *   - Recording the GATED frame would make `lastInput` report all zeros
+       *     for every kart during the countdown, and a harness could then not
+       *     tell "the driver commanded nothing" from "the driver commanded full
+       *     throttle and the gate held it". The gate would be INVISIBLE from the
+       *     harness surface, and an invisible gate is how the ungated version of
+       *     it survived this long. It would also make `steer-test`'s ai-command
+       *     check read a commanded steer of exactly 0.0000 against a working AI
+       *     if it were ever run outside 'racing' — the precise failure the
+       *     `releaseInput` note below exists to prevent, arrived by another road.
+       *
+       *   - Recording the DRIVER'S command keeps the field meaning what its name
+       *     and its comment say, keeps the sign convention checkable in any
+       *     phase, and makes the gate observable: throttle 1.0 against 0.00 m/s
+       *     during a countdown is the gate working, and it is a reading a harness
+       *     can assert on. `grid-start.mjs` states this where it prints it, so
+       *     nobody reads it as a physics failure.
+       *
+       * The driver is therefore STEPPED during the countdown even though its
+       * frame is discarded, which is the cost of the above and is what keeps the
+       * reference AI's pursuit state continuous across GO rather than cold.
+       */
       const record = lastFrames[i]!
-      record.steer = frame.steer
-      record.throttle = frame.throttle
-      record.brake = frame.brake
-      record.drift = frame.drift
-      record.useItem = frame.useItem
-      record.look = frame.look
-      karts[i]!.step(step, frame)
+      record.steer = command.steer
+      record.throttle = command.throttle
+      record.brake = command.brake
+      record.drift = command.drift
+      record.useItem = command.useItem
+      record.look = command.look
+      karts[i]!.step(step, inputReachesKart(i) ? command : idleFrame)
     }
 
     /*

@@ -434,8 +434,42 @@ export const createRace: RaceFactory = (ctx: Ctx): StandingRace => {
       race.step(step)
     },
 
+    /*
+     * A STANDING START STARTS FROM THE GRID, AND ESTABLISHING THAT IS `start`'s
+     * JOB — NOT THE CALLER'S AND NOT THE COUNTDOWN'S.
+     *
+     * This used to set the phase and the clock and nothing else, which left an
+     * asymmetry nobody could see from either side of it: the HUD's RESTART path
+     * is `reset()` then `start()` (`ui/hud.ts:337-339`) and therefore begins on a
+     * grid, while the FIRST race of a session is `start()` alone (`hud.ts:328`)
+     * and begins wherever the field happens to be.
+     *
+     * Wherever the field happens to be is not the grid. The reference AI drives
+     * every kart from the moment the page boots — no race is required for that
+     * and there should not be one, because `src/main.ts` deliberately does NOT
+     * gate driver input in phase 'idle': every measuring harness in this repo
+     * drives a kart with the race unstarted, and a gate there turns a probe that
+     * drove into a probe that measured a parked kart and reported no error.
+     *
+     * So the field is already rolling when the lights come on, by an amount that
+     * depends on how long the player looked at the start screen. Measured with
+     * `tools/grid-start.mjs`, which presses START about 12 ticks after load —
+     * roughly the best case — the field carried 0.51 m/s across `start()` and
+     * coasted 2.6 m up the grid before GO, with the input gate working
+     * perfectly. A player who reads the start card for twenty seconds would find
+     * the field most of a lap away. `grid-start.mjs`'s `countdown-hold` reports
+     * 0.000 m with this in place and 2.605 m without it.
+     *
+     * `resetRacer` is reused rather than a narrower "place on grid", because the
+     * narrower version is how the two paths drifted apart in the first place.
+     * It is safe here precisely because `start()` refuses unless the phase is
+     * 'idle', and the only routes into 'idle' are construction and `reset()`,
+     * both of which have already zeroed `finishCount` and the standings.
+     */
     start(): void {
       if (services === null || phase !== 'idle') return
+      for (let i = 0; i < racers.length; i++) resetRacer(racers[i]!)
+      updatePlaces()
       phase = 'countdown'
       clock = -COUNTDOWN_SECONDS
       countdownNext = 2

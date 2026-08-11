@@ -69,6 +69,13 @@
  *                     phase becomes 'racing'.
  *   countdown-hud     The 3 / 2 / 1 / GO! a player actually sees. A PROXY for
  *                     `race:countdown`, which is unobservable — see PENDING.
+ *   countdown-hold    ...and NOTHING MOVES while it runs. Every kart's position
+ *                     and speed stay at their grid values from the tick START
+ *                     was pressed until the phase becomes 'racing'. Added after
+ *                     a human found the field driving through 3-2-1 while the
+ *                     three checks above were all green: they grade the phases,
+ *                     the timing and the clock, and none of them ever asked
+ *                     whether a kart moved.
  *   launch-field      Every AI kart accelerates away, against a known-good
  *                     reference measured from the real game.
  *   launch-player     The player kart is at EXACTLY zero with no input. This is
@@ -102,18 +109,26 @@
  *
  * HOW IT GETS AN UNCONTAMINATED VIEW OF THE GRID
  * ----------------------------------------------
- * `main.ts:682` steps every driver and every kart on every tick with NO PHASE
- * GUARD, and the seven AI karts default to `'referenceAI'` from build. They are
- * therefore driving before anybody presses START. That means "the state of the
- * grid" decays with wall-clock time between page load and the first thing the
- * harness can ask, which is exactly the machine-load dependence the contract's
- * CLOCK section exists to forbid.
+ * `main.ts:driverFrame` used to step every driver and every kart on every tick
+ * with NO PHASE GUARD, and the seven AI karts default to `'referenceAI'` from
+ * build. They were therefore driving before anybody pressed START, and "the
+ * state of the grid" decayed with wall-clock time between page load and the
+ * first thing the harness could ask — exactly the machine-load dependence the
+ * contract's CLOCK section exists to forbid. `countdown-hold` below is the check
+ * that finally named it, and the gate in `driverFrame` is the fix.
+ *
+ * THE INIT-SCRIPT CAPTURE STAYS, AND THE GUARD LANDING IS NOT A REASON TO
+ * REMOVE IT. It is what makes the grid snapshot independent of how long this
+ * machine took to boot the page, and it is the ONLY reading in this file that
+ * does not go through the phase gate — so it is also the only reading that could
+ * ever catch that gate regressing. A capture taken after `ready` plus a
+ * Playwright round trip would land at tick 30-80 and would agree with a broken
+ * build for as long as the breakage was small.
  *
  * So the grid snapshot is taken from an INIT SCRIPT that polls rAF and captures
- * the instant `window.__harness` becomes visible (`main.ts:1043`), rather than
- * after `ready` plus a Playwright round trip. That lands at tick 0-2 instead of
- * tick 30-80. The tick it actually landed on is printed with the result, because
- * a measurement whose contamination is unreported is a measurement you cannot
+ * the instant `window.__harness` becomes visible (`main.ts:1043`). That lands at
+ * tick 0-2. The tick it actually landed on is printed with the result, because a
+ * measurement whose contamination is unreported is a measurement you cannot
  * argue with.
  *
  * This is also why `lib/browser.mjs:openGame` is not called directly: it has no
@@ -272,14 +287,59 @@ const TOL = {
   goTickMin: 300,
   goTickMax: 480,
 
+  // --- check 3b: the countdown HOLDS the field ----------------------------
+  /*
+   * FOUND BY A HUMAN PLAYING THE GAME, WHICH IS THE WHOLE POINT OF THIS FILE.
+   *
+   * Press START and the field drives off during 3-2-1. Every check above was
+   * green while it did: `countdown-order` only asks that the phases happen,
+   * `countdown-timing` only that GO lands on the beat, `countdown-clock` only
+   * that the clock is a clock. Not one of them ever asked whether a kart MOVED
+   * while the lights were still on — and `launch-field`'s own reference numbers
+   * were measured against the bug, which is why they are "seconds after
+   * startRace()" and not "seconds after GO".
+   *
+   * A standing start is standing. The correct answer for both numbers below is
+   * exactly 0, so these are slop rails and not tuning parameters.
+   */
+  /**
+   * Metres a kart may move in PLAN (XZ) between `startRace()` and the phase
+   * becoming 'racing'. Y is excluded for the same reason `gridOffsetM` excludes
+   * it: the kart settles onto SUSPENSION_TRAVEL = 0.09 m (`kart.ts:37`) in Y
+   * alone, and that is not driving. 5 cm matches `gridOffsetM` because it is the
+   * same claim about the same karts on the same slots.
+   */
+  countdownDriftM: 0.05,
+  /**
+   * `KartState.speed` is signed m/s along chassis forward, so suspension
+   * settling does not enter it at all. Not float zero like `restSpeed`: a kart
+   * resting on a graded road may creep, and a gate that fires on creep would be
+   * grading the surface model rather than the countdown. 0.05 m/s is 0.15 m over
+   * the three-second countdown — well inside `countdownDriftM`, so this is the
+   * secondary rail. It catches a kart that has started moving but has not yet
+   * gone anywhere, which is what a sample landing just after GO-minus-epsilon
+   * looks like.
+   */
+  countdownSpeed: 0.05,
+
   // --- check 4: the launch ------------------------------------------------
   /**
-   * KNOWN-GOOD REFERENCE, measured from the real game: [seconds after
-   * `startRace()`, m/s]. Note the clock these are against — `startRace()`, not
-   * GO. The AI has no phase awareness (`src/game/ai.ts` never reads `IRace`) and
-   * `main.ts:682` steps it during the countdown, so the field is already rolling
-   * when the lights go out; the reference numbers include that and so does the
-   * measurement.
+   * KNOWN-GOOD REFERENCE, measured from the real game: [seconds after GO, m/s].
+   *
+   * RE-ANCHORED FROM `startRace()` TO GO, AND THAT IS PART OF THE BUG FIX.
+   *
+   * These used to be "seconds after `startRace()`", with a comment explaining
+   * that `main.ts` stepped the AI during the countdown so "the field is already
+   * rolling when the lights go out; the reference numbers include that". They
+   * did include it — which made this a reference calibrated against a defect,
+   * and the exact shape CLAUDE.md warns about: a confident, precise number that
+   * is fiction because the thing it was measured on was wrong. The moment the
+   * gate in `main.ts:driverFrame` landed, `launch-field` went red on a CORRECT
+   * build, reporting 0.00 m/s at "t+1s" because t+1s was still the countdown.
+   *
+   * Anchored to GO these are the same physical claim they were always trying to
+   * make — a kart accelerates from rest to racing speed in the first few seconds
+   * — and they are now measurable on a build where the standing start stands.
    */
   launchRef: [[1, 4], [4, 15], [8, 24]],
   /**
@@ -292,7 +352,14 @@ const TOL = {
   launchTolFrac: 0.4,
 
   // --- check 5: nothing is stuck ------------------------------------------
-  /** Seconds of race the stall window covers, from `startRace()`. */
+  /**
+   * Seconds of race the stall window covers, FROM GO.
+   *
+   * Also re-anchored, and for the same reason as `launchRef`: from
+   * `startRace()` this window graded the three seconds of countdown, in which a
+   * correctly-held kart covers 0 m against a 1 m/s floor. "Nothing is stuck" is
+   * a claim about a race, and the race starts at GO.
+   */
   stuckWindowSeconds: 15,
   /**
    * Metres a kart that should be moving must cover per 1 s window.
@@ -333,11 +400,20 @@ const TOL = {
    */
   cornerMinSeparation: 1.2,
 
-  /** Seconds of race the whole run covers. The player is handed to the AI at 8 s
-   *  and needs to reach turn one from a standing start on the grid. */
-  runSeconds: 26,
-  /** Seconds after `startRace()` at which the player is handed to the reference
-   *  AI. Every assertion about the resting player is complete by then. */
+  /**
+   * Seconds the whole run covers, FROM `startRace()` and deliberately not from
+   * GO — this is the run's LENGTH, not an anchor for a measurement, and it has
+   * to be a number the harness can compute before it knows whether GO will ever
+   * happen at all (the `no-start` sabotage is a build where it does not).
+   *
+   * Raised from 26 to 29 when the countdown gate landed, so that the budget
+   * AFTER GO is unchanged: 29 - 3.05 s of countdown is the same ~26 s of racing
+   * every threshold below was set against. The player is handed to the AI at
+   * GO+8 s and needs to reach turn one from a standing start on the grid.
+   */
+  runSeconds: 29,
+  /** Seconds after GO at which the player is handed to the reference AI. Every
+   *  assertion about the resting player is complete by then. */
   handoverSeconds: 8,
 }
 
@@ -428,6 +504,7 @@ async function battery(opts) {
     'grid-slots', 'grid-karts',
     'cam-behind', 'cam-tangent', 'cam-follows', 'cam-seam',
     'countdown-order', 'countdown-timing', 'countdown-clock', 'countdown-hud',
+    'countdown-hold',
     'launch-field', 'launch-player',
     'stuck-motion', 'stuck-respawn', 'progress-counter',
     'corner-onroad', 'corner-clearance', 'corner-flow',
@@ -591,15 +668,34 @@ async function battery(opts) {
   const aiIds = kartIds.filter((id) => id !== playerId)
   const respawnsAtStart = {}
   const wallHitsAtStart = {}
-  for (const k of preStartTel.karts) {
-    respawnsAtStart[k.kartId] = k.respawns
-    wallHitsAtStart[k.kartId] = k.wallHits
-  }
 
   // ---- press START --------------------------------------------------------
   h.startRace()
   const afterStart = h.telemetry()
   const startTick = afterStart.tick
+
+  /*
+   * THE RESPAWN AND WALL BASELINES ARE TAKEN AFTER `startRace()`, NOT BEFORE.
+   *
+   * Same argument as the GO anchors below, one step earlier in the run:
+   * `stuck-respawn` asks "did anybody get stuck and need rescuing DURING the
+   * race", and the race is established by `start()`. `game/race.ts:start` places
+   * the whole field back on the grid, which goes through `IKart.respawn` and
+   * therefore emits eight `kart:respawn` events — one per kart, on purpose. That
+   * is the race being set up, not eight karts getting wedged, and `camera.ts`
+   * :764 wants exactly that event so the rig SNAPS to the gridded kart instead
+   * of whip-panning to it from wherever the start screen left it.
+   *
+   * Baselining before the button counted all eight of those as failures. Nothing
+   * is lost by moving it: the OUTCOME of that placement is still fully graded —
+   * `countdown-hold` asserts the field is then at rest and `grid-karts` asserts
+   * it is on its slots — so a placement that went wrong still has two checks
+   * looking straight at it.
+   */
+  for (const k of afterStart.karts) {
+    respawnsAtStart[k.kartId] = k.respawns
+    wallHitsAtStart[k.kartId] = k.wallHits
+  }
 
   saw('countdown-order')
   if (afterStart.phase !== 'countdown') {
@@ -613,12 +709,36 @@ async function battery(opts) {
   }
 
   const totalTicks = Math.ceil(TOL.runSeconds / STEP)
-  const handoverTick = startTick + Math.round(TOL.handoverSeconds / STEP)
-  const stuckEndTick = startTick + Math.round(TOL.stuckWindowSeconds / STEP)
   const horizonTick = startTick + Math.min(totalTicks, Math.ceil(opts.horizonSeconds / STEP))
+
+  /*
+   * EVERYTHING THAT GRADES THE RACE IS ANCHORED TO GO. Only the run's length is
+   * anchored to `startRace()`, because it must be computable on a build where GO
+   * never arrives.
+   *
+   * These were all `startTick + ...` and they were wrong in a way that only a
+   * CORRECT build reveals: while the karts drove during the countdown, "1 s
+   * after START" and "1 s after GO" happened to describe similar states, so the
+   * bug hid the anchor error and the anchor error hid the bug. Fixing one
+   * without the other turns `launch-field` and `stuck-motion` red on a build
+   * whose standing start is finally standing — which is how this was found.
+   *
+   * They are null until GO because GO's tick is not knowable in advance: the
+   * countdown length is the race's to choose, and `countdown-timing` is the
+   * check that has an opinion about it. A gate that never gets a tick asserts
+   * nothing and reports itself unmeasured, which is the honest answer for a
+   * build that never started.
+   */
+  let handoverTick = null
+  let stuckEndTick = null
   const launchMarks = TOL.launchRef.map((r) => ({
-    seconds: r[0], reference: r[1], tick: startTick + Math.round(r[0] / STEP), taken: null,
+    seconds: r[0], reference: r[1], tick: null, taken: null,
   }))
+  const anchorToGo = (goAt) => {
+    handoverTick = goAt + Math.round(TOL.handoverSeconds / STEP)
+    stuckEndTick = goAt + Math.round(TOL.stuckWindowSeconds / STEP)
+    for (const m of launchMarks) m.tick = goAt + Math.round(m.seconds / STEP)
+  }
 
   const samples = []
   const shots = {}
@@ -660,6 +780,28 @@ async function battery(opts) {
     const s = h.kartSnapshot(k.kartId)
     prevPos[k.kartId] = s ? v(s.position.x, s.position.y, s.position.z) : null
   }
+
+  /*
+   * The countdown-hold baseline, taken at the tick START was pressed and NOT at
+   * the t0 grid capture.
+   *
+   * Those are different claims and only this one is `countdown-hold`'s. t0 is
+   * "where the karts were at page load"; whatever happens between load and the
+   * button belongs to whether the game should be simulating at all before a race
+   * exists, and `printFacts` already reports that gap in ticks. This check asks
+   * the narrower question a player asks: from the moment I pressed START, did
+   * anything move before GO?
+   */
+  const holdBase = {}
+  for (const k of afterStart.karts) {
+    const s = h.kartSnapshot(k.kartId)
+    if (s) holdBase[k.kartId] = { pos: v(s.position.x, s.position.y, s.position.z), speed: s.speed }
+  }
+  const holdWorst = {}
+  for (const id of kartIds) holdWorst[id] = { drift: 0, dY: 0, speed: 0, samples: 0 }
+  let holdSamples = 0
+  /** Largest throttle any driver COMMANDED during the countdown. See below. */
+  let holdCommandPeak = 0
   let windowStartTick = startTick
   const metresThisSecond = {}
   for (const id of kartIds) metresThisSecond[id] = 0
@@ -674,7 +816,7 @@ async function battery(opts) {
     tick = tel.tick
 
     // --- the one driver change in this file, and it is after check 4 -------
-    if (!handedOver && tick >= handoverTick) {
+    if (!handedOver && handoverTick !== null && tick >= handoverTick) {
       h.setDriver(playerId, 'referenceAI')
       handedOver = true
     }
@@ -683,6 +825,12 @@ async function battery(opts) {
     if (goTick === null) {
       if (tel.phase === 'racing') {
         goTick = tick
+        anchorToGo(goTick)
+        // The 1 s displacement windows start counting at GO too, and the metres
+        // banked during the countdown are discarded rather than credited: a kart
+        // that was correctly held has zero of them and must not be graded on it.
+        windowStartTick = tick
+        for (const id of kartIds) metresThisSecond[id] = 0
         grab('go')
       } else if (tel.phase === 'countdown') {
         saw('countdown-clock')
@@ -723,6 +871,66 @@ async function battery(opts) {
       const before = prevPos[k.kartId]
       if (before) metresThisSecond[k.kartId] += len(sub(p, before))
       prevPos[k.kartId] = p
+    }
+
+    // --- countdown-hold ----------------------------------------------------
+    /*
+     * Only samples whose phase READS 'countdown' are graded, so a sample is
+     * never blamed for movement that was legitimate. `race.fixedUpdate` flips
+     * the phase after the kart loop has already run for that tick, so the last
+     * up-to-`sampleTicks` ticks of the countdown land in the first 'racing'
+     * sample and are NOT graded here. That is a 0.05 s blind spot at the end and
+     * it is stated rather than closed: the failure this check exists for moves
+     * karts by metres over three seconds, and closing the window would mean
+     * asserting on ticks the harness cannot attribute to a phase.
+     */
+    if (row.phase === 'countdown') {
+      holdSamples++
+      for (const r of row.karts) {
+        const base = holdBase[r.id]
+        if (!base) continue
+        const w = holdWorst[r.id]
+        /*
+         * WHAT THE DRIVER ASKED FOR, WHICH IS WHAT MAKES THIS CHECK NON-VACUOUS.
+         *
+         * "Nothing moved during the countdown" is satisfied just as well by a
+         * gate that holds the field as by a reference AI that commanded nothing
+         * at all — and the second one is a broken AI, not a working gate. This
+         * check would print an identical green for both.
+         *
+         * `main.ts` records `lastInput` UNGATED for exactly this reason: it is
+         * the driver's command, not the frame the kart received. So a commanded
+         * throttle above zero against a kart at 0.000 m/s IS the gate working,
+         * observably, and if no kart ever commands anything the check reports
+         * itself unmeasured below rather than passing on nothing. Same treatment
+         * `cam-seam` gets when the camera never rotates.
+         */
+        let li = null
+        try { li = h.lastInput(r.id) } catch (err) { li = null }
+        if (li && typeof li.throttle === 'number' && li.throttle > holdCommandPeak) {
+          holdCommandPeak = li.throttle
+        }
+        const drift = lenXZ(sub(r.pos, base.pos))
+        const dY = Math.abs(r.pos.y - base.pos.y)
+        const spd = Math.abs(r.speed)
+        w.samples++
+        if (drift > w.drift) w.drift = drift
+        if (dY > w.dY) w.dY = dY
+        if (spd > w.speed) w.speed = spd
+
+        saw('countdown-hold', 2)
+        if (drift > TOL.countdownDriftM) {
+          bump('countdown-hold', drift,
+            `kart ${r.id} moved ${f(drift)} m (in plan) from its grid slot ${f((tick - startTick) * STEP, 2)} s ` +
+            `after START, with ${f(-tel.clock, 2)} s of countdown still to run — the lights are still on ` +
+            `(max ${TOL.countdownDriftM} m)`)
+        }
+        if (spd > TOL.countdownSpeed) {
+          bump('countdown-hold', spd,
+            `kart ${r.id} is doing ${f(spd)} m/s at ${f((tick - startTick) * STEP, 2)} s after START, ` +
+            `clock ${f(tel.clock, 2)} s — a standing start is standing (max ${TOL.countdownSpeed} m/s)`)
+        }
+      }
     }
 
     // --- camera ------------------------------------------------------------
@@ -802,7 +1010,7 @@ async function battery(opts) {
 
     // --- launch marks ------------------------------------------------------
     for (const m of launchMarks) {
-      if (m.taken === null && tick >= m.tick) {
+      if (m.taken === null && m.tick !== null && tick >= m.tick) {
         // `lastInput` is captured HERE and not at the end of the run. At the end
         // the player has been handed to the reference AI, so reading it then
         // reports the AI's command and reads as "the player was at full throttle
@@ -824,14 +1032,17 @@ async function battery(opts) {
       for (const r of row.karts) {
         // The player is EXPECTED to be stationary until the handover. Gating it
         // before then would be gating the very thing check 4 asserts is correct.
-        const exempt = r.id === playerId && tick < handoverTick + Math.round(1 / STEP)
+        const exempt = r.id === playerId &&
+          (handoverTick === null || tick < handoverTick + Math.round(1 / STEP))
         if (exempt) continue
-        if (tick > startTick + Math.round(1 / STEP) && tick <= stuckEndTick) {
+        // Anchored to GO. Before it, EVERY kart is expected to be stationary and
+        // a stall gate that fires on a held grid is grading the countdown.
+        if (goTick !== null && tick > goTick + Math.round(1 / STEP) && tick <= stuckEndTick) {
           saw('stuck-motion')
           const metres = metresThisSecond[r.id]
           if (metres < TOL.minMetresPerSecond * seconds) {
             bump('stuck-motion', TOL.minMetresPerSecond * seconds - metres,
-              `kart ${r.id} covered ${f(metres)} m in ${f(seconds, 2)} s ending t+${f((tick - startTick) * STEP, 1)}s ` +
+              `kart ${r.id} covered ${f(metres)} m in ${f(seconds, 2)} s ending GO+${f((tick - goTick) * STEP, 1)}s ` +
               `(floor ${f(TOL.minMetresPerSecond * seconds)} m); t=${f(r.t, 4)} lateral=${f(r.lateral)}`)
           }
         }
@@ -844,7 +1055,7 @@ async function battery(opts) {
     // Counters are CUMULATIVE, so they are latched at the end of the window and
     // graded once. Grading them per sample reports the same single respawn 150
     // times and makes a one-off look like a loop.
-    if (tick <= stuckEndTick) {
+    if (stuckEndTick !== null && tick <= stuckEndTick) {
       for (const r of row.karts) {
         stuckWindowEnd[r.id] = { respawns: r.respawns, wallHits: r.wallHits }
       }
@@ -886,7 +1097,7 @@ async function battery(opts) {
     }
 
     samples.push(row)
-    if (goTick !== null && tick >= startTick + Math.round(5 / STEP) && !shots.launch) grab('launch')
+    if (goTick !== null && tick >= goTick + Math.round(5 / STEP) && !shots.launch) grab('launch')
   }
 
   // =========================================================================
@@ -982,7 +1193,7 @@ async function battery(opts) {
         saw('launch-player')
         if (Math.abs(r.speed) > TOL.restSpeed) {
           bump('launch-player', Math.abs(r.speed),
-            `the player kart is doing ${f(r.speed)} m/s at t+${m.seconds}s with no input injected; ` +
+            `the player kart is doing ${f(r.speed)} m/s at GO+${m.seconds}s with no input injected; ` +
             `it must be at exactly rest`)
         }
         continue
@@ -991,7 +1202,7 @@ async function battery(opts) {
       saw('launch-field')
       if (r.speed < lo || r.speed > hi) {
         bump('launch-field', Math.abs(r.speed - m.reference),
-          `kart ${r.id} at t+${m.seconds}s: ${f(r.speed, 2)} m/s against a reference of ` +
+          `kart ${r.id} at GO+${m.seconds}s: ${f(r.speed, 2)} m/s against a reference of ` +
           `${m.reference} m/s (band ${f(lo, 2)}..${f(hi, 2)})`)
       }
     }
@@ -1073,6 +1284,15 @@ async function battery(opts) {
    * metres.
    */
   if (camAngleTravel < 1) checks['cam-seam'].measured = 0
+
+  /*
+   * The same treatment for countdown-hold, and for the same reason: a gate that
+   * holds a field nobody was driving has not been shown to hold anything. If no
+   * driver commanded throttle at any point in the countdown, every "the kart did
+   * not move" assertion above is true for a reason that has nothing to do with
+   * the gate, so they are reported as unmeasured rather than as a pass.
+   */
+  if (holdCommandPeak <= 0) checks['countdown-hold'].measured = 0
 
   // ---- ticksWithoutProgress behaves --------------------------------------
   /*
@@ -1190,6 +1410,14 @@ async function battery(opts) {
             radius: cornerWindow.radius, samplesInside: cornerWindow.seen || 0 }
         : null,
       launch: launchReport,
+      countdownHold: {
+        samples: holdSamples,
+        commandPeak: holdCommandPeak,
+        karts: kartIds.map((id) => ({
+          id: id, drift: holdWorst[id].drift, dY: holdWorst[id].dY,
+          speed: holdWorst[id].speed, samples: holdWorst[id].samples,
+        })),
+      },
       twp: twpReport,
       stall: stallReport,
       hud: hudSeq,
@@ -1364,6 +1592,39 @@ function gridStartSabotage(spec) {
         clock: Math.max(0, t.clock), karts: t.karts,
       }
     }
+  } else if (spec.kind === 'countdown-drive') {
+    /*
+     * THE BUG A HUMAN FOUND, REPRODUCED AT THE SURFACE IT SHIPPED ON.
+     *
+     * The real defect was that `main.ts:driverFrame` handed every driver's frame
+     * to `IKart.step` on every tick without ever reading `IRace.phase`, so the
+     * player and the seven AI karts drove off during 3-2-1. This file may not
+     * edit `src/`, so it reproduces the OUTCOME: one kart rolling forward while
+     * the lights are still on.
+     *
+     * Velocity is REWRITTEN every step rather than nudged once, because the
+     * chassis damps a one-off impulse away in a few ticks and a detector proven
+     * only against a transient is not proven against a kart that is genuinely
+     * driving. Position therefore drifts (the primary rail) and `speed` reads
+     * non-zero (the secondary rail), which is both halves of `countdown-hold`.
+     *
+     * 0.5 m/s is chosen to be unambiguous against a 0.05 m/s gate and harmless
+     * to `launch-field`: over a three-second countdown it is 1.5 m of head
+     * start, and the t+1s launch band is 2.4..5.6 m/s wide.
+     */
+    afterEachStep(null, (t) => {
+      if (t.phase !== 'countdown') return
+      const k = h.kartSnapshot(4)
+      if (!k) return
+      h.track.locate(k.position, loc)
+      h.track.sample(loc.t, smp)
+      k.velocity.set(smp.tangent.x * 0.5, k.velocity.y, smp.tangent.z * 0.5)
+      k.position.set(
+        k.position.x + smp.tangent.x * 0.5 * (1 / 120),
+        k.position.y,
+        k.position.z + smp.tangent.z * 0.5 * (1 / 120),
+      )
+    })
   } else if (spec.kind === 'field-asleep') {
     // Nobody launches.
     const t = tel0()
@@ -1552,6 +1813,13 @@ function gridStartInit(cfg) {
  * far the run has to get before that owner can possibly have an opinion. Other
  * checks firing as well is recorded but is not the evidence — "something went
  * red" is not the same claim as "the detector for this failure fired".
+ *
+ * `horizon` is SECONDS AFTER `startRace()`, not after GO, because it bounds the
+ * run and the run has to be bounded on a build where GO never arrives — see
+ * `no-start`. Every horizon that has to reach racing time therefore carries the
+ * ~3.05 s countdown inside it, and the ones below grew by 3 when the countdown
+ * gate landed: before it, the field was already at speed when the lights went
+ * out, so a horizon of 9 bought nine seconds of driving. It now buys six.
  */
 const SABOTAGES = [
   { kind: 'grid-overlap', owner: 'grid-karts', horizon: 2,
@@ -1564,7 +1832,7 @@ const SABOTAGES = [
     what: 'the view yawed 90 deg, position and follow untouched' },
   { kind: 'camera-beside', owner: 'cam-behind', horizon: 5,
     what: 'the camera moved 8 m to the kart\'s right, still looking down the road' },
-  { kind: 'camera-frozen', owner: 'cam-follows', horizon: 18,
+  { kind: 'camera-frozen', owner: 'cam-follows', horizon: 21,
     what: 'the camera stops following once the kart moves' },
   { kind: 'camera-whip', owner: 'cam-seam', horizon: 8,
     what: 'a 25 deg discontinuity in the view every 0.05 s' },
@@ -1572,19 +1840,21 @@ const SABOTAGES = [
     what: 'the START button does nothing' },
   { kind: 'clock-clamped', owner: 'countdown-clock', horizon: 5,
     what: 'IRace.clock never reports a negative value' },
-  { kind: 'field-asleep', owner: 'launch-field', horizon: 9,
+  { kind: 'countdown-drive', owner: 'countdown-hold', horizon: 5,
+    what: 'kart 4 rolls forward at 0.5 m/s while the lights are still on' },
+  { kind: 'field-asleep', owner: 'launch-field', horizon: 12,
     what: 'no AI kart launches' },
-  { kind: 'one-kart-asleep', owner: 'launch-field', horizon: 9,
+  { kind: 'one-kart-asleep', owner: 'launch-field', horizon: 12,
     what: 'exactly one AI kart does not launch' },
-  { kind: 'player-driven', owner: 'launch-player', horizon: 5,
+  { kind: 'player-driven', owner: 'launch-player', horizon: 8,
     what: 'the player kart is driven, so it is not at rest with no input' },
-  { kind: 'kart-wedged', owner: 'stuck-motion', horizon: 16,
+  { kind: 'kart-wedged', owner: 'stuck-motion', horizon: 19,
     what: 'kart 6 pinned in place from 3 s in' },
-  { kind: 'progress-frozen', owner: 'progress-counter', horizon: 6,
+  { kind: 'progress-frozen', owner: 'progress-counter', horizon: 9,
     what: 'ticksWithoutProgress frozen at zero' },
-  { kind: 'corner-offroad', owner: 'corner-onroad', horizon: 14,
+  { kind: 'corner-offroad', owner: 'corner-onroad', horizon: 17,
     what: 'kart 2 pushed off the road, but only inside turn one' },
-  { kind: 'corner-pileup', owner: 'corner-clearance', horizon: 14,
+  { kind: 'corner-pileup', owner: 'corner-clearance', horizon: 17,
     what: 'karts 1 and 3 inside each other, but only inside turn one' },
   { kind: 'hud-silent', owner: 'countdown-hud', horizon: 5,
     what: 'the countdown a player sees never appears' },
@@ -1663,12 +1933,13 @@ function printFacts(F) {
   L.push(`track        ${fmt(F.trackLength, 1)} m centreline`)
   L.push(
     `grid capture tick ${F.t0Tick} (phase '${F.t0Phase}') — the earliest tick this harness can observe. ` +
-    `The AI drives from tick 0 with no phase guard, so every tick between load and here is decay.`,
+    `It is still taken from an init script rather than after ready: the capture must not depend on how ` +
+    `long the machine took to boot the page, whatever the game does in the meantime.`,
   )
   L.push(
     `start        startRace() at tick ${F.startTick}, phase was '${F.preStartPhase}', clock ` +
-    `${fmt(F.preStartClock)} — ${F.startTick - F.t0Tick} tick(s) of AI driving happened between the ` +
-    `grid capture and the button`,
+    `${fmt(F.preStartClock)} — ${F.startTick - F.t0Tick} tick(s) elapsed between the grid capture and ` +
+    `the button; 'grid karts' below is what they cost`,
   )
   L.push(
     F.goTick === null
@@ -1676,7 +1947,33 @@ function printFacts(F) {
       : `GO           tick ${F.goTick}, ${F.goTicksAfterStart} ticks (${fmt(F.goTicksAfterStart / 120)} s) after startRace()`,
   )
   L.push(`countdown    a player saw [${F.hud.join(', ') || '(nothing)'}]   (DOM proxy for race:countdown)`)
-  L.push(`handover     player -> referenceAI at tick ${F.handoverTick}${F.handedOver ? '' : ' (not reached)'}`)
+  const CH = F.countdownHold
+  if (!CH || CH.samples === 0) {
+    L.push('countdown hold  NOT MEASURED — no sample of this run ever read phase \'countdown\'')
+  } else {
+    L.push(
+      `countdown hold  worst movement between startRace() and GO, over ${CH.samples} sample(s). ` +
+      `Gates: ${TOL.countdownDriftM} m in plan, ${TOL.countdownSpeed} m/s. dY is reported, not gated.`,
+    )
+    L.push(
+      `                peak throttle COMMANDED by any driver during the countdown: ${fmt(CH.commandPeak, 3)}. ` +
+      (CH.commandPeak > 0
+        ? 'Non-zero, so the karts below were HELD rather than merely undriven — that is the gate working.'
+        : 'ZERO, so nothing was asking to move and this check is reported unmeasured, not passed.'),
+    )
+    for (const g of CH.karts) {
+      L.push(
+        `  kart ${g.id}   moved ${String(fmt(g.drift, 3)).padStart(8)} m  ` +
+        `dY ${String(fmt(g.dY, 3)).padStart(6)} m  peak speed ${String(fmt(g.speed, 3)).padStart(7)} m/s`,
+      )
+    }
+  }
+  L.push(
+    F.handoverTick === null
+      ? 'handover     never scheduled — GO was never reached, so there is no clock to hang it on'
+      : `handover     player -> referenceAI at tick ${F.handoverTick} (GO+${TOL.handoverSeconds}s)` +
+        `${F.handedOver ? '' : ' (not reached)'}`,
+  )
   L.push(`run          ended at tick ${F.endTick}, phase '${F.endPhase}'`)
   L.push('')
   L.push('grid slots   (from ITrack.startGrid, no simulation involved)')
@@ -1706,10 +2003,12 @@ function printFacts(F) {
     L.push('first corner  NOT FOUND — no |curvature| >= 1/170 anywhere on the lap')
   }
   L.push('')
-  L.push('launch       reference is measured from the real game, in seconds after startRace()')
+  L.push('launch       reference is measured from the real game, in seconds after GO — NOT after')
+  L.push('             startRace(). Anchored to startRace() it graded the countdown as racing time,')
+  L.push('             which was only survivable while the field illegally drove through it.')
   for (const l of F.launch) {
     L.push(
-      `  t+${l.seconds}s   AI ${fmt(l.min)} .. ${fmt(l.max)} m/s (mean ${fmt(l.mean)})   ` +
+      `  GO+${l.seconds}s  AI ${fmt(l.min)} .. ${fmt(l.max)} m/s (mean ${fmt(l.mean)})   ` +
       `reference ${l.reference} m/s, band ${fmt(l.band[0])}..${fmt(l.band[1])}   ` +
       `player ${fmt(l.player, 4)} m/s`,
     )
@@ -1718,8 +2017,8 @@ function printFacts(F) {
   L.push(
     `  the player kart reads exactly ${fmt((F.launch[0] || {}).player, 4)} m/s and THAT IS CORRECT — it is ` +
     `the one stationary kart a reader should expect. Driver mode 'human', nothing injected: ` +
-    `lastInput at t+1s was ${pin ? `throttle ${fmt(pin.throttle)}, brake ${fmt(pin.brake)}, steer ${fmt(pin.steer)}` : 'null'}. ` +
-    `It is handed to the reference AI at t+${TOL.handoverSeconds}s, after every assertion above.`,
+    `lastInput at GO+1s was ${pin ? `throttle ${fmt(pin.throttle)}, brake ${fmt(pin.brake)}, steer ${fmt(pin.steer)}` : 'null'}. ` +
+    `It is handed to the reference AI at GO+${TOL.handoverSeconds}s, after every assertion above.`,
   )
   L.push('')
   L.push('camera       ' +
@@ -1829,6 +2128,20 @@ try {
         'unmeasured rather than as a pass. A camera that never rotates passes a swing gate perfectly.',
       )
     }
+    pendings.push(
+      'countdown-hold, the PLAYER half — this check proves the countdown gate for the seven AI karts by ' +
+      'direct measurement, because they are under a driver that would otherwise drive. The player kart ' +
+      'is in mode \'human\' with no keyboard in a headless run, so it reads 0 m/s whether the gate exists ' +
+      'or not, and its row of the table is evidence of nothing on its own. It CANNOT be closed with ' +
+      '`setInput`: that switches the player to \'scripted\', and \'scripted\' bypasses the countdown gate ' +
+      'BY DESIGN (`main.ts:inputReachesKart`) so that a harness which has seized the controls is never ' +
+      'silently overridden. Injecting throttle here would therefore measure the bypass, not the gate, ' +
+      'and would pass identically on a build with no gate at all — a vacuous pass, which is the worst ' +
+      'output an instrument can produce. What covers the player is that the gate is ONE predicate ' +
+      'evaluated ahead of the driver-mode switch, so \'human\' and \'referenceAI\' cannot diverge, plus ' +
+      'the `countdown-drive` sabotage in --broken. Closing it properly needs a keyboard the harness can ' +
+      'press — `HarnessAPI.injectInput`, which this build reports as not available yet.',
+    )
     pendings.push(
       'the simultaneous eight-kart first corner — the player kart is correctly stationary through the ' +
       'launch window (that is check 4), so it reaches turn one alone, ~8 s behind the seven AI karts. ' +
