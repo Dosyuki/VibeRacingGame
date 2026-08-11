@@ -169,8 +169,30 @@ const STEER_TOUCH_DEADZONE_PX = 3
 const STICK_DEADZONE = 0.18
 /** Triggers rest at 0, but rarely at exactly 0. Enough to kill the idle creep. */
 const TRIGGER_DEADZONE = 0.05
-/** Movement below this is noise, not a hardware event worth timestamping. */
-const GAMEPAD_EPSILON = 1e-3
+/**
+ * How far a stick or trigger must travel FROM WHERE THE PAD WAS LAST RESTING
+ * before the pad is treated as "the device the player is using" and takes the
+ * frame.
+ *
+ * This used to be 1e-3, described as "movement below this is noise", and it was
+ * three orders of magnitude too small for the job it had grown into. It gates
+ * `kind`, and `kind` is winner-takes-all: a pad that claims the frame silences
+ * the keyboard completely. A worn analogue stick jitters by a few thousandths
+ * every poll while nobody is touching it, so at 1e-3 an idle controller
+ * re-claimed the frame on EVERY TICK, forever, and a player on the keyboard
+ * could not get it back — a held key emits no further events, so nothing ever
+ * marked the keyboard as used again. Measured against a pad parked at axis 0.35
+ * with 0.004 of jitter: `steer` sat at 0.207 with no key held, and ArrowLeft +
+ * ArrowUp produced steer 0.207, throttle 0. That is a kart that turns by itself
+ * and then ignores the controls, which is exactly what it was reported as.
+ *
+ * 0.05 is well above any resting noise and well below any deliberate input.
+ * Comparing against the pad's own NEUTRAL rather than the previous poll is the
+ * other half: a slow, deliberate sweep accumulates past the threshold and
+ * claims, while a stick that is merely parked off-centre never does however
+ * long it sits there.
+ */
+const GAMEPAD_ACTIVITY = 0.05
 /**
  * Ticks between speculative `getGamepads()` polls while no `gamepadconnected`
  * event has ever fired. A pad connected before the page loaded is invisible
@@ -395,15 +417,42 @@ export const createInput: InputFactory = (ctx: Ctx): IInput & Subsystem => {
   let padBrake = 0
   let padDrift = false
   let padLook = 0
-  // Previous poll, for change detection. A pad's `timestamp` advances on every
-  // poll in some engines whether or not anything moved, so it cannot itself be
-  // the change signal — only the timing of a change detected some other way.
-  let prevPadSteer = 0
-  let prevPadThrottle = 0
-  let prevPadBrake = 0
-  let prevPadDriftDown = false
-  let prevPadItemDown = false
-  let prevPadLook = 0
+  /*
+   * THE PAD'S NEUTRAL — where it sits when nobody is touching it.
+   *
+   * Seeded from the first poll of a given pad and never moved after, which is
+   * the difference that matters. A pad's `timestamp` advances on every poll in
+   * some engines whether or not anything moved, so it cannot itself be the
+   * change signal; and comparing against the PREVIOUS POLL cannot tell a stick
+   * held deliberately at full lock from one that was let go, because both are
+   * motionless. Displacement from neutral can, and that is what decides whether
+   * the pad is a device in use.
+   *
+   * The first poll of a pad therefore claims nothing, however far off-centre the
+   * stick already is. A controller plugged in with a worn stick has not been
+   * touched by anybody.
+   */
+  let padNeutralSeen = false
+  let padNeutralSteer = 0
+  let padNeutralThrottle = 0
+  let padNeutralBrake = 0
+  let padNeutralDriftDown = false
+  let padNeutralItemDown = false
+  let padNeutralLook = 0
+  /*
+   * WHERE THE PAD WAS THE LAST TIME IT TOOK THE FRAME. Not the previous poll:
+   * against the previous poll a deliberate but slow stick sweep moves less than
+   * the activity threshold on every single one of them and is therefore never
+   * seen at all, while against the last claim the same sweep accumulates and is.
+   */
+  let claimPadSteer = 0
+  let claimPadThrottle = 0
+  let claimPadBrake = 0
+  let claimPadDriftDown = false
+  let claimPadItemDown = false
+  let claimPadLook = 0
+  /** Is the pad displaced from its own neutral right now? See `sample`. */
+  let padEngaged = false
 
   /**
    * Guards double consumption of the one-tick item pulse. If `sample` runs
@@ -662,6 +711,11 @@ export const createInput: InputFactory = (ctx: Ctx): IInput & Subsystem => {
     padDrift = false
     padLook = 0
     padItemLatched = false
+    padEngaged = false
+    // The next pad to arrive is a different piece of hardware resting somewhere
+    // else; carrying this one's neutral forward would read the difference
+    // between two devices as a movement.
+    padNeutralSeen = false
   }
 
   // -------------------------------------------------------------------------
@@ -689,12 +743,15 @@ export const createInput: InputFactory = (ctx: Ctx): IInput & Subsystem => {
           gp = candidate
           gamepadIndex = i
           gamepadSeen = true
+          // A pad we have not been reading until now rests wherever it rests.
+          padNeutralSeen = false
           break
         }
       }
     }
     if (!gp) {
       gamepadIndex = -1
+      padEngaged = false
       return
     }
 
@@ -734,13 +791,53 @@ export const createInput: InputFactory = (ctx: Ctx): IInput & Subsystem => {
     // Stick forward is negative Y; forward means looking ahead, which is +1.
     const look = standard ? -applyDeadzone(axisValue(gp, AXIS_RIGHT_Y), STICK_DEADZONE) : 0
 
+    /*
+     * First sight of this pad: adopt whatever it is doing as its neutral and
+     * claim nothing. A controller plugged in with a drifting stick has not been
+     * touched by anybody, and the frame belongs to whoever last touched
+     * something.
+     */
+    if (!padNeutralSeen) {
+      padNeutralSeen = true
+      padNeutralSteer = steer
+      padNeutralThrottle = throttle
+      padNeutralBrake = brake
+      padNeutralDriftDown = driftDown
+      padNeutralItemDown = itemDown
+      padNeutralLook = look
+      claimPadSteer = steer
+      claimPadThrottle = throttle
+      claimPadBrake = brake
+      claimPadDriftDown = driftDown
+      claimPadItemDown = itemDown
+      claimPadLook = look
+    }
+
+    /*
+     * ENGAGED means displaced from neutral: somebody has hold of this thing.
+     * It is a LEVEL, not an edge, and that is the point — a stick pushed to full
+     * lock and held there is perfectly motionless, and any previous-poll
+     * comparison reads it as an idle device that can be taken the frame from.
+     */
+    const engaged =
+      Math.abs(steer - padNeutralSteer) > GAMEPAD_ACTIVITY ||
+      Math.abs(throttle - padNeutralThrottle) > GAMEPAD_ACTIVITY ||
+      Math.abs(brake - padNeutralBrake) > GAMEPAD_ACTIVITY ||
+      Math.abs(look - padNeutralLook) > GAMEPAD_ACTIVITY ||
+      driftDown !== padNeutralDriftDown ||
+      itemDown !== padNeutralItemDown
+
+    /**
+     * Has it MOVED since it last took the frame? A button edge always counts;
+     * nothing about a button press is ambiguous.
+     */
     const moved =
-      Math.abs(steer - prevPadSteer) > GAMEPAD_EPSILON ||
-      Math.abs(throttle - prevPadThrottle) > GAMEPAD_EPSILON ||
-      Math.abs(brake - prevPadBrake) > GAMEPAD_EPSILON ||
-      Math.abs(look - prevPadLook) > GAMEPAD_EPSILON ||
-      driftDown !== prevPadDriftDown ||
-      itemDown !== prevPadItemDown
+      Math.abs(steer - claimPadSteer) > GAMEPAD_ACTIVITY ||
+      Math.abs(throttle - claimPadThrottle) > GAMEPAD_ACTIVITY ||
+      Math.abs(brake - claimPadBrake) > GAMEPAD_ACTIVITY ||
+      Math.abs(look - claimPadLook) > GAMEPAD_ACTIVITY ||
+      driftDown !== claimPadDriftDown ||
+      itemDown !== claimPadItemDown
 
     padSteer = steer
     padThrottle = throttle
@@ -757,14 +854,32 @@ export const createInput: InputFactory = (ctx: Ctx): IInput & Subsystem => {
       padItemLatched = false
     }
 
-    prevPadSteer = steer
-    prevPadThrottle = throttle
-    prevPadBrake = brake
-    prevPadDriftDown = driftDown
-    prevPadItemDown = itemDown
-    prevPadLook = look
+    const wasEngaged = padEngaged
+    padEngaged = engaged
 
-    if (!moved) return
+    /*
+     * THE PAD TAKES THE FRAME WHEN SOMEBODY MOVES IT, AND AT NO OTHER TIME.
+     *
+     * Two conditions, and both of them are load-bearing:
+     *
+     *   `engaged` — displaced from its own neutral. An untouched controller,
+     *     however far off-centre a worn stick has drifted, is never engaged, so
+     *     the noise floor of an idle pad cannot reach `kind` at all. That is the
+     *     defect this whole arrangement exists to close.
+     *
+     *   `moved || !wasEngaged` — it has actually done something since it last
+     *     took the frame. Without this, a stick HELD at full lock re-claims on
+     *     its own jitter every tick, and a player who reaches back for the
+     *     keyboard is overruled a tick after every keypress — the same bug in a
+     *     smaller box.
+     */
+    if (!engaged || !(moved || !wasEngaged)) return
+    claimPadSteer = steer
+    claimPadThrottle = throttle
+    claimPadBrake = brake
+    claimPadDriftDown = driftDown
+    claimPadItemDown = itemDown
+    claimPadLook = look
 
     /*
      * A polled device has no receipt time of its own, so the API's `timestamp`
@@ -789,6 +904,67 @@ export const createInput: InputFactory = (ctx: Ctx): IInput & Subsystem => {
     lastSampledTick = clock.tick
 
     pollGamepad()
+
+    /*
+     * AN IDLE DEVICE MUST NOT KEEP THE FRAME WHILE ANOTHER ONE IS BEING HELD.
+     *
+     * `kind` is winner-takes-all and it is claimed by EVENTS, which is correct
+     * for the moment a player picks a device up and wrong for every moment after
+     * it. A keyboard emits nothing at all while a key is simply held down —
+     * `keydown` fired once, `keyup` has not happened yet, and OS auto-repeat is
+     * discarded in `onKeyDown` because it is not a new intent — so between those
+     * two events the keyboard is indistinguishable, to `markEvent`, from a device
+     * nobody is touching. Anything that stirs takes the frame off it, and the
+     * player cannot take it back without letting go of the key first.
+     *
+     * Two ways that reached a real player, both reproduced in a real browser with
+     * real key events:
+     *
+     *   - A gamepad. An idle stick's noise re-claimed the frame every tick, so
+     *     `steer` sat at a constant non-zero value with nothing held and the
+     *     keyboard could not override it. Written up on GAMEPAD_ACTIVITY, which
+     *     is the other half of that fix: an untouched pad is no longer engaged at
+     *     all, so it never gets as far as this block.
+     *
+     *   - A single stray contact on a touchscreen laptop's glass. A palm landing
+     *     and lifting inside a control zone while ArrowUp was held dropped
+     *     `throttle` from 1 to 0 and it stayed 0 until the key was released and
+     *     pressed again — and a player holds the throttle down for a whole lap.
+     *
+     * The fix is NOT to mix devices; summing them is still wrong for every reason
+     * the comment below gives. It is that "most recently used" has to mean the
+     * same thing for a device whose input is a held level as for one whose input
+     * is a stream of events. So: an engaged device outranks an idle one, and
+     * between two engaged devices the event-driven `kind` stands, which is real
+     * recency and is what makes a player reaching for the pad mid-race still work.
+     *
+     * `lastEventAtMs` is deliberately NOT touched here. It answers "how long ago
+     * did a hardware event arrive", the latency instrument reads it, and a key
+     * that is merely still down is not a new event.
+     */
+    let keyEngaged = false
+    for (let k = 1; k < KEY_COUNT; k++) {
+      if (keyHeld[k]!) {
+        keyEngaged = true
+        break
+      }
+    }
+    let touchEngaged = steerPointerId !== -1
+    if (!touchEngaged) {
+      for (let c = 1; c < CONTROL_COUNT; c++) {
+        if (touchHeld[c]! > 0) {
+          touchEngaged = true
+          break
+        }
+      }
+    }
+    if (kind === 'gamepad' && !padEngaged && (keyEngaged || touchEngaged)) {
+      kind = keyEngaged ? 'keyboard' : 'touch'
+    } else if (kind === 'touch' && !touchEngaged && (keyEngaged || padEngaged)) {
+      kind = keyEngaged ? 'keyboard' : 'gamepad'
+    } else if (kind === 'keyboard' && !keyEngaged && (padEngaged || touchEngaged)) {
+      kind = touchEngaged ? 'touch' : 'gamepad'
+    }
 
     // The keyboard rack integrates every tick regardless of which device is
     // active, so a player who reaches for the pad mid-race and comes back finds
@@ -916,6 +1092,11 @@ export const createInput: InputFactory = (ctx: Ctx): IInput & Subsystem => {
     itemPending = false
     gamepadSeen = false
     gamepadIndex = -1
+    padEngaged = false
+    // A pad's neutral belongs to the world that measured it. Carrying one across
+    // a rebuild is exactly the cross-run leak the ALLOCATION note above is about,
+    // and it would present as an input bug in the NEXT run.
+    padNeutralSeen = false
   }
 
   /*
