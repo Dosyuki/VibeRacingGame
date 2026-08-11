@@ -116,6 +116,31 @@ export interface TerrainStats {
    * would show up before somebody noticed the scree had gone.
    */
   readonly scatterRejected: number
+  /**
+   * Station cross-sections whose outward reach had to be squeezed to stay out
+   * of another part of the lap's corridor, and the worst squeeze factor
+   * applied. See `computeCorridorReach`.
+   *
+   * Reported for the same reason `scatterRejected` is: a build where this is
+   * large is a circuit that folds back on itself harder than the section table
+   * assumes, and this number is the only place that would show up before
+   * somebody noticed the hinterland had steepened.
+   */
+  readonly profilesCompressed: number
+  readonly worstProfileSqueeze: number
+  /**
+   * Stations whose FACE BASE — not just its hinterland — could not clear
+   * another part of the lap's corridor. Should be zero. Anything else is a
+   * track layout that passes closer to itself than the section's own setback,
+   * and it is a conversation about the layout, not a number to tune here.
+   */
+  readonly corridorConflicts: number
+}
+
+interface ProfileStats {
+  readonly compressedProfiles: number
+  readonly worstSqueeze: number
+  readonly corridorConflicts: number
 }
 
 /**
@@ -230,6 +255,87 @@ const OXIDE_MAX = 0.8
 
 /** §5c: talus at 32° repose. `run = height / tan(32°)`. */
 const TALUS_RUN_PER_METRE = 1 / Math.tan((32 * Math.PI) / 180)
+
+/*
+ * EXTRA METRES BEYOND `halfWidth + BARRIER_MARGIN` THAT THE PROFILE MUST LEAVE
+ * ALONE — and every one of them is derived, not chosen.
+ *
+ * `halfWidth + BARRIER_MARGIN` is the corridor, from the contract. Two
+ * discretisation errors sit between that line and what this file actually
+ * emits, and both are one-sided in the dangerous direction:
+ *
+ *   - The corridor is tested against STATIONS, 4.5 m apart, as a union of
+ *     discs. A union of discs of radius R at spacing s under-covers the true
+ *     tube around the polyline by `R - sqrt(R^2 - (s/2)^2)` in the gaps. At the
+ *     tightest corridor on the lap (The Slot, R = 8.0 + 1.5 = 9.5 m) that is
+ *     0.27 m.
+ *   - The swept surface is a chord between two stations 4.5 m apart, and the
+ *     road it must clear is a curve of radius >= 47.8 m (tools/track-check
+ *     reports the minimum). The chord cuts inside the arc by the sagitta,
+ *     4.5^2 / (8 * 47.8) = 0.053 m.
+ *
+ * 0.27 + 0.05 = 0.32, rounded up to 0.5 for the arithmetic to stay obviously
+ * safe rather than exactly safe. This is not a tuning knob: raise the station
+ * spacing and the first term grows as s^2 and this number has to be re-derived.
+ */
+const CORRIDOR_CLEARANCE = 0.5
+
+/*
+ * HEADROOM: how far above the road the corridor extends.
+ *
+ * It cannot be infinite. §1 gives this circuit an arch tunnel with a roof and a
+ * Slot whose walls close to a 9° sky strip; both are named design intents and
+ * both put rock over the road on purpose. So the rule has to be "nothing in the
+ * corridor BELOW the headroom", and the headroom is the number that decides
+ * whether an overhang is architecture or an obstacle.
+ *
+ * MEASURED, not assumed. The contract carries no kart dimensions — tools/
+ * track-check.mjs flags that absence as its own finding — so this was taken off
+ * the built model: every vertex of the eight grid karts projected through
+ * `ITrack.locate` tops out at 0.920 m above the road plane (the helmet), with
+ * the lowest at -0.042 m. 4.0 m is 4.3x that, leaving 3.08 m of air for a kart
+ * that is airborne over a crest.
+ *
+ * It is also the number this file already committed to in prose: The Slot's
+ * section entry says "Nothing overhangs below 4 m, so a kart at the barrier
+ * line never touches it". That sentence was true and unenforced. It is now the
+ * constant.
+ */
+const CORRIDOR_HEADROOM = 4.0
+
+/*
+ * Above the headroom the wall is allowed to lean back in, and this is how fast
+ * it may do so.
+ *
+ * The forbidden region has to be described by a CONCAVE lower bound on `u` as a
+ * function of height, not by a step. Rows are joined by straight quads: if
+ * every row satisfies `u >= f(h)` and `f` is concave, then every point on every
+ * quad between them satisfies it too, because a chord of points above a concave
+ * function stays above it. A step from "full width" to "no constraint" is not
+ * concave, and a face that jumped the step would sweep straight through the
+ * corridor between two legal rows — which is exactly the class of miss that a
+ * per-vertex check cannot see.
+ *
+ * Constant, then linear-decreasing, is concave. 6 m of fade takes the bound
+ * from the full corridor at 4 m to zero at 10 m — steeper than anything §1
+ * asks for. The Slot's crest sits at 0.34x its base offset, about 3.5 m from
+ * the centreline at 26 m up, and clears this bound by 16 m of height.
+ */
+const CORRIDOR_LEAN_FADE = 6.0
+
+/**
+ * The concave lower bound on the profile's lateral offset — the shape of the
+ * corridor, seen from a wall.
+ *
+ * `hAbove` is metres above the road plane at this station. Below the headroom
+ * nothing may come inside `halfWidth + BARRIER_MARGIN + CORRIDOR_CLEARANCE`;
+ * above it the bound falls away linearly so §1's overhangs remain buildable.
+ */
+function corridorMinU(hAbove: number, halfWidth: number): number {
+  const w = halfWidth + BARRIER_MARGIN + CORRIDOR_CLEARANCE
+  if (hAbove <= CORRIDOR_HEADROOM) return w
+  return Math.max(0, w * (1 - (hAbove - CORRIDOR_HEADROOM) / CORRIDOR_LEAN_FADE))
+}
 
 /** §1 Trap 4, the three separation criteria. All three must hold to permit reuse. */
 const TRAP4_MIN_AZIMUTH_DEG = 55
@@ -398,7 +504,13 @@ const SECTIONS: readonly Section[] = [
    * a vertical face, 26 m up the gap is 16 m wide and subtends 34°, not 9°. At
    * `topScale` 0.34 the crests close to about 2.7 m each side and the strip lands
    * near 11°, which is as close as this gets without the roof meeting itself.
-   * Nothing overhangs below 4 m, so a kart at the barrier line never touches it.
+   *
+   * Nothing overhangs below 4 m, so a kart at the barrier line never touches
+   * it. That was a claim about this table's numbers and nothing enforced it;
+   * `CORRIDOR_HEADROOM` is now that 4 m, and `corridorMinU` is what holds the
+   * lean above it. The lap sweep found 0.60 m of basal shale inside the barrier
+   * line here at ride height while this sentence was still true of the table —
+   * the erosion field had moved the face after the table had spoken.
    */
   {
     name: 'the-slot',
@@ -730,6 +842,15 @@ interface Station {
   readonly backGrade: number
   /** Metres the bedding stack is displaced by the §5c 2.4° dip at this point. */
   dip: number
+  /**
+   * THE FURTHEST OUT THIS STATION'S CROSS-SECTION MAY REACH, per side, before
+   * it enters the drivable corridor of some OTHER part of the lap.
+   *
+   * `Infinity` where the ray never meets the circuit again, which is most of
+   * the lap. See `computeCorridorReach` for how it is measured and
+   * `buildProfiles` for what is done about it.
+   */
+  reachU: [number, number]
   /** Row offsets and heights, `[side][row]`. Heights are above the road plane. */
   readonly rowU: [Float64Array, Float64Array]
   readonly rowH: [Float64Array, Float64Array]
@@ -888,7 +1009,8 @@ export function buildCanyonTerrain(
   const floorY = minY - 3
 
   applyDip(stations, cx, cz)
-  buildProfiles(stations, fields, lapLength, floorY)
+  computeCorridorReach(stations, stationCount)
+  const profileStats = buildProfiles(stations, fields, lapLength, floorY)
 
   // -------------------------------------------------------------------------
   // Materials
@@ -1152,8 +1274,6 @@ export function buildCanyonTerrain(
     triangles += triCount(geo)
   }
 
-  ctx.scene.add(group)
-
   const stats: TerrainStats = {
     meshes: meshCount,
     shadowCasters,
@@ -1162,7 +1282,24 @@ export function buildCanyonTerrain(
     instances,
     stations: stationCount,
     scatterRejected: scatter.rejected,
+    profilesCompressed: profileStats.compressedProfiles,
+    worstProfileSqueeze: profileStats.worstSqueeze,
+    corridorConflicts: profileStats.corridorConflicts,
   }
+
+  /*
+   * The stats, hung where something can actually read them.
+   *
+   * `buildCanyonTerrain` returns them, and today nothing in `main.ts` looks at
+   * the return value, so `scatterRejected` and the corridor counters would be a
+   * gate that quietly covers nothing — the failure mode CLAUDE.md names about
+   * `energy-check`'s PENDING rows. `userData` on the group is a channel any
+   * harness already holding `HarnessAPI.scene` can read, costs nothing per
+   * frame, and widens no contract.
+   */
+  group.userData.terrainStats = stats
+
+  ctx.scene.add(group)
 
   return {
     group,
@@ -1280,8 +1417,16 @@ function sampleStations(
        * `BARRIER_MARGIN * 0.4`, which let the scree toe sit 0.6 m off the road
        * on a 1.5 m margin. The comment was right and the code was not; a kart
        * inside its own legal run-off was inside a talus slope. Full margin.
+       *
+       * Plus CORRIDOR_CLEARANCE, and that is not belt-and-braces. This is a
+       * STATION, 4.5 m from its neighbours, and the road it must clear is a
+       * curve; a toe placed at exactly `halfWidth + BARRIER_MARGIN` here
+       * measures up to 0.32 m INSIDE the barrier line when it is projected back
+       * through `ITrack.locate` from a point between stations. The lap sweep
+       * measured 0.08 m of exactly that before this term existed. The clearance
+       * is the discretisation error, derived where it is declared.
        */
-      const minToe = halfWidth + BARRIER_MARGIN
+      const minToe = halfWidth + BARRIER_MARGIN + CORRIDOR_CLEARANCE
       if (base - run < minToe) {
         run = Math.max(0, base - minToe)
         tH = run / TALUS_RUN_PER_METRE
@@ -1330,6 +1475,7 @@ function sampleStations(
       facePower: resolved.facePower,
       backGrade: resolved.backGrade,
       dip: 0,
+      reachU: [Infinity, Infinity],
       rowU: [new Float64Array(ROWS_TOTAL), new Float64Array(ROWS_TOTAL)],
       rowH: [new Float64Array(ROWS_TOTAL), new Float64Array(ROWS_TOTAL)],
       rowV: [new Float64Array(ROWS_TOTAL), new Float64Array(ROWS_TOTAL)],
@@ -1353,6 +1499,129 @@ function applyDip(stations: Station[], cx: number, cz: number): void {
   }
 }
 
+/**
+ * How far each station's cross-section may reach outward before it arrives over
+ * a DIFFERENT part of the lap.
+ *
+ * ────────────────────────────────────────────────────────────────────────────
+ * WHY THIS EXISTS, AND WHY NOTHING ELSE IN THE FILE COULD HAVE CAUGHT IT.
+ *
+ * Every clearance rule above this line is written in ONE station's frame:
+ * `minToe`, `legalInner`, `corridorMinU`. They are all correct, and they are all
+ * blind to the same thing — the profile keeps going outward long after it has
+ * left the neighbourhood the station knows about. `faceTopU` is
+ * `(halfWidth + setback) * topScale`, and at the mesa climb that is
+ * (12.4 + 50) * 2.1 = 131 m; the cap adds up to 7 m and the hinterland
+ * `backGrade` run adds up to 70 more. The cross-section is 205 m wide.
+ *
+ * Vermilion Nine folds back on itself. Measured on the built circuit, the road
+ * at t = 0.55 passes within 131.5 m of the road at t = 0.70, thirteen metres
+ * below it. So the mesa climb's hinterland was laid straight over the wash
+ * descent — 466 m² of it inside the corridor, 5.7 m above the road surface at
+ * the centreline. From a kart that is a mountain you drive into and then drive
+ * around inside, which is exactly what the player reported. No screenshot from
+ * any §11 vantage shows it, because the vantages look along the road and this
+ * is a roof.
+ *
+ * ────────────────────────────────────────────────────────────────────────────
+ * WHAT IS MEASURED. For each station and side, the horizontal ray the profile
+ * is swept along, tested against every station's corridor disc of radius
+ * `halfWidth + BARRIER_MARGIN + CORRIDOR_CLEARANCE`. The union of the hit
+ * intervals is merged; the component containing u = 0 is this station's OWN
+ * corridor and is skipped; the start of the next interval is the answer.
+ * `Infinity` where the ray never meets the circuit again — 361 of 722 rays.
+ *
+ * THE TEST IS PURELY 2D, AND THAT IS DELIBERATE. Height is not a defence here.
+ * Terrain that passes 20 m above the road reads as a tunnel the player did not
+ * expect; terrain that passes 20 m below is invisible but leaves the road on a
+ * shelf with a hole beside it. Neither is something this file should produce by
+ * accident at a place §1 never asked for a tunnel, and the only two places §1
+ * DOES ask for one — The Slot and the arch — are a single station's own
+ * cross-section closing over itself, which `corridorMinU` governs and this does
+ * not touch.
+ */
+function computeCorridorReach(stations: Station[], stationCount: number): void {
+  // Scratch, reused across every ray: this runs 722 times over 361 stations and
+  // allocating an interval array per ray is 260 000 short-lived objects.
+  const iv: number[] = []
+  for (let i = 0; i < stationCount; i++) {
+    const a = stations[i]!
+    for (let side = 0; side < 2; side++) {
+      const sg = side === 0 ? -1 : 1
+      const dx = a.rx * sg
+      const dz = a.rz * sg
+      iv.length = 0
+      for (let j = 0; j < stationCount; j++) {
+        const b = stations[j]!
+        const r = b.halfWidth + BARRIER_MARGIN + CORRIDOR_CLEARANCE
+        const ox = a.px - b.px
+        const oz = a.pz - b.pz
+        // Ray-circle: |o + u*d|^2 = r^2 with |d| = 1.
+        const p = ox * dx + oz * dz
+        const disc = p * p - (ox * ox + oz * oz - r * r)
+        if (disc <= 0) continue
+        const s = Math.sqrt(disc)
+        const u1 = -p + s
+        if (u1 <= 0) continue
+        iv.push(Math.max(0, -p - s), u1)
+      }
+      // Sort the intervals by entry, merge, and walk out from u = 0. Sorting a
+      // flat pair array by hand keeps this allocation-free.
+      const n = iv.length / 2
+      for (let x = 1; x < n; x++) {
+        const e0 = iv[x * 2]!
+        const e1 = iv[x * 2 + 1]!
+        let y = x - 1
+        while (y >= 0 && iv[y * 2]! > e0) {
+          iv[(y + 1) * 2] = iv[y * 2]!
+          iv[(y + 1) * 2 + 1] = iv[y * 2 + 1]!
+          y--
+        }
+        iv[(y + 1) * 2] = e0
+        iv[(y + 1) * 2 + 1] = e1
+      }
+      let own = a.halfWidth + BARRIER_MARGIN + CORRIDOR_CLEARANCE
+      let reach = Infinity
+      let curLo = -1
+      let curHi = -1
+      for (let x = 0; x < n; x++) {
+        const lo = iv[x * 2]!
+        const hi = iv[x * 2 + 1]!
+        if (curLo < 0) {
+          curLo = lo
+          curHi = hi
+          continue
+        }
+        if (lo <= curHi) {
+          if (hi > curHi) curHi = hi
+          continue
+        }
+        // `curLo..curHi` is closed. Either it is the station's own corridor or
+        // it is the first thing the profile must not reach.
+        if (curLo <= 0) own = Math.max(own, curHi)
+        else if (curLo > own) {
+          reach = curLo
+          break
+        }
+        curLo = lo
+        curHi = hi
+      }
+      if (reach === Infinity && curLo >= 0) {
+        if (curLo <= 0) own = Math.max(own, curHi)
+        else if (curLo > own) reach = curLo
+      }
+      a.reachU[side] = reach
+    }
+  }
+  // The wrap station is a duplicate of station 0 and must carry its limits, or
+  // the last quad of the lap is swept against `Infinity` and the seam opens.
+  const last = stations[stationCount]
+  if (last) {
+    last.reachU[0] = stations[0]!.reachU[0]!
+    last.reachU[1] = stations[0]!.reachU[1]!
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Profiles
 // ---------------------------------------------------------------------------
@@ -1366,7 +1635,15 @@ function applyDip(stations: Station[], cx: number, cz: number): void {
  * hard strata edge, and it is also why every band strip is a regular grid that
  * can be swept without any per-station branching.
  */
-function buildProfiles(stations: Station[], fields: Fields, lapLength: number, floorY: number): void {
+function buildProfiles(
+  stations: Station[],
+  fields: Fields,
+  lapLength: number,
+  floorY: number,
+): ProfileStats {
+  let compressed = 0
+  let worstSqueeze = 1
+  let corridorConflicts = 0
   for (const st of stations) {
     for (let side = 0; side < 2; side++) {
       const u = st.rowU[side]!
@@ -1462,7 +1739,26 @@ function buildProfiles(stations: Station[], fields: Fields, lapLength: number, f
         const thickness = (hi - lo) * faceH
         const bias =
           spec.bias * Math.sin(Math.PI * clamp(local, 0, 1)) * biasScale * Math.min(1, thickness / 1.5)
-        return faceBase + (faceTop - faceBase) * Math.pow(phi, st.facePower) + bias + erosionAt(phi)
+        const raw = faceBase + (faceTop - faceBase) * Math.pow(phi, st.facePower) + bias + erosionAt(phi)
+        /*
+         * THE CORRIDOR BOUND GOES HERE, NOT UPSTREAM, AND THAT IS THE POINT.
+         *
+         * `minToe` clamps where the talus starts, and it is correct. Then this
+         * expression adds two signed terms to `faceBase` — a weathering `bias`
+         * and a SIGNED erosion field — and both can be negative. At the
+         * amplitudes §5c asks for, `erosionAt` reaches about -1.2 * eroAmp,
+         * which on a 25 m face is 2.3 m of inward displacement applied after
+         * every clearance decision in this file had already been made. The lap
+         * sweep found it as 0.60 m of basal shale inside the barrier line at
+         * t = 0.366 and 0.72 m of upper strata at t = 0.975: small, at ride
+         * height, and on the racing line.
+         *
+         * That is the third time this project has shipped a guard that was
+         * right and applied at the wrong point in the pipeline. The bound is
+         * therefore evaluated on the RESULT, at the height the row actually
+         * sits at, so nothing downstream of it can move the geometry.
+         */
+        return Math.max(raw, corridorMinU(talusH + phi * faceH, st.halfWidth))
       }
 
       // --- talus ------------------------------------------------------------
@@ -1559,6 +1855,59 @@ function buildProfiles(stations: Station[], fields: Fields, lapLength: number, f
         h[bOff + r] = h[cOff + 2]! - totalDrop * Math.pow(f, 1.25) + wob * 2.2 * f
       }
 
+      // --- corridor reach: squeeze, never clip -------------------------------
+      /*
+       * Everything outboard of the face base is scaled toward the face base
+       * until the whole cross-section fits inside `reachU`.
+       *
+       * COMPRESSED RATHER THAN TRUNCATED, for two reasons that are not taste.
+       * Truncating leaves the outermost rows stacked at one offset — a vertical
+       * shear tens of metres high standing over the road it was cut away from,
+       * and `computeVertexNormals` on the resulting sliver quads is a coin
+       * flip. Compressing keeps the profile monotonic in `u`, keeps every band
+       * boundary, the cap and the hinterland in the same order at the same
+       * heights, and simply makes the section steeper — the crest still exists,
+       * the backslope still closes against the floor.
+       *
+       * AND IT CANNOT OPEN A VOID. The thing that bounds the reach is a road,
+       * and a road brings its own cross-section: where the mesa climb is
+       * squeezed from 205 m to 131 m, the wash descent's own hinterland already
+       * covers from 34 m to 146 m in the same frame. The backslope band exists
+       * to stop a vantage above the crest looking into nothing — that argument
+       * is unaffected here, because the ground on the far side of the cut is
+       * another section's ground rather than nothing.
+       *
+       * The talus and the road-side face base are NOT scaled. They are governed
+       * by `minToe` and `corridorMinU`, and a squeeze that moved them would be
+       * one clearance rule quietly overwriting another.
+       */
+      const reach = st.reachU[side]!
+      if (Number.isFinite(reach)) {
+        const outer = u[ROWS_TOTAL - 1]!
+        if (outer > reach) {
+          const room = reach - faceBase
+          if (room <= 0.5) {
+            /*
+             * The face base itself is inside another part of the lap's
+             * corridor. Nothing in this file can resolve that — it is a track
+             * layout that passes closer to itself than one section's setback —
+             * so it is clamped hard and COUNTED, in the same spirit as
+             * `scatterRejected`. A silent clamp here would hide a genuine
+             * layout conflict behind a plausible-looking wall.
+             */
+            corridorConflicts++
+            for (let r = 0; r < ROWS_TOTAL; r++) if (u[r]! > reach) u[r] = reach
+          } else {
+            const k = room / (outer - faceBase)
+            compressed++
+            if (k < worstSqueeze) worstSqueeze = k
+            for (let r = 0; r < ROWS_TOTAL; r++) {
+              if (u[r]! > faceBase) u[r] = faceBase + (u[r]! - faceBase) * k
+            }
+          }
+        }
+      }
+
       // --- texture V: distance travelled along the profile -------------------
       /*
        * v is arc length UP THE CROSS-SECTION, not world height.
@@ -1585,6 +1934,7 @@ function buildProfiles(stations: Station[], fields: Fields, lapLength: number, f
       }
     }
   }
+  return { compressedProfiles: compressed, worstSqueeze, corridorConflicts }
 }
 
 // ---------------------------------------------------------------------------
@@ -1993,9 +2343,16 @@ function buildScatter(
    * `Station.rightY`. `dy` is the largest vertical excursion the instance can
    * have from the road plane; the bank term is signed either way, so its
    * magnitude is what has to be paid for on both sides.
+   *
+   * CORRIDOR_CLEARANCE is in here for the same reason it is in `minToe`: this
+   * is measured against ONE station's `halfWidth`, and the barrier line the
+   * result is graded against is a curve sampled every 4.5 m. Without it the lap
+   * sweep reads boulders at 0.03–0.05 m inside the line — the discretisation
+   * error, not a placement error, but indistinguishable from one in a report.
    */
   const legalInner = (st: Station, worldRadius: number, dy: number): number =>
-    (st.halfWidth + BARRIER_MARGIN + worldRadius + Math.abs(dy * st.rightY)) / st.rightXZ
+    (st.halfWidth + BARRIER_MARGIN + CORRIDOR_CLEARANCE + worldRadius + Math.abs(dy * st.rightY)) /
+    st.rightXZ
 
   for (let i = 0; i < stationCount; i++) {
     const st = stations[i]!
