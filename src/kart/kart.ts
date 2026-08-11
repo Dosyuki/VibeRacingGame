@@ -163,6 +163,63 @@ const MAX_STEER = 0.48
 const STEER_FADE_SPEED = 34
 const TYRE_SLIP_ANGLE = 0.115
 const TYRE_SLIP_RATIO = 0.13
+/*
+ * The heat the brush model does not model, in the only currency the wheel
+ * understands: how far ahead of the road its contact patch may run.
+ *
+ * `wheelOmega` is an integrator with exactly one outlet — the reaction to
+ * `longitudinalForce` — and past about 4x `TYRE_SLIP_RATIO` that outlet is
+ * CONSTANT, because tanh is saturated and returns the same peak force for a
+ * patch running 0.5 m/s fast as for one running 250 m/s fast. Above that the
+ * wheel is a battery: spin costs nothing to hold, buys the chassis nothing
+ * while it is held, and comes back later as thrust that no longer has anything
+ * to do with what the engine is asking for at that speed. Where the rear is
+ * also LATERALLY saturated there is no outlet at all, because the friction
+ * circle has spent the whole budget sideways — so a slide charges it flat out.
+ * Measured on the flat bench, a 3 s deliberate drift then held throttle: the
+ * rear patch reached 150 m/s during the drift and 282 m/s after it, and the
+ * kart accelerated for eleven seconds straight to 39.3 m/s against a 27.80 m/s
+ * terminal — 41% over, and still 38.6 m/s fifteen seconds later. A real tyre at
+ * 282 m/s of rim speed is not storing that energy. It is destroying itself with
+ * it, and that is what this constant stands in for.
+ *
+ * 80 m/s is not a physical number and must not be read as one. It is the
+ * measured peak of the kart's OWN clean full-throttle launch on DustyAsphalt,
+ * which tops out at 78.4 m/s of slip at 14.2 m/s of road speed. The bound is
+ * therefore chosen to be exactly non-binding on the launch, and everything
+ * else is held to what the launch already does. That matters, because the
+ * launch is not innocent either:
+ *
+ *   - a 0 -> 25 m/s run is slip-SATURATED for its entire length, so its thrust
+ *     is the rear's peak 1122 N and NOT the engine's demand, which has fallen
+ *     to 663 N by 22 m/s
+ *   - the run therefore spends the store to reach 25, and the documented 6.96 s
+ *     is a number the store pays for
+ *
+ * So a physically honest bound is not free. Measured, same bench, same tick:
+ *
+ *   bound on slip                     0->25 m/s   3 s drift then throttle
+ *   none (the defect)                    6.96 s          39.30 m/s
+ *   0.9 x TYRE_SLIP_RATIO reference      9.30 s          26.74 m/s
+ *   80 m/s, the launch's own peak        6.96 s          27.75 m/s
+ *
+ * The middle row is what the tyre model can actually justify: past 0.9 of slip
+ * ratio every force in this file is identical to two parts in a million, so it
+ * removes the discharge and nothing else — and it costs 2.3 s of 0 -> 25 m/s,
+ * because that 2.3 s was being paid for out of the battery. Spending it is a
+ * decision about how the kart accelerates and belongs with whoever owns 6.96 s;
+ * it is not a decision to make silently while fixing a corner-exit bug. This
+ * bound removes only what the launch itself never asks for.
+ *
+ * This is NOT "clamp wheelOmega to road speed", which deletes wheelspin, and
+ * wheelspin is what starts a drift. At 80 m/s of slip a standing kart may still
+ * spin its rears to 222 rad/s.
+ *
+ * If this ever seems to want to go UP, the thing that changed is the engine
+ * demand: see ENGINE_FORCE, where the rear is asked for twice its budget. A
+ * bigger cap is a bigger discharge, and the demand is what fills it.
+ */
+const MAX_SLIP_SPEED = 80
 const MAX_TYRE_LOAD = MASS * GRAVITY * 0.75
 /*
  * The chassis cap, and it is NOT the same number as `MAX_TYRE_LOAD`.
@@ -694,18 +751,22 @@ export const createKart: KartFactory = (
          * steady state at all — K0 is bit-identical, and usable steer while
          * holding 22 m/s goes 0.70 -> full lock.
          *
-         * What it does NOT fix, so that the next person does not read the good
-         * numbers above as a clean bill: while the rear is laterally saturated
-         * its longitudinal force is now near zero, so `wheelOmega` below has
-         * almost nothing to react the drive torque against and runs away, and
-         * the stored spin discharges as thrust once the slide ends. That is the
-         * ENGINE_FORCE=3450 top-speed-overshoot failure, and it was ALREADY
-         * here — a 3 s deliberate drift then held throttle peaks at 37.1 m/s
-         * against a 27.8 m/s terminal with radial clipping and 38.5 with this.
-         * Short drifts get better, not worse (0.8 s: 33.6 -> no overshoot at
-         * all), because the kart no longer departs on the exit. Fixing the
-         * discharge is a change to the wheel model, not to the circle, and it
-         * wants its own measurement.
+         * What this allocation does NOT fix, and the reason the bound below
+         * `wheelOmega` exists: while the rear is laterally saturated its
+         * longitudinal force here is near zero, so the wheel has almost nothing
+         * to react the drive torque against and runs away, and the stored spin
+         * discharges as thrust once the slide ends. That is the
+         * ENGINE_FORCE=3450 top-speed-overshoot failure and it was ALREADY
+         * here — a 3 s deliberate drift then held throttle peaked at 37.1 m/s
+         * against a 27.8 m/s terminal with radial clipping and 39.3 with this,
+         * while short drifts got better, not worse (0.8 s: 33.6 -> no overshoot
+         * at all) because the kart no longer departs on the exit.
+         *
+         * It is fixed now, in the wheel model rather than in the circle, by
+         * MAX_SLIP_SPEED — a bound on what the wheel may bank, not on what this
+         * allocation may hand it. Nothing on this page moved: the same 3 s
+         * drift releases at the same 7.274 m/s, reaches the same tier 3 at the
+         * same 2.083 s, and now peaks at 27.75 m/s instead of 39.30.
          */
         const combined = Math.hypot(lateralForce, longitudinalForce)
         if (combined > peakForce) {
@@ -731,6 +792,17 @@ export const createKart: KartFactory = (
         wheelOmega[i] =
           wheelOmega[i]! +
           (axleTorque - longitudinalForce * WHEEL_RADIUS) / WHEEL_INERTIA * step
+        // Spend, as heat, the slip the contact patch cannot survive — see
+        // MAX_SLIP_SPEED.  The bound is on the patch's speed RELATIVE to the
+        // road it is standing on, not on the wheel's absolute speed, so it
+        // follows the kart up to terminal instead of pinning the rim to the
+        // road and deleting wheelspin.  It is symmetric because a wheel dragged
+        // 80 m/s slower than the road is the same lie in the other direction.
+        wheelOmega[i] = clamp(
+          wheelOmega[i]!,
+          (tyreLongSpeed - MAX_SLIP_SPEED) / WHEEL_RADIUS,
+          (tyreLongSpeed + MAX_SLIP_SPEED) / WHEEL_RADIUS,
+        )
         wheel.spin += wheelOmega[i]! * step
 
         totalForceX +=
