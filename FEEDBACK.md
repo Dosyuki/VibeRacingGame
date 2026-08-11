@@ -84,6 +84,178 @@ defect costs a round in the other direction.
 
 ---
 
+## 2. The kart was not sliding. It was airborne.
+
+**Round 7 → 8. Found by:** driving for a while and watching the kart go straight
+on while the road bent away.
+
+> While driving, after a certain amount of time, the kart slides — the whole
+> body slides. Maybe because it's trying to move straight while the road curves.
+
+The reporter's guess was right about the effect and wrong about the cause, in a
+way worth recording: there was indeed almost no lateral force, so the kart did
+carry straight on while the road turned. But nothing was wrong with the tyre
+model, the steering, the road frame or the camera. **The kart was hovering.**
+
+`kart.ts` subtracts an analytic road-roughness profile from each suspension ray
+length, and computed the damper's `compressionSpeed` as a backward difference of
+that same ray length. The bump is a function of *distance travelled*, so
+differencing it yields a damper velocity of `A·k·v` — proportional to **speed**.
+`Math.max(0, …)` on the spring force then rectified it: the negative half of
+every 1.10 m cycle was clipped and the positive half was not, so the mean
+vertical force exceeded the kart's weight and the body climbed to the droop stop
+and stayed there.
+
+Parity with the 637.7 N static wheel load arrives at 11.8 m/s on asphalt and at
+**5.9 m/s on the dusty asphalt of the grid straight**. Over a full lap, 90.7% of
+ticks had zero static spring load and 8.4% had all four wheels off the ground.
+Achieved lateral acceleration under a held steer was 2.78 m/s² where the same
+tyre model delivers 7.91 with the wheels down — same command, same speed, 35% of
+the grip.
+
+The single most convincing measurement was not a slip angle. A **zero-steer**
+hold on the grid straight left the wheels reading `SandDrift` for 589 of 960
+wheel-ticks and `Gravel` for 172: with nothing whatsoever commanded, the kart
+slid off the road. That is the human's report, in the contract's own vocabulary.
+
+**Why it looked like a time-based bug and was not.** It is a function of speed,
+not elapsed time. "After a while" was how long the kart took to accelerate past
+5.9 m/s. Every reproduction that started from a fresh `seek` hovered within 90
+ticks at 16 m/s and never hovered at 2 m/s however long it ran.
+
+**Why the gates missed it.** Every one of them for a different reason, which is
+what makes it worth writing down:
+
+- `smoke.mjs`, `energy-check.mjs`, `fps-bench.mjs` grade pixels and frame cost.
+  **A hovering kart renders a flawless frame.**
+- `steer-test.mjs` probes 36 ticks — 0.30 s — at one speed, and asks only which
+  **sign** the kart moves in. A kart with 35% of its grip still moves the right
+  way. Whether it hovers at all depends entirely on `CFG.probeSpeed`.
+- `autoplay.mjs` gates on lap times, drift ratios, respawns and stalls. A whole
+  field at 35% grip satisfies every one of those: everybody finishes, and
+  because there is no baseline for what a lap time *should* be, the field
+  produces a **self-consistent set of slow lap times that no threshold rejects.**
+- Nothing asserted the one invariant that catches it in a line: on flat, level
+  road, at every speed the game supports, all four wheels stay in contact and
+  mean compression stays near static. `WheelState.grounded` and
+  `WheelState.compression` were already on the contract the whole time.
+
+**Acted on.** `tools/slip-check.mjs` — 40 s of simulated driving, sampled every
+tick, binned by curvature so that slip in a corner and slip on a straight are
+never averaged together. Two properties of it are the point:
+
+- Its straight-line slip gate is **derived from the run itself** — degrees of
+  body slip per m/s² measured in that same kart's own corners — rather than from
+  a number somebody chose.
+- Its `--broken` world is a real bicycle model with linear tyres, so slip is a
+  physical output rather than a value the self-test hands itself. Twelve
+  sabotages fire. One of them, `soft-tyres`, is a **decoy that must not fire**:
+  6° of legitimate cornering slip, and the gate correctly stays quiet.
+
+The sabotage that mattered most was `hovering`. With the tyre model untouched
+and the kart lifted above 15 m/s, `wheel-contact` reported 0.00/4 grounded while
+`slip-straight`, `slip-corner` and `slip-agreement` **all stayed green.** A slip
+gate does not subsume a contact gate, and without that sabotage nobody would
+have known.
+
+**Recorded against ourselves, twice:**
+
+- `wheel-contact` was added *after* the cause was known, so it is not an
+  independent discovery and must not be cited as one. It earns its place by
+  measuring a separately derived invariant and by moving no slip threshold.
+- The harness reaches 25.1 m/s. The hover is worst at 31. **`wheel-contact`
+  being green does not yet cover the bug it was written for**, and the harness
+  prints that caveat itself rather than passing silently.
+
+Two detector defects were caught while building it, both the same shape as the
+`smoke.mjs` self-test that never touched the drawing buffer: the `onTrack`
+contradiction check sat inside a filter that the sabotage emptied — a detector
+switched off by the very thing it detects — and `command-path` was originally
+*passive*, so a parked kart, which never asks for much steer, passed it over
+nothing at all.
+
+---
+
+## 3. The field drove off before the lights went out, and stopping the input did not stop it
+
+**Round 7 → 8. Found by:** pressing START and watching the karts leave during the
+countdown.
+
+> When you press Start, the countdown isn't finished yet and they can already
+> move.
+
+Measured, before the fix: the seven AI karts covered **17.788 – 17.976 m**
+between START and GO, peaking at **11.78 – 11.91 m/s**. 829 violations of 960
+assertions.
+
+**The obvious half.** `main.ts`'s `driverFrame` never consulted `race.phase`, and
+`fixedUpdate` passed its result straight into `IKart.step`. Nothing gated input
+on the race at all: across the whole of `src/`, `race.phase` was read by exactly
+two places, `ui/hud.ts` and telemetry. It was missing rather than broken —
+`kart.ts` has no phase awareness and `ai.ts` never reads `IRace`, so there was no
+failing hold to repair.
+
+**The half that would have been shipped as a fix.** Gating the input is not
+sufficient, and a build with only that change still creeps. The reference AI
+drives from page load, so the field carries **momentum** across `startRace()`:
+with the gate alone the karts still coasted 2.605 m and peaked at 1.07 m/s before
+GO. Worse, *how much* depends on how long the machine took to boot the page —
+wall-clock leaking into the simulation through the one door the fixed-timestep
+rule does not cover. `race.ts`'s `start()` set phase and clock and nothing else;
+it now establishes the grid. `hud.ts` restarts via `reset()` + `start()` and so
+began on a grid already, which is exactly why only the *first* race of a session
+showed it and why it would have survived a casual retest.
+
+Both halves are needed. Removing either brings the creep back.
+
+**Why the gates missed it.** `grid-start.mjs` — the one harness that presses
+START rather than calling `seek()`, written last round precisely to catch
+starting-state bugs — was *watching the field launch and grading it*, and had
+anchored two of its own reference measurements to `startRace()`. Its comment
+stated plainly that `launchRef` **included** the countdown driving. The illegal
+behaviour had been read, described in a comment, and adopted as the baseline.
+
+The moment the gate landed, `launch-field` and `stuck-motion` went red **on a
+correct build**. Re-anchoring them to GO turned them green with their reference
+*values* unchanged — GO+1 s measures 3.88 m/s against a reference of 4 — which is
+the strongest available evidence that the anchor was the error and the numbers
+were right all along. A harness can encode a bug as its definition of normal, and
+nothing about its green output says so.
+
+**Acted on.** `countdown-hold` in `grid-start.mjs`: every kart's position and
+speed must not move between START and GO. 960 assertions, 0 violations after the
+fix. It also prints **peak throttle commanded during the countdown = 1.000**,
+which is what stops it passing vacuously — the karts are *held*, not merely
+undriven, and if no driver ever commands throttle the check reports itself
+unmeasured instead of green. The `countdown-drive` sabotage rewrites velocity
+every step rather than nudging once, because a detector proven only against a
+transient is not proven.
+
+**Recorded against ourselves.** `countdown-hold` proves the gate for the seven AI
+karts and **cannot prove it for the player**. A headless run has no keyboard, so
+the player kart reads 0 m/s whether or not the gate exists, and `setInput` cannot
+substitute: it switches the player to `'scripted'`, which bypasses the gate by
+design, so injecting throttle there would measure the bypass and **pass
+identically on a build with no gate at all**. It is filed PENDING. Closing it
+needs `HarnessAPI.injectInput`, which this build honestly reports as unavailable.
+
+**A trap created and removed inside the same round.** The first version of the
+gate held input during `'idle'` as well. Every harness in this repo runs with the
+race never started, so that version silently zeroed another agent's scripted
+probe mid-investigation and it measured a stationary kart with no error of any
+kind — the same defect shape as the `releaseInput` bug fixed days earlier, one
+commit later, in a different file. `'idle'` is now ungated and `'scripted'`
+bypasses the gate, so a caller that has seized the controls is never silently
+overridden. The residue that gating `'idle'` was covering up is properly fixed by
+`race.start()` establishing the grid.
+
+`lastInput` deliberately records the driver's **ungated** command. Recording the
+gated zero would make the gate invisible to every harness that reads it, and
+would make `steer-test`'s `ai-command` read `0.0000` against a working AI outside
+`'racing'` — which is, once again, the bug this project has now paid for twice.
+
+---
+
 ## Standing gaps — what nobody has done yet
 
 These are not findings. They are the honest shape of what this file does *not*
