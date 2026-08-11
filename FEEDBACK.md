@@ -392,6 +392,126 @@ throttle in a corner.
 
 ---
 
+## 5. Three sentences, three unrelated bugs, and one of them no harness could ever have found
+
+**Round 9 → 10. Found by:** playing the deployed build for several minutes.
+
+> Driving along for a fair distance, then it turns right by itself — I think —
+> and then it's like I can't control anything. And after a while it resets itself
+> and starts again.
+
+Three clauses. Three separate defects, in three different subsystems, none of
+them the one the sentence structure implies.
+
+### "It turns right by itself" — partly the road, and partly an idle gamepad
+
+**The kart does not self-steer.** Zero commanded steer on a validated flat plane,
+60 s × 12 conditions: heading drift, lateral drift and ∫yaw all **bit-exactly
+0.0000**. On the real circuit over 25 s the kart turned −0.120° while **the road
+turned +43.7°**. The lap is 1040 m of right-handers against 436 m of left, and
+from the grid it is 129 m of straight into a 257 m right-hander.
+
+But the other half was real, and it is the finding of the round. `input.ts`
+picks one device — "the one most recently used" — and for a gamepad, which fires
+no events, "used" meant `1e-3` of axis movement between polls. **A worn stick
+jitters by more than that untouched.** Reproduced on the shipped build with a pad
+parked at 0.35 with 0.004 of jitter:
+
+```
+steer 0.207 with no key held                    <- "it turns right by itself"
+ArrowLeft + ArrowUp -> steer 0.207, throttle 0  <- "I can't control anything"
+```
+
+**The keyboard could never take the frame back**, and that is the cruel part: a
+key held down emits no further events. `keydown` fired once, `keyup` has not
+happened, and OS auto-repeat is deliberately discarded. The pad re-claimed on its
+own noise every tick, forever.
+
+"After a fair distance" is explained too — Chrome hides a connected gamepad until
+the user interacts with it, so an idle controller is invisible at load and
+appears mid-race the moment it is bumped.
+
+### "I can't control anything" — under throttle the wheel was disconnected
+
+Step steer 0.85 held 3 s at 20 m/s with the throttle down, then release the wheel
+to zero: **the kart turned another 183.3° over 5.57 s**, yaw rate pinned at
+0.615 rad/s. Off the throttle the same input peaks at 5.2° and straightens in
+0.63 s. And **full opposite lock with the throttle held moved the sustained yaw
+rate by under 0.02 rad/s versus doing nothing at all.**
+
+The friction circle scaled both force components radially. Radial scaling
+preserves whatever direction two independent `tanh` curves landed on — and with
+both saturated that direction is exactly 45°. A longitudinally-saturated driven
+rear therefore kept `peak/√2` of lateral force while the undriven front kept all
+of it: `2·(0.68·peak − 0.72·0.707·peak) = +192 N·m`, against the −45 N·m the axle
+split exists to provide. **Same term, opposite sign, 4.3× the magnitude.**
+
+### "It resets itself" — the stall detector fired on a kart driving perfectly
+
+`race.ts` reset the stall timer only when `progress` beat `bestProgress`. But
+`progress` is a **position**, and `respawn()` moves the kart backwards on purpose
+without re-baselining it. Every rescue handed the kart a distance debt to re-drive
+inside 12 s — and **six of the seven sections take longer than 12 s from a
+standstill**, worst 18.1 s. The debt is normally unpayable.
+
+One deliberate 1.2 s mistake in a 200 s run that otherwise holds the road 100% of
+the time: **8 respawns instead of 1**, at 34.0 s and then 46.0, 58.1, 70.1, 82.1,
+94.1, 106.1, 118.1 — **12.005 s apart, every time, with the kart on the centreline
+at 18.3 m/s.** Zero laps completed instead of one.
+
+Both respawn triggers were checked and **neither was wrong**, which is why neither
+constant moved. `onTrack` is generous rather than tight — by the time it flips
+false all four wheels are on gravel. The 2.25 s off-track grace recovered 95 of 95
+controlled excursions, worst 2.18 s.
+
+### Why the gates missed them
+
+- **No harness in this project can press a key.** `HarnessAPI.injectInput` does
+  not exist; `grid-start.mjs` files the player half of its countdown check as
+  PENDING for exactly that reason. The gamepad defect was invisible **by
+  construction** — and the keyboard path had never been exercised end to end
+  until this round, when it was finally driven in a real Chrome with real trusted
+  events and found clean across nine sequences.
+- **`steer-test` probes 0.75 s.** The departure needs 2.5–3 s of held steer to
+  build. A slow steer *ramp* never departs at any speed — only a step does — so
+  every steady-state sweep in the repo is blind to it.
+- **Nothing in the repo ever released a held steer and asked whether the car
+  straightens.** That single measurement is what separates "it slides in corners"
+  from "the steering has stopped working", and it did not exist.
+- **`slip-check`'s cruise controller lifts off for corners.** The departure is
+  throttle-triggered, so the one long-run harness in the project **drives around
+  its own trigger**, and its 15.5 m/s mean sits below the danger band.
+- **The stall bug was a second instance of a trap the file already documents.**
+  `race.ts` carries a comment explaining that `progress` falls at the seam and
+  after a respawn. The comment was right, the detector next to it was not.
+
+### Recorded against ourselves
+
+- **A fix shipped earlier the same day rested on a false premise.** The axle-swap
+  comment claimed "measured load transfer is exactly zero — 1275 N front, 1275 N
+  rear, cornering or not." That was measured on a synthetic flat plane, which
+  **cannot show pitch-curvature transfer by construction**. On the real road the
+  rear's share is 49% on the flat straight, **38% on the dune sweep**, 59% on The
+  Wall. The value survived re-examination; its justification did not, and the
+  alternative the finding implies was measured and rejected on cost.
+- The textbook elliptical combined-slip model was implemented and is measurably
+  **worse** here (171.6° vs 184.0°). Being the honest tyre model does not make it
+  the right one for a chassis with no pitch freedom.
+- `slip-check` passing all 12 for the first time is **corroboration, not proof**,
+  for the reason above — it lifts off for corners.
+- **`ess-2` may be untakeable.** R = 47.6 m, unbanked, opening 1.6 m after a 72.4 m
+  left-hander with no straight to brake in. Minimum stable radius is 52.7 m at
+  20 m/s, so the corner needs ≲18.8 m/s. A closed-loop run went off there **seven
+  times in 100 s and never completed a lap**, every excursion identical: t=0.2936,
+  18.2 m/s, commanded steer **+1.000**. That is circuit geometry and it is still
+  open.
+- An agent killed the user's Discord while cleaning up a stray harness process,
+  using a `CommandLine -match 'autoplay'` filter that also matched Discord's
+  renderer flags. Nothing was lost, and it is written here because the next
+  cleanup will be tempted by the same shortcut.
+
+---
+
 ## Standing gaps — what nobody has done yet
 
 These are not findings. They are the honest shape of what this file does *not*
