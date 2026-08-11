@@ -376,6 +376,24 @@ function buildRoadSurface(track: ITrack, opts: RoadBuildOptions): Mesh {
        * whose ideal line crosses the centre nine times a lap, a centred rubber
        * band is worse than none: it draws a second, wrong line for the player
        * to follow.
+       *
+       * THIS PAINT IS AN INVITATION, AND IT IS ONLY SAFE TO ACCEPT BECAUSE OF
+       * `RACING_MARGIN` in track.ts. Queried live, so it follows the line
+       * wherever the solver puts it — but when the margin was 1.35 m the solver
+       * put the line 0.35 m inside the sand band for 925 m of the lap, and this
+       * loop then painted the most inviting surface in the game directly on top
+       * of the least grippy one. A dark band a human aims at, over 0.62 grip,
+       * with nothing in the frame to say so. The margin is now derived from
+       * `SAND_EDGE_WIDTH` so the two cannot separate again; if anyone ever
+       * un-derives it, this paint becomes the trap rather than the reward.
+       *
+       * Verified rather than assumed, because `racing` is read live here and it
+       * would be easy to believe it follows: `racing ± 0.6` — the full-strength
+       * core of the fade below — reads `SandDrift` for 2.23% of the lap now,
+       * against 23.99% before, and the 2.23% is exactly the two full-width wash
+       * bands, which are sand on purpose and are meant to be driven over. The
+       * worst clearance from the outer edge of the rubber core to the road edge
+       * went from 0.75 m to 1.94 m. Visible line and grippy line coincide.
        */
       const offLine = Math.abs(lat - racing)
       c.lerp(cRubber, 0.8 * (1 - smoothstep(0.6, 1.9, offLine)))

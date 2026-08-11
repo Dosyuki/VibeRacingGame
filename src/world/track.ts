@@ -388,8 +388,87 @@ const KERB_WIDTH = 0.95
  */
 const SAND_EDGE_WIDTH = 1.7
 
-/** Clearance the ideal line keeps from the edge: kart half-width plus a little. */
-const RACING_MARGIN = 1.35
+/**
+ * Half the kart's track width: the lateral offset of a wheel's contact patch
+ * from the chassis centre, metres.
+ *
+ * A DELIBERATE COPY of `HALF_TRACK` in `src/kart/kart.ts`, not an import.
+ * Sibling imports are banned and none of the three channels that cross a
+ * directory boundary carries this: it is not per-tick state, not a discrete
+ * moment, and putting it in `src/types.ts` is a contract widening — its own
+ * announced commit that re-runs every harness, not a side effect of this fix.
+ *
+ * It is a MEASURED copy rather than an assumed one. Predicting
+ * `KartState.wheels[].surface` from `surfaceAt(t, lateral ± 0.64)` reproduced
+ * the game's own answer at 16 of 16 seek stations, and the same predictor with
+ * 0.0 substituted missed 3 of 8 — so the agreement is evidence rather than a
+ * tautology.
+ *
+ * THE FAILURE IF THIS EVER GOES STALE is silent and one-sided: build a kart
+ * wider than this and its outer wheel drops back into the sand band on the very
+ * line the AI follows, which no frame shows and no lap time obviously explains.
+ * That is the bug this file just paid for once; see `RACING_MARGIN`.
+ */
+const KART_HALF_TRACK = 0.64
+
+/**
+ * Slack between the outer wheel on the ideal line and the sand it must clear.
+ *
+ * Not zero, for two independent reasons. `racing` is a `Float32Array` and
+ * `halfWidth` is interpolated between samples, so a margin of exactly
+ * `SAND_EDGE_WIDTH + KART_HALF_TRACK` leaves the boundary case to round-off and
+ * the surface under a wheel becomes a coin flip. And `surfaceAt` models a wheel
+ * as a POINT while a real contact patch is about 0.2 m across, so a point query
+ * reports clear while a third of the tyre is in the drift.
+ */
+const LINE_SAND_CLEARANCE = 0.2
+
+/**
+ * Clearance the ideal line keeps from the road edge, metres. DERIVED — and the
+ * derivation is the entire reason this is no longer a hand-picked number.
+ *
+ * IT WAS 1.35, described as "kart half-width plus a little", and it had never
+ * been compared with `SAND_EDGE_WIDTH` six lines above it. 1.35 < 1.7, so
+ * wherever the clamp in `solveRacingLine` bit — 925 m of a 1624 m lap, 57% of
+ * it — the ideal line sat 0.35 m INSIDE the sand band, outer wheel 0.99 m into
+ * it and inner wheel 0.29 m outside it. Measured on that line over a lap:
+ *
+ *   - the chassis centre read `SandDrift` for 63.9% of the lap, while the
+ *     CENTRELINE read `DustyAsphalt` for 84.2% of it — the ideal line was the
+ *     dirtiest path around the circuit
+ *   - right wheels on `SandDrift` 25.1% of the lap against the left wheels' 1.0%
+ *   - 85.2% of every straight ran with a 0.88 / 0.62 grip step across the axles,
+ *     always the same way round, mean signed asymmetry +0.222
+ *
+ * A kart with a permanent one-sided grip deficit pulls to that side for ever,
+ * and it does so on the line the game paints in rubber and the reference AI
+ * follows.
+ *
+ * THAT IS ALSO WHERE `steer-test` PUT ITS SYMMETRY PROBE. It seeks with
+ * `lateral: 0`, and `seek` resolves lateral as `racingLine(t) + lateral`, so
+ * "zero" is the ideal line and not the centreline. Its unexplained left/right
+ * asymmetry was being measured across an axle with a 30% grip deficit on one
+ * side. Run at the same t with the SAME build: on the line, a zero-steer
+ * full-throttle hold moved 0.055 m sideways in 0.75 s and the two steer
+ * directions differed by 8.1%; moved to the centreline, where both wheels are
+ * on the same surface, the hold moved 2.8e-8 m and the two directions matched
+ * to eight significant figures — 0.00%. The asymmetry was never in the chassis.
+ * With this margin it is 4.2%, and the remainder is the probe steering INTO the
+ * edge sand during its own 0.75 s window, which is the road being a road.
+ *
+ * NEITHER CONSTANT WAS WRONG ALONE, which is why this went unseen for six
+ * rounds. `solveRacingLine` does not know the sand exists; `surfaceAt` does not
+ * know where the line is. Two correct numbers in one file, never compared. The
+ * relationship is the fix and the value is a consequence of it — if the sand
+ * band widens, this follows; it can no longer be left behind.
+ *
+ * §1 had already made the design call this encodes. The half-width table's
+ * maximum is annotated "on the dune sweep where the trap is outside the line",
+ * and §5a puts the rubber lay-down "along the true optimal line". A sand trap
+ * under the ideal line is not a trap, it is a handicap, and rubbering it is an
+ * invitation into one.
+ */
+const RACING_MARGIN = SAND_EDGE_WIDTH + KART_HALF_TRACK + LINE_SAND_CLEARANCE
 
 // ---------------------------------------------------------------------------
 // Build-time construction
@@ -768,7 +847,15 @@ function buildCentreline(): Centreline {
  * clipped apex and a wide exit all fall out of the minimisation instead of
  * being written down. Where the road is wide enough for the solution to be
  * unconstrained it comes out straight; where it is not, the clamp bites and the
- * line rides the inside kerb.
+ * line runs parallel to the edge at `RACING_MARGIN`.
+ *
+ * That used to read "and the line rides the inside kerb", and it was true: at a
+ * margin of 1.35 m the outer wheel sat 0.71 m from the edge, inside the 0.95 m
+ * kerb band. It is no longer true and the change is deliberate — the same
+ * placement put the outer wheel 0.99 m into the sand band on every stretch with
+ * NO kerb, which is where the damage was. See `RACING_MARGIN` for the
+ * measurement. Kerb-riding is a thing a driver may still choose; it is no
+ * longer a thing the reference line does on the driver's behalf.
  *
  * Relaxed on a coarse lattice first. Jacobi on a Laplacian needs O(m²)
  * iterations to settle its longest wavelength, so 203 nodes converge roughly
@@ -1236,7 +1323,8 @@ export const createTrack: TrackFactory = (ctx: Ctx): ITrack & Subsystem => {
       // §11 `banked-wall` grades the 6.4:1 kerb value contrast, and a kerb a
       // boost pad or a sand band can overwrite is a kerb that disappears from
       // exactly the frames that measure it.
-      if (Math.abs(curv) > KERB_MIN_CURVATURE && off > -KERB_WIDTH) return Surface.Kerb
+      const kerbed = Math.abs(curv) > KERB_MIN_CURVATURE
+      if (kerbed && off > -KERB_WIDTH) return Surface.Kerb
 
       for (let i = 0; i < pads.length; i += 4) {
         if (w >= pads[i]! && w <= pads[i + 1]! && lateral >= pads[i + 2]! && lateral <= pads[i + 3]!) {
@@ -1249,7 +1337,37 @@ export const createTrack: TrackFactory = (ctx: Ctx): ITrack & Subsystem => {
       // Slot and the arch are the two sections with no wind reaching the floor.
       if (inRanges(asphalt, w)) return Surface.Asphalt
       if (inRanges(sandBands, w)) return Surface.SandDrift
-      if (off > -SAND_EDGE_WIDTH) return Surface.SandDrift
+      /*
+       * THE EDGE DRIFT STOPS AT A KERB, and the `!kerbed` is the whole point.
+       *
+       * Without it the lateral profile at every kerbed corner is
+       * NON-MONOTONIC: Kerb 0.95 -> SandDrift 0.62 -> DustyAsphalt 0.88, with
+       * the sand exactly `SAND_EDGE_WIDTH - KERB_WIDTH` = 0.75 m wide, pinned
+       * between two grippier surfaces at the apex. 61.1% of the lap had one. It
+       * rewards running WIDER onto the kerb over a tidy apex, which is backwards
+       * — and a 0.3 m wander at an apex drops one wheel from 0.95 to 0.62 and
+       * back for no reason a driver can construct.
+       *
+       * It was also INVISIBLE. `road.ts` derives its vertex colours from this
+       * function precisely so that what the tyre reads and what the player sees
+       * cannot drift apart, but its lateral stations are fractions of the
+       * half-width, and on this circuit's 8.0-16.0 m profile not one of them
+       * ever lands between `KERB_WIDTH` and `SAND_EDGE_WIDTH`. Measured over
+       * 20000 stations: 11779 samples carried a kerb-edge sliver and a road
+       * vertex fell inside NONE of them. (446 more looked like slivers to the
+       * probe and all 446 had a vertex — those are the full-width wash bands
+       * under a kerb, which are sand on purpose and survive this change.) So
+       * the sliver had no vertex anywhere to tint, and §7's "the player learns
+       * what is under them without looking down" was quietly false for 0.75 m
+       * of every apex.
+       *
+       * Two independent band rules stacked without either knowing about the
+       * other — the same shape of bug as `RACING_MARGIN` above, in the same
+       * function. A kerb is a built edge: it is the thing that stops the drift,
+       * so there is no sand behind one. The wash's full-width `sandBands` are
+       * checked above this line and are unaffected; those are meant to be seen.
+       */
+      if (!kerbed && off > -SAND_EDGE_WIDTH) return Surface.SandDrift
       return Surface.DustyAsphalt
     },
 
