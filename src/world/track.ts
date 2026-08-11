@@ -2,8 +2,9 @@
  * VERMILION NINE — the circuit.
  *
  * ART_DIRECTION §1 in code: 1620 m of closed centreline through eight named
- * sections, half-width 8.0–16.0 m, elevation 0–52 m, bank 0° everywhere except
- * The Wall.
+ * sections, half-width 8.0–16.0 m, elevation 0–52 m, and two banked corners —
+ * The Wall at 20° and ess-2 at 10°. See `BANK` for why the second one exists
+ * and what it measured; §1 was rewritten in the same commit that added it.
  *
  * ────────────────────────────────────────────────────────────────────────────
  * WHY THIS IS NOT A CATMULL-ROM THROUGH CONTROL POINTS
@@ -151,6 +152,10 @@ const PLAN: readonly PlanSegment[] = [
   { name: 'dune-sweep', len: 185, turn: -87.347523 },
   // §1 Strata esses, 0.219–0.336. R = 72 / 48 / 98, alternating.
   { name: 'ess-1', len: 62, turn: 49.042011 },
+  // ess-2 is the slowest corner on the lap and the only one besides The Wall
+  // that is banked — 10°, see `BANK`. Its 66 m is what sizes that bank: two
+  // 20 m ramps are the minimum a 10° twist can use, and they leave 22 m of
+  // plateau. Shortening this segment would take the bank with it.
   { name: 'ess-2', len: 66, turn: -79.498609 },
   { name: 'ess-3', len: 62, turn: 36.196155 },
   // §1 The Slot, 0.336–0.426. R = 348 m: a crack in the rock does not corner.
@@ -272,6 +277,14 @@ const ELEVATION_TRANSITION = 40
  *   arch        11.5   the second narrows, and it reads as one
  *   The Slot     8.0   narrowest, exactly half the dune sweep, held for 92 m
  *
+ * ess-2 is now banked too (10°, see `BANK`) and was NOT widened for it, which
+ * is a decision and not an oversight. "A bank needs width or it is a ramp" is
+ * about cross-slope over the road, and the two are not comparable: The Wall
+ * drops 2·15.0·sin20° = 10.3 m across its width, ess-2 drops 2·11.6·sin10° =
+ * 4.0 m across its own. Widening ess-2 would also move the racing line, which
+ * is the thing the bank was sized against — the measurement would no longer be
+ * about the corner it was taken on.
+ *
  * Smoothstep-interpolated rather than linear. A width crease reads as a kink in
  * the barrier line from 200 m away, and the road mesh inherits it verbatim.
  *
@@ -318,23 +331,111 @@ const HALF_WIDTH: readonly (readonly [Metres, Metres])[] = [
   [1620, 14.0],
 ]
 
+interface BankWindow {
+  readonly name: string
+  /** Plan distances. Bank is 0 at `rampInStart`, `angle` from `fullStart` to
+   *  `fullEnd`, and back to 0 at `rampOutEnd`, smoothstep either side. */
+  readonly rampInStart: Metres
+  readonly fullStart: Metres
+  readonly fullEnd: Metres
+  readonly rampOutEnd: Metres
+  /**
+   * Radians. POSITIVE banks the road down toward the driver's right, so a
+   * positive angle helps a RIGHT-hand corner and hurts a left one. Both windows
+   * below are right-handers. There is no left-hand bank on this circuit and a
+   * negative value here would be a design decision, not a sign fix.
+   */
+  readonly angle: number
+}
+
 /**
- * The Wall's bank window, in plan distance. §1: ramp-in 40 m, sustained 145 m,
- * ramp-out 35 m. That is 220 m of banking inside a 232.5 m arc, so it is inset
- * 6 m at the entry and 6.5 m at the exit rather than overhanging the straights
- * either side of it.
+ * The banked corners, in plan order. A TABLE rather than one special case,
+ * because there are now two of them.
+ *
+ * Windows may not overlap and none may cross the start line — `bankAtPlan`
+ * returns the first match and does not sum, so an overlap would silently
+ * resolve to whichever is written first. They are 400 m apart.
+ *
+ * ────────────────────────────────────────────────────────────────────────────
+ * ART_DIRECTION §1 SAID "BANK IS 0° EVERYWHERE EXCEPT THE WALL". IT NO LONGER
+ * DOES, AND THE DOCUMENT WAS CHANGED IN THE SAME COMMIT AS THIS LINE.
+ *
+ * ess-2 is the slowest corner on the lap by a wide margin and it was the
+ * slowest by more than the geometry admits to. Measured on a validated
+ * flat-plane bench the chassis holds 7.88 m/s² of sustained lateral, brakes at
+ * 9.2 and tops out at 27.8 m/s. Against ess-2's CENTRELINE radius of 47.6 m
+ * that is 19.1 m/s, which is a slow corner but an ordinary one.
+ *
+ * The centreline is not what anybody drives. `solveRacingLine` minimises Σκ²,
+ * and a sum-of-squares objective will buy two nearly-straight corners by making
+ * a third one tighter — 3k² beats 1·(2k)². At the esses it does exactly that:
+ * measured, line radius against centreline radius, ess-1 72.4 → 268, ess-3
+ * 98.1 → 264, and ess-2 47.6 → 40.6. The line is 15% TIGHTER than the
+ * centreline at the one corner that sets the lap, and §5a paints the rubber
+ * lay-down along that line, so 40.6 m is the radius a player is invited to
+ * drive. It allows 17.5 m/s. That was the real number and nothing in the
+ * geometry table said it.
+ *
+ * 10° at 40.6 m allows 21.3 m/s. Why 10° and not more:
+ *
+ *   - The pair is limited by ess-1, not by ess-2. ess-1's own centreline limit
+ *     is 23.8 m/s; banking ess-2 past that moves the bottleneck onto a corner
+ *     this change does not touch and buys nothing. 10° puts ess-2's centreline
+ *     limit at 23.0 and its line limit at 21.3, both under that ceiling, so
+ *     there is still headroom if the line solver ever shifts.
+ *   - A corner that demands braking is the point. At 21.3 m/s ess-2 is still
+ *     the slowest corner on the circuit and still needs roughly 20 m of
+ *     threshold braking off the 27.8 m/s the line carries out of ess-1. Making
+ *     it flat out would delete the corner, not fix it.
+ *   - It is exactly HALF The Wall's 20°, which keeps The Wall the extreme case
+ *     by a factor of two rather than by a few degrees.
+ *
+ * WHAT THE 66 m COSTS, because it is a real constraint and not a rounding.
+ * `tools/track-check.mjs` check 4 gates |dbank/ds| at 0.02 rad/m, and a
+ * smoothstep ramp peaks at 1.5× its mean rate, so 10° needs 1.5·0.1745/0.02 =
+ * 13.1 m of ramp at the gate and 17.6 m to stay under The Wall's own 0.0149.
+ * Two 20 m ramps leave 22 m of plateau inside a 66 m segment. That plateau
+ * cannot cover the centreline's 48 m constant-radius section, so a driver
+ * holding the middle of the road gains only 19.1 → 20.0 m/s. It is not a
+ * tuning failure: covering the centreline plateau would need ≤ 9 m ramps,
+ * which caps the bank at 5.1° and buys 19.3 m/s. The corner is 66 m long and a
+ * useful bank needs 40 m of ramp; there is no arrangement that serves both
+ * lines, so it serves the one the game paints.
+ *
+ * The plateau is therefore CENTRED ON THE LINE'S APEX, not on the segment.
+ * Measured at 1 m stations, the line's radius through ess-2 runs 268 → 180 at
+ * plan 417–426, holds above 150 to 438, then collapses 90 → 59 → 46 → 41 by
+ * plan 450, holds 41 through 454 and is back over 150 by 466. The tightest
+ * point is plan 451; the plateau is 439–461. That is a late apex, and the bank
+ * is under the car where the load is rather than where the section boundary is.
+ * ────────────────────────────────────────────────────────────────────────────
  */
-const BANK_RAMP_IN_START = 901
-const BANK_FULL_START = 941
-const BANK_FULL_END = 1086
-const BANK_RAMP_OUT_END = 1121
-/**
- * §1: 20°. Positive banks the road down toward the driver's right and The Wall
- * is a right-hander, so the road falls toward the inside — which is what makes
- * §10c criterion 5 ("mean speed through The Wall exceeds an equivalent flat 74 m
- * corner by ≥ 6%") reachable rather than merely stated.
- */
-const BANK_MAX = 20 * DEG
+const BANK: readonly BankWindow[] = [
+  /*
+   * ess-2. 20 m ramp / 22 m plateau / 20 m ramp inside the segment's
+   * 417–483 m, inset 2 m at each end so the ramp does not overhang ess-1 or
+   * ess-3. The inset at the exit end also matters for a second reason: the
+   * curvature transition into ess-3 — a LEFT-hander — begins at plan 474, so
+   * bank that ran to the segment boundary would still be leaning right while
+   * the road had started to turn left. It is under 1.5° by 474 and zero by 481.
+   */
+  { name: 'ess-2', rampInStart: 419, fullStart: 439, fullEnd: 461, rampOutEnd: 481, angle: 10 * DEG },
+  /*
+   * The Wall. §1: ramp-in 40 m, sustained 145 m, ramp-out 35 m, 20°. That is
+   * 220 m of banking inside a 232.5 m arc, so it is inset 6 m at the entry and
+   * 6.5 m at the exit rather than overhanging the straights either side of it.
+   * The Wall is a right-hander and the angle is positive, so the road falls
+   * toward the inside — which is what makes §10c criterion 5 ("mean speed
+   * through The Wall exceeds an equivalent flat 74 m corner by ≥ 6%") reachable
+   * rather than merely stated.
+   *
+   * The 35 m ramp-out is the fastest bank change on the circuit — 0.0149 rad/m
+   * against the 0.02 gate — and it stays the worst on the lap after ess-2:
+   * ess-2's 20 m ramps run 0.0131. If a future change makes ess-2's ramps the
+   * binding pair, check 4's number moves and the report should say why.
+   */
+  { name: 'the-wall', rampInStart: 901, fullStart: 941, fullEnd: 1086, rampOutEnd: 1121, angle: 20 * DEG },
+]
 
 // ---------------------------------------------------------------------------
 // Surface regions, authored in plan distance and converted to `t` at build time
@@ -578,12 +679,16 @@ function evalSmoothTable(ks: readonly (readonly [number, number])[], x: number):
 }
 
 function bankAtPlan(s: Metres): number {
-  if (s <= BANK_RAMP_IN_START || s >= BANK_RAMP_OUT_END) return 0
-  if (s < BANK_FULL_START) {
-    return BANK_MAX * smoothstep01((s - BANK_RAMP_IN_START) / (BANK_FULL_START - BANK_RAMP_IN_START))
+  for (let i = 0; i < BANK.length; i++) {
+    const w = BANK[i]!
+    if (s <= w.rampInStart || s >= w.rampOutEnd) continue
+    if (s < w.fullStart) {
+      return w.angle * smoothstep01((s - w.rampInStart) / (w.fullStart - w.rampInStart))
+    }
+    if (s <= w.fullEnd) return w.angle
+    return w.angle * smoothstep01((w.rampOutEnd - s) / (w.rampOutEnd - w.fullEnd))
   }
-  if (s <= BANK_FULL_END) return BANK_MAX
-  return BANK_MAX * smoothstep01((BANK_RAMP_OUT_END - s) / (BANK_RAMP_OUT_END - BANK_FULL_END))
+  return 0
 }
 
 function buildCentreline(): Centreline {

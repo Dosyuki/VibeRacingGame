@@ -27,7 +27,7 @@ casting them. The lap runs eight sections:
 |---|---|---|
 | Hardpan grid | 0.00–0.11 | Start straight on dark compacted tarmac, sun raking in from behind-left, kart shadows thrown 4.7× ahead across the road |
 | Dune sweep | 0.11–0.23 | Fast open right-hander, sand shoulders both sides, ripple sheen at grazing incidence, soft trap outside the line |
-| Strata esses | 0.23–0.35 | Alternating turns cut into a 34 m cliff face; six rock bands run horizontally through frame, gypsum seam at eye height |
+| Strata esses | 0.23–0.35 | Alternating turns cut into a 34 m cliff face; six rock bands run horizontally through frame, gypsum seam at eye height. **The middle turn is banked 10°** — the slowest corner on the lap, see below |
 | The Slot | 0.35–0.44 | **Canyon narrows.** Half-width collapses to 4.6 m over 92 m, walls 26 m, sky reduced to a 9° strip, lit almost entirely by bounce |
 | Mesa climb | 0.44–0.57 | Climb to +52 m, longest sightline on the lap, five silhouette layers receding into haze |
 | The Wall | 0.57–0.69 | **20° banked 180°**, radius 74 m, ramp-in 40 m / sustained 145 m / ramp-out 35 m; horizon rolls 20° through the corner |
@@ -35,8 +35,80 @@ casting them. The lap runs eight sections:
 | Arch tunnel | 0.83–1.00 | **Natural rock arch, 118 m.** Three collapse skylights throw hard shafts across the road; exit fires straight into the low sun |
 
 **Geometry:** 1620 m centreline, half-width 4.6–13.0 m, elevation 0–52 m. No
-straight longer than 145 m. Bank is 0° everywhere except The Wall. Gradient never
+straight longer than 145 m. **Exactly two corners are banked and no others: The
+Wall at 20°, and the middle turn of the strata esses at 10°.** Gradient never
 exceeds 8% up or 11% down.
+
+**Why the second banked corner exists, and what it costs.**
+
+This line used to read "bank is 0° everywhere except The Wall", and The Wall's
+bank being the only one on the circuit was part of what The Wall was. That is
+now false and the paragraph below is what replaces it, because a rule in this
+document that contradicts the circuit gets "fixed" eventually and there is no
+telling in which direction.
+
+The middle esse — 66 m, turning 79.5° right, half-width 11.3 m — is the slowest
+corner on the lap, and it was slower than its own geometry admitted to. The
+numbers, all measured rather than chosen:
+
+- The chassis holds **7.88 m/s² of sustained lateral**, brakes at 9.2 m/s² and
+  tops out at 27.8 m/s, on a validated flat-plane bench.
+- The corner's **centreline** radius is 47.6 m. Flat, that is 19.1 m/s: a slow
+  corner, but an ordinary one, and it is the number the section table implies.
+- The radius a player actually drives is **40.6 m**, 15% tighter. The ideal line
+  is derived by minimising Σκ², and a sum-of-squares objective buys two nearly
+  straight corners by making a third one tighter — 3k² beats 1·(2k)². Across the
+  esses it does exactly that: line radius against centreline radius runs 72 → 268,
+  **48 → 41**, 98 → 264. §5a paints the rubber lay-down along that line, so the
+  tightest radius on the circuit is also the one the road invites you onto.
+- Flat, 40.6 m is **17.5 m/s**. That is 1.6 m/s slower than anything else on the
+  lap and 1.6 m/s below what the geometry table says the corner is.
+
+**What 40.6 m does and does not bound, because the difference was measured and
+overstating it would be the same error as the centreline.** It is the radius of
+the line the circuit *paints*, confirmed by two independent estimators. It is not
+a floor on what a driver can do. Driven in the game, a kart that runs 1.6 m off
+that line — still on tarmac, inside wheels on the kerb — smooths the line's short
+curvature spike into an **82 m** arc and carries **21.8 m/s** through the corner
+with no bank at all. So 17.5 m/s bounds the painted line and not the corner, and
+the strongest reading of the 40.6 m figure is that the *line* is wrong at the
+esses, which is a separate change nobody has made. The bank is not a substitute
+for it: it raises the limit of whatever line is driven, by 21%, and it is worth
+having either way.
+
+**10° raises it to 21.6 m/s**, and the corner keeps its job: it is still the
+slowest on the circuit and still needs 24 m of threshold braking off the 27.8 m/s
+the line carries out of the first esse — it was 33 m before, so the brake point
+moved 10 m later rather than disappearing. The ceiling on the angle is the
+first esse, whose own limit is 23.8 m/s — banking the middle one past that moves
+the bottleneck onto a corner nobody has asked to change, so it buys nothing. 10°
+sits under that with headroom, and it is **exactly half of The Wall's 20°**.
+
+**What is honestly lost.** The Wall's bank is no longer singular. Some of that
+section's identity was "this is the banked corner", and a second banked corner
+spends part of it. Two things keep the difference real and neither is a matter of
+taste: the angle is 2:1, and the cross-slope across the road is **10.3 m on The
+Wall against 4.0 m on the esse**, 2.6:1, because The Wall is also 3.7 m wider on
+each side. The Wall remains the only place the horizon rolls far enough to be the
+subject of the shot, and §11 `banked-wall` remains the only vantage that grades a
+bank.
+
+**They must not read as the same feature, and this is a requirement on
+`world/` and `render/`, not something §1 can implement.** The Wall is a *built*
+bank: its outer edge stands free against sky and the road is carried on it. The
+esse must be a *cambered road*: its outer edge is buried in the cliff foot and
+the talus, so the road reads as leaning into the rock rather than as a wall
+rising out of the desert. If a frame at the esse is ever mistaken for a frame at
+The Wall, that is a defect report against this paragraph.
+
+**One limit worth stating so it is not rediscovered as a bug.** A 10° twist needs
+20 m of ramp at each end to stay inside the 0.02 rad/m continuity gate, and the
+corner is only 66 m long, so the sustained bank is 22 m. That plateau cannot
+cover the corner's 48 m constant-radius section, and a driver holding the middle
+of the road therefore gains only 19.1 → 20.0 m/s. Covering the centreline
+properly would need ramps of 9 m, which caps the bank at 5.1° and buys 19.3 m/s —
+worse for everybody. The bank is sized for the line the game paints because at
+this length there is no arrangement that serves both.
 
 **Why a low sun works here, and the four traps it brings.**
 
@@ -373,8 +445,11 @@ harder, because sand has no reflection to carry it.
 - Visible driver, tinted visor `#2a3a4a`, hands tracking the wheel
 - Exhaust stacks, roll bar, bevelled bumper, two mudflaps that flare with speed
 - Per-wheel suspension travel 0.09 m; body rolls into corners, pitches under load
-- **On The Wall the chassis stays normal to the banked surface while the camera
-  horizon rolls 20°.** The bank must be felt, not just seen.
+- **On a banked corner the chassis stays normal to the banked surface while the
+  camera horizon rolls with the bank** — 20° on The Wall, 10° on the banked esse
+  (§1). The bank must be felt, not just seen. It is stated for both because both
+  exist; it is not a new treatment for the esse, it is the same road-relative
+  camera doing the same thing at half the angle.
 - Driver leans and counter-steers into a drift
 - Kart hops on drift entry — the tell that the drift *took*
 - Eight liveries, each with secondary trim and a procedural decal
