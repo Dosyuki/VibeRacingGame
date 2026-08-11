@@ -512,6 +512,142 @@ controlled excursions, worst 2.18 s.
 
 ---
 
+## 6. A mountain from the far side of the lap, and a corner the game paints wrong
+
+**Round 10 → 11. Found by:** playing, and sending a minimap screenshot.
+
+> In the corner sections it still slides sometimes, barely controllable. And at
+> the place in this picture there's a mountain blocking the way — it shouldn't be
+> there. Now we pass through the mountain and drive around inside it.
+
+### The mountain was real, and it came from 130 m away
+
+At map (0.18, 0.68), t = 0.7056: the **mesa climb's** hinterland — backslope,
+caprock and cap-top, emitted from stations at t = 0.446–0.565 on the *right*
+side — lying across the **wash-descent** road from road level to **23.4 m up**,
+over 105 m of lap. 4419 m², reaching 16.21 m into the corridor, worst point at
+lateral **0.03 m: the centreline**.
+
+A cross-section's outward extent is computed **entirely in one station's frame**:
+`(halfWidth + setback)·topScale + capRun + backslopeRun`, which at the mesa climb
+is 205 m. Vermilion Nine folds back to within **131.5 m** of itself there, 13.7 m
+lower. Nothing in the file knew the rest of the circuit existed.
+
+**It is invisible to a vertex sweep.** One backslope quad is 23 m wide and *both*
+its rows sit outside the corridor of the road nearest them, while the surface
+between them passes over the road on the far side of a hairpin. It only appears
+at triangle resolution.
+
+A second, smaller cause was the same shape this project has now hit three times
+in one day: `faceU` adds weathering bias and a **signed** erosion term *after*
+`minToe` has clamped the toe. **The guard was correct and applied one step too
+early.**
+
+### There is no collision in this game at all
+
+Established while investigating, and it is why "drive around inside it" was
+possible: `'kart:wall'` is declared in the contract and counted in telemetry, and
+**nothing in the entire codebase emits it.** A kart driven at full lock into The
+Slot's wall reached **38.6 m past a wall at 11.0 m** — 27.6 m inside solid rock —
+with `wallHits` still 0.
+
+Worse: the kart's ground is not the terrain. Suspension rays cast against the
+road plane **extrapolated infinitely sideways**, so `height` stayed pinned at
+0.539 m and `grounded` true for the whole 36 m excursion. The canyon is
+decoration.
+
+**`autoplay.mjs` has been printing `wall contacts 0` for the life of the
+project**, with the sentence *"a field that never touches a wall is driving a
+corridor"* next to it — inviting exactly the wrong reading of an unfireable
+counter. Its `--selftest` produces non-zero hits because it tests against its own
+synthetic race model. **The analysis code was exercised; the source was never
+connected.** Green self-test, inert instrument.
+
+Deferred by the user: collision needs a contract widening
+(`ITrack.wallLimit(t, side)`), because a barrier at any multiple of `halfWidth`
+is impossible — the wall sits between **0.55 m and 53.9 m** beyond the road edge
+depending on where you are, a factor of five in ratio.
+
+### The corner the game paints wrong
+
+**No corner on this circuit is impossible.** ess-2 is takeable at 19.3 m/s —
+three independent methods agree — but with *zero* margin: it needs threshold
+braking beginning inside the previous corner, and the required entry speed at
+ess-1 came out at **23.77 m/s against ess-1's own limit of 23.76**. Coinciding to
+0.01 m/s is not a design; it is an accident that happened to land on the right
+side of the line.
+
+**And the racing line makes it worse.** `solveRacingLine` minimises Σκ², which
+buys two straight corners by making one tight: ess-1 goes 72.4 → **651 m**,
+ess-3 98.1 → **838 m**, and ess-2 47.6 → **40.6 m — 15% tighter than the
+centreline, at the slowest corner on the lap.** §3 paints the rubber lay-down
+along that line, so the darkest strip on the road invites the player onto the
+slowest path through the corner that matters, while straightening the corner they
+must brake in until it does not look like a corner.
+
+Sightlines were ruled out with numbers: every corner needing braking is visible
+from **5–8× the distance required** (ess-2 needs 22.2 m, is visible from 170 m).
+What is missing is not visibility but any cue that ess-2 is *tighter* than its
+neighbours — and the painted line says the opposite.
+
+### The controllability was the wheels, not the corner
+
+The remaining "barely controllable" was a defect **flagged earlier the same day
+and deliberately left unfixed**. With the rear laterally saturated its
+longitudinal force is near zero, so `wheelOmega` runs away in a slide and
+discharges as thrust afterwards — and the charge does not stop when the drift
+does, rising to **282 m/s of contact-patch speed for six seconds after**.
+
+Caught with no drift ever commanded: spin at ess-2 down to 0.28 m/s with the
+throttle pinned, then five seconds later — `boost` 0, `drift` 0, steer 0.13,
+climbing 50 m uphill — **32.1 → 37.84 m/s against a 27.8 terminal**, arriving at
+The Wall at 35.3 and going off. **The circuit produced the spin; the chassis
+converted it into a projectile.**
+
+### Why the gates missed it
+
+- **A vertex sweep finds almost nothing.** The corridor defect only exists at
+  triangle resolution. Nothing in the repo sampled geometry that way.
+- **The wall-contact counter cannot fire**, and has been reassuring everybody for
+  the life of the project.
+- **`slip-check`'s premise is wrong in its own comment.** `latAccelBudget: 8` is
+  justified as "0.82 g on a 0.88-grip road" — but 0.88 is a tyre-force multiplier,
+  not a g figure, and the measured peak is **0.80 g**. Its stated safety margin
+  does not exist; it commands 19.51 m/s at ess-2 against a measured 19.07 and
+  passes anyway. Its controller also brakes for every corner with 1.5 s of
+  look-ahead, so it is **structurally incapable** of seeing a failure whose cause
+  is arrival speed, and it caps at 24 m/s against a 27.8 terminal.
+- **A spin that stays on the road is invisible to every off-track detector.**
+  ess-2 produced 82–89° of body slip and a stop from 27 m/s with
+  `offSamples = 0`.
+- **A lap time is not a lap.** The pre-fix arm posted 50.47 s, which reads as
+  good. It went off at The Wall, respawned, and skipped the last third of the
+  circuit.
+
+### Recorded against ourselves
+
+- **The acceleration figure was being paid for out of the bug.** Bounding
+  `wheelOmega` at the physically honest point removes the discharge completely
+  and costs 0→25 m/s **6.96 → 9.30 s**, because a clean launch is slip-saturated
+  for its entire length. The bound shipped is the kart's own launch peak, chosen
+  so the launch is untouched — and both numbers are in the comment, because how
+  the kart launches is a decision, not a side effect.
+- **Two instrument bugs were caught by self-check, not by review.** A curvature
+  estimator used `cross/(abc)` where the circumradius is `4·Area/(abc)` — every
+  radius came out exactly double, and it looked entirely plausible. And a corner
+  segmenter merged two sections because one clothoid passes through the other's
+  plateau curvature on the way up.
+- **`ART_DIRECTION.md` §1 said bank is 0° everywhere except The Wall.** Banking
+  ess-2 made that false, so §1 was rewritten rather than left to contradict the
+  circuit — and it records what The Wall loses, its bank no longer being
+  singular.
+- The banked corner helps a driver on the painted line (17.5 → 21.6 m/s) far more
+  than one in the middle of the road (19.1 → 20.0), because a 10° twist needs 20 m
+  of ramp per end and there are only 66 m. **Covering both would have capped the
+  bank at 5.1°.** Stated, not hidden.
+
+---
+
 ## Standing gaps — what nobody has done yet
 
 These are not findings. They are the honest shape of what this file does *not*
