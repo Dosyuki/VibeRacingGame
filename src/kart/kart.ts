@@ -60,6 +60,19 @@ const STEER_FADE_SPEED = 34
 const TYRE_SLIP_ANGLE = 0.115
 const TYRE_SLIP_RATIO = 0.13
 const MAX_TYRE_LOAD = MASS * GRAVITY * 0.75
+/*
+ * The chassis cap, and it is NOT the same number as `MAX_TYRE_LOAD`.
+ *
+ * `MAX_TYRE_LOAD` only ever limited the load handed to the brush model. The
+ * chassis received the full, unclamped spring+damper force, so a single-tick
+ * damper spike of ~24 kN on one wheel put 24_000 / 260 * step = 0.77 m/s of
+ * upward delta-v into the body — the kart flicked itself into the air off a
+ * feature it should have absorbed. Capping at 2 g per wheel still lets four
+ * wheels arrest 8 g, which is more than any drop on this circuit asks for,
+ * while leaving `MAX_TYRE_LOAD` strictly the smaller of the two so the guard
+ * below keeps doing its own separate job.
+ */
+const MAX_SUSPENSION_FORCE = MASS * GRAVITY * 2
 
 const DRIFT_MIN_STEER = 0.18
 const DRIFT_MIN_SPEED = 7
@@ -368,7 +381,7 @@ export const createKart: KartFactory = (
         const props = SURFACE_PROPS[wheel.surface]
 
         // Roughness perturbs the ray target, not the chassis after integration.
-        // That distinction lets spring/damper forces filter the bump instead of
+        // That distinction lets the SPRING filter the bump instead of
         // teleporting the body, while the fixed phase keeps it deterministic.
         // Both tyres on an axle cross the same transverse road feature at the
         // same longitudinal station.  Giving left and right unrelated phases
@@ -376,18 +389,66 @@ export const createKart: KartFactory = (
         // straight, which then made the saturated tyre response chaotic.
         const bumpPhase = location.t * track.length * 5.7 + (i >> 1) * 1.91 + identity.id * 0.73
         const bump = Math.sin(bumpPhase) * props.roughness * 0.42
-        let rayLength =
+        /*
+         * TWO ray lengths, and the difference between them is the entire reason
+         * the kart used to hover and then slide.
+         *
+         * `smoothRayLength` measures the chassis against the road SURFACE.
+         * `rayLength` adds the roughness profile; the spring and the contact
+         * test use that one, so the bump is still felt exactly as before.
+         *
+         * The DAMPER is fed the smooth ray only. `bump` is a function of
+         * distance travelled, so a finite difference of a ray length that
+         * contains it yields A*k*v — a damper velocity proportional to SPEED,
+         * with k = 5.7 rad/m (a 1.10 m wavelength). On DustyAsphalt that term
+         * reached the 638 N static wheel load at just 5.9 m/s, and because the
+         * `Math.max(0, …)` below rectifies it, the clipped mean exceeded the
+         * kart's weight: the body was pumped to full droop, all four wheels
+         * spent half of every tick in the air, tyre load fell to the 120 N
+         * floor and the kart slid instead of turning. Achieved lateral
+         * acceleration at 14 m/s was 2.4 m/s^2 against the 8.1 the same tyre
+         * model produces with its wheels down.
+         *
+         * A real car does not do this because the tyre's own vertical
+         * compliance sits between the road and the damper and swallows
+         * short-wavelength input. We have no unsprung mass to model that with,
+         * so the difference is taken upstream of the bump instead — that is
+         * what this stands in for. The bump still reaches the spring, which is
+         * SPRING_RATE * A = 210 N of load variation on DustyAsphalt: rumble,
+         * three times too small to ever unload a wheel.
+         *
+         * Do NOT "fix" a recurrence of this by lowering `roughness` in
+         * SURFACE_PROPS. Those values are shared with fx/ and the camera, the
+         * sand ones were raised on purpose, and lowering them only moves the
+         * onset speed instead of removing the mechanism.
+         */
+        const smoothRayLength =
           (mount.x - sample.position.x) * sample.normal.x +
           (mount.y - sample.position.y) * sample.normal.y +
           (mount.z - sample.position.z) * sample.normal.z -
-          WHEEL_RADIUS -
-          bump
+          WHEEL_RADIUS
+        const rayLength = smoothRayLength - bump
         wheel.grounded = rayLength <= FULL_EXTENSION
+
+        // The damper history is kept OUTSIDE the grounded branch and over the
+        // same quantity every tick, airborne or not.  Parking it at
+        // FULL_EXTENSION whenever a wheel lifted meant the re-contact tick
+        // differenced a length the wheel had never been at: up to
+        // (0.25 - 0.16) / step = 10.8 m/s, a ~24 kN spike earned by hopping two
+        // millimetres over a bump crest.  Tracking the real (clamped) smooth
+        // ray makes that tick report the body's actual approach speed.
+        const damperRayLength = clamp(smoothRayLength, BOTTOM_LENGTH, FULL_EXTENSION)
+        // A pose assignment has no previous contact sample.  Treat its first
+        // ray as history rather than manufacturing a damper velocity from the
+        // old pose; the next fixed tick then has a real finite difference.
+        const compressionSpeed = suspensionHistoryValid
+          ? (previousRayLength[i]! - damperRayLength) / step
+          : 0
+        previousRayLength[i] = damperRayLength
 
         if (!wheel.grounded) {
           wheel.compression = 0
           wheel.slip = 0
-          previousRayLength[i] = FULL_EXTENSION
           wheelOmega[i] = wheelOmega[i]! * Math.max(0, 1 - step * 0.3)
           wheel.spin += wheelOmega[i]! * step
           wheel.steerAngle = i < 2 ? frontSteer : 0
@@ -398,18 +459,15 @@ export const createKart: KartFactory = (
         normalX += sample.normal.x
         normalY += sample.normal.y
         normalZ += sample.normal.z
-        rayLength = clamp(rayLength, BOTTOM_LENGTH, FULL_EXTENSION)
-        wheel.compression = clamp((FULL_EXTENSION - rayLength) / SUSPENSION_TRAVEL, 0, 1)
-        // A pose assignment has no previous contact sample.  Treat its first
-        // ray as history rather than manufacturing a damper velocity from the
-        // old pose; the next fixed tick then has a real finite difference.
-        const compressionSpeed = suspensionHistoryValid
-          ? (previousRayLength[i]! - rayLength) / step
-          : 0
-        previousRayLength[i] = rayLength
-        const springForce = Math.max(
-          0,
-          SPRING_RATE * (REST_LENGTH - rayLength) + DAMPER_RATE * compressionSpeed,
+        const springRayLength = clamp(rayLength, BOTTOM_LENGTH, FULL_EXTENSION)
+        wheel.compression = clamp((FULL_EXTENSION - springRayLength) / SUSPENSION_TRAVEL, 0, 1)
+        // Capped for the chassis, not just for the tyre — see MAX_SUSPENSION_FORCE.
+        const springForce = Math.min(
+          MAX_SUSPENSION_FORCE,
+          Math.max(
+            0,
+            SPRING_RATE * (REST_LENGTH - springRayLength) + DAMPER_RATE * compressionSpeed,
+          ),
         )
         totalForceX += sample.normal.x * springForce
         totalForceY += sample.normal.y * springForce
@@ -442,7 +500,10 @@ export const createKart: KartFactory = (
         // Damper force is allowed to arrest a landing, but it is not a usable
         // tyre load without limit.  Feeding an impact spike straight into the
         // brush model produced forces large enough to reverse the kart through
-        // the rearward component of a steered wheel's lateral force.
+        // the rearward component of a steered wheel's lateral force.  This is
+        // still the tighter of the two caps — `MAX_SUSPENSION_FORCE` bounds what
+        // the chassis feels, this bounds what the tyre may grip with — so it is
+        // not redundant with the clamp applied to `springForce` above.
         const tyreLoad = Math.min(springForce, MAX_TYRE_LOAD)
         const peakForce = Math.max(120, tyreLoad * props.grip * rearDriftScale)
         let lateralForce = -Math.tanh(slipAngle / (TYRE_SLIP_ANGLE / rearDriftScale)) * peakForce
