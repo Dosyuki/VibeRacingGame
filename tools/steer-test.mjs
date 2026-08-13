@@ -61,6 +61,21 @@
  * proves the split works: it drives correctly, `ai-outcome` stays quiet, and
  * `ai-command` goes red.
  *
+ * AND WHY WHERE IT ASKS IS HALF THE CHECK
+ * ----------------------------------------
+ * "The racing line is to your right" is only a question about a SIGN where the
+ * line is roughly parallel to the road. `world/track.ts` solves the line by
+ * minimising Σκ², and a minimum-curvature line runs DIAGONALLY across a straight
+ * between two corners — 0.4184 m of lateral per metre of arc at its worst here.
+ * Site the probe there and the pursuit chord is dominated by the line's diagonal
+ * rather than by which side of it the kart sits, and the check grades a heading
+ * error as if it were a sign. It did exactly that for a round, and the only way
+ * an AI could turn it green was to carry enough cross-track gain to overpower
+ * its own pursuit solve, which costs real pace for nothing. The window is now
+ * gated on that directly; see THE THIRD CONDITION below the straight finder, and
+ * `line-sawtooth` in the sabotage table, which is the world where no honest
+ * placement exists and the required answer is PENDING.
+ *
  * Reading the command needs one thing HarnessAPI does not declare; see the
  * PENDING block and CONTRACT_ADDITION at the bottom of a live run. Until it
  * lands, the command is graded through `KartState.wheels[].steerAngle`, whose
@@ -80,8 +95,9 @@
  * SELF-TEST. `--broken` needs no game and no server. It builds a complete
  * reference world in the page — a stadium circuit with real arc-length
  * parameterisation, a bicycle-model kart, and a pure-pursuit AI — installs it on
- * `window.__harness`, asserts the battery passes it clean, then applies eight
- * sabotages and asserts each is caught BY THE CHECK THAT OWNS IT. Two of them
+ * `window.__harness`, asserts the battery passes it clean, then applies ten
+ * sabotages and asserts each produces the verdict it owns — FAIL for a broken
+ * subject, PENDING for a world where the question cannot be asked. Four of them
  * additionally assert that a NAMED OTHER CHECK STAYED QUIET, because "everything
  * went red" would hide the fact that the two anchors are supposed to be
  * independent. It also drives the real extraction path — a harness that is
@@ -232,8 +248,30 @@ const CFG = {
    * racing line is to your right, for the whole look-ahead". A 200 m radius
    * bends by 5.7° over the 20 m the AI looks down, which cannot move the line
    * across the kart. Anything tighter can, and then a correct AI reads red.
+   *
+   * IT IS A PROXY FOR THE CENTRELINE AND THE PREMISE IS ABOUT THE RACING LINE,
+   * and on this circuit the proxy is false — see `aiLookAheadM` below, which is
+   * the direct measurement that now decides. This gate is KEPT because it is a
+   * cheap first pass and because the sentence above records why the window is
+   * chosen on straightness at all. It is now strictly subsumed: the
+   * contamination cap admits nothing under about 1000 m of radius, so if this
+   * gate is ever the binding one, something is wrong with the other.
    */
   aiMinRadiusM: 200,
+  /*
+   * How far down the road the driver under test is assumed to look, in metres.
+   *
+   * guess, and DELIBERATELY AN OVER-ESTIMATE. `src/game/ai.ts` resolves its own
+   * horizon as `LOOK_BASE + LOOK_PER_SPEED · v` clamped, which is roughly 16-18 m
+   * at this file's 18 m/s probe speed. This file does not read that — a harness
+   * that imports its subject's gains grades the subject against itself, and the
+   * day someone retunes the look-ahead the gate would follow it silently instead
+   * of reporting that the question had changed. 20 m is longer than any of them,
+   * and erring LONG is the safe direction: every term this constant bounds grows
+   * with the horizon, so an over-estimate makes the window selection stricter
+   * and never looser.
+   */
+  aiLookAheadM: 20,
   /*
    * DERIVED from how far the kart actually goes: 36 ticks at the 18.2 m/s probe
    * speed is 5.5 m. 15 m covers that with room to spare and is deliberately
@@ -519,8 +557,102 @@ async function battery(CFG) {
     return minRoom
   }
 
+  /*
+   * THE THIRD CONDITION, AND WHY THE FIRST TWO WERE NOT ENOUGH.
+   *
+   * `aiMinRadiusM` above gates on the CENTRELINE's radius, as a proxy for "the
+   * racing line cannot move across the kart over the look-ahead". On Vermilion
+   * Nine the proxy is false, and it is false by a wide margin. Measured at the
+   * station the shipped selection picked — t = 0.34326, centreline radius 242 m
+   * over its own 60 m window, comfortably past a 200 m floor:
+   *
+   *     look-ahead    the racing line moves       probe offset
+   *        14 m            +2.15 m                   ±2.50 m
+   *        16 m            +2.36 m
+   *        18 m            +2.66 m                <- larger than the offset
+   *        20 m            +2.85 m
+   *
+   * The road is straight and the LINE is not parallel to it. `world/track.ts`
+   * solves the line by minimising Σκ², and a minimum-curvature line runs
+   * DIAGONALLY across a straight between two corners rather than along it: the
+   * lap's peak lateral slope is 0.4184 m per metre of arc, and 0.1754 m/m at
+   * that station.
+   *
+   * WHY THAT DEFEATS THE CHECK. Pure pursuit's chord to an aim point `d` metres
+   * ahead, for a kart at cross-track error `e` with heading error ψ against the
+   * line, on a road of curvature κ, carries three things added together:
+   *
+   *     chord_right  ≈  e  +  ψ·d  +  κ·d²/2
+   *
+   * Only `e` says which side of the line the kart is on, and only `e` is what
+   * this check claims to grade. `seek` places the kart on the CENTRELINE TANGENT
+   * (`IKart.placeAt` builds its basis from `TrackSample.tangent`), so at tick
+   * zero ψ is exactly the angle between the road and the line — 9.95° at that
+   * station — and ψ·d is exactly the distance the line moves over the
+   * look-ahead. THE HEADING ERROR AND THE LINE'S DRIFT ARE THE SAME TERM, seen
+   * twice; bounding one bounds the other, and there is no separate settling
+   * period to wait out. With the drift at 2.66 m against a 2.50 m offset, the
+   * dominant term in the chord was the line's diagonal and not the placement:
+   * the check was grading a heading error as if it were a sign, and a correct AI
+   * could only turn it green by carrying enough cross-track gain to overpower
+   * its own pursuit solve.
+   *
+   * So the window now gates on the thing the radius was a proxy for, measured:
+   *
+   *     contamination  =  |racingLine(s + look) - racingLine(s)|  +  κ_worst·look²/2
+   *                       └─ ψ·d, the line's diagonal ─┘            └─ the road's own bend ─┘
+   *
+   * worst over the whole footprint the probe touches — the kart's own travel
+   * (aiTicks at probeSpeed) plus one look-ahead beyond it, because the aim point
+   * runs ahead of the kart the whole way.
+   *
+   * THE CAP is `aiMinOffsetM / noiseMultiple` — the same 4x rule this file
+   * already uses for a sign quoted against a noise floor, applied to the
+   * smallest cross-track error the check will accept as measurable. 0.8 / 4 =
+   * 0.20 m. Deriving it from the FLOOR rather than from the offset the run
+   * actually gets is deliberate: the offset is only known after a window is
+   * chosen, so a cap derived from it would be circular, and a cap valid at the
+   * floor is valid at every larger offset the selection might land on. The
+   * realised ratio is reported either way.
+   *
+   * IF NOTHING QUALIFIES, the check reports PENDING with the best contamination
+   * on the lap and where it was. It does NOT fall back to the least-bad window:
+   * probing anyway with a relaxed condition is the same mistake as clamping the
+   * offset "to fit", and that mistake is what produced a phantom inverted AI for
+   * a whole round.
+   */
+  const lookSteps = Math.max(1, Math.round(CFG.aiLookAheadM / ds))
+  const aiTravelM = CFG.aiTicks * CFG.simStep * CFG.probeSpeed
+  const footSteps = Math.max(2, Math.round((aiTravelM + CFG.aiLookAheadM) / ds))
+  const contamCapM = CFG.aiMinOffsetM / CFG.noiseMultiple
+
+  /** Worst metres the racing line moves over one look-ahead, anywhere in the footprint. */
+  function lineDriftFrom(start, count) {
+    let worst = 0
+    for (let k = 0; k < count; k++) {
+      const j = (start + k) % N
+      const d = Math.abs(lineAt[(j + lookSteps) % N] - lineAt[j])
+      if (d > worst) worst = d
+    }
+    return worst
+  }
+  /** Sagitta of the ROAD over one look-ahead: how far the centreline itself has bent away. */
+  const roadBend = (worstCurvature) => (worstCurvature * CFG.aiLookAheadM * CFG.aiLookAheadM) / 2
+  /** Lateral slope of the racing line at a station, metres per metre of arc. */
+  const lineSlopeAt = (i) => (lineAt[(i + 1) % N] - lineAt[(i - 1 + N) % N]) / (2 * ds)
+
   let aiEntry = -1
   let aiRoom = -Infinity
+  let aiDriftM = 0
+  let aiBendM = 0
+  // The least-contaminated window anywhere, kept only so the PENDING below can
+  // quote a number instead of "no window qualified".
+  let leastContam = Infinity
+  let leastContamEntry = -1
+  let leastContamDrift = 0
+  let leastContamBend = 0
+  let straightWindows = 0
+  let sitedWindows = 0
   for (let i = 0; i < N; i++) {
     let worstC = 0
     for (let k = 0; k < win; k++) {
@@ -528,21 +660,42 @@ async function battery(CFG) {
       if (c > worstC) worstC = c
     }
     if (worstC > 1 / CFG.aiMinRadiusM) continue
+    straightWindows++
     const entry = (i + entryOffset) % N
+    const drift = lineDriftFrom(entry, footSteps)
+    const bend = roadBend(worstC)
+    const contam = drift + bend
+    if (contam < leastContam) {
+      leastContam = contam
+      leastContamEntry = entry
+      leastContamDrift = drift
+      leastContamBend = bend
+    }
+    if (contam > contamCapM) continue
+    sitedWindows++
     const r = roomFrom(entry, roomWin)
     if (r > aiRoom) {
       aiRoom = r
       aiEntry = entry
+      aiDriftM = drift
+      aiBendM = bend
     }
   }
-  // No window is straight enough at all: fall back to the flattest one and let
-  // the offset floor below decide whether anything is still measurable there.
-  const aiFellBack = aiEntry < 0
-  if (aiFellBack) {
-    aiEntry = (bestStart + entryOffset) % N
+  /*
+   * Nothing qualified. Site the REPORT on the least-contaminated window there
+   * was — every number below then describes a real place on the lap — and set
+   * the flag that routes the two AI checks to PENDING. There is deliberately no
+   * path from here to a measurement.
+   */
+  const aiNoWindow = aiEntry < 0
+  if (aiNoWindow) {
+    aiEntry = leastContamEntry >= 0 ? leastContamEntry : (bestStart + entryOffset) % N
     aiRoom = roomFrom(aiEntry, roomWin)
+    aiDriftM = leastContam === Infinity ? lineDriftFrom(aiEntry, footSteps) : leastContamDrift
+    aiBendM = leastContam === Infinity ? 0 : leastContamBend
   }
   const tAI = wrap01(aiEntry / N)
+  const aiHeadingErrDeg = (Math.atan(lineSlopeAt(aiEntry)) * 180) / Math.PI
   const sAtAI = mkSample()
   track.sample(tAI, sAtAI)
 
@@ -922,7 +1075,17 @@ async function battery(CFG) {
     aiCommand.metrics.tAI = tAI
     aiCommand.metrics.roomM = aiRoom
     aiCommand.metrics.halfWidthM = sAtAI.halfWidth
-    aiCommand.metrics.fellBackToFlattest = aiFellBack
+    // The siting ledger: what the window had to satisfy, and by how much.
+    aiCommand.metrics.lookAheadM = CFG.aiLookAheadM
+    aiCommand.metrics.lineDriftM = aiDriftM
+    aiCommand.metrics.roadBendM = aiBendM
+    aiCommand.metrics.contaminationM = aiDriftM + aiBendM
+    aiCommand.metrics.contaminationCapM = contamCapM
+    aiCommand.metrics.contaminationFracOfOffset = offset > 0 ? (aiDriftM + aiBendM) / offset : null
+    aiCommand.metrics.headingErrDeg = aiHeadingErrDeg
+    aiCommand.metrics.straightWindows = straightWindows
+    aiCommand.metrics.sitedWindows = sitedWindows
+    aiCommand.metrics.noWindow = aiNoWindow
 
     /*
      * If there is not enough road either side of the line to place the kart on
@@ -930,14 +1093,27 @@ async function battery(CFG) {
      * `blocked` path a dead run uses, so the PENDING wording stays in one place.
      * The alternative — clamping the offset down and probing anyway — is how
      * this check spent a round reporting an inverted AI that did not exist.
+     *
+     * The same applies, for the same reason, to a lap with nowhere the question
+     * can be asked cleanly at all: `aiNoWindow`. Probing the least-bad window
+     * would be relaxing the threshold silently, which is the identical mistake
+     * one level up.
      */
-    const tooTight =
-      offset >= CFG.aiMinOffsetM
+    const cannotSite = aiNoWindow
+      ? `NOWHERE ON THE LAP CAN THIS QUESTION BE ASKED CLEANLY. Of ${straightWindows} window(s) meeting the ` +
+        `${CFG.aiMinRadiusM} m straightness floor, none kept the pursuit chord's non-cross-track content under ` +
+        `${contamCapM.toFixed(2)} m over a ${(aiTravelM + CFG.aiLookAheadM).toFixed(0)} m footprint. The best was ` +
+        `${(aiDriftM + aiBendM).toFixed(2)} m at t=${tAI.toFixed(4)} (racing line moves ${aiDriftM.toFixed(2)} m ` +
+        `across the road over a ${CFG.aiLookAheadM} m look-ahead, road bend adds ${aiBendM.toFixed(2)} m; the line's ` +
+        `heading there is ${aiHeadingErrDeg.toFixed(2)}° off the tangent seek places the kart on). A probe sited ` +
+        `there grades the line's diagonal, not which side of it the kart is on — so this run measured NOTHING about ` +
+        `the AI's steering sign and must not be read as a pass`
+      : offset >= CFG.aiMinOffsetM
         ? null
-        : `the roomiest straight window on the lap leaves ${aiRoom.toFixed(2)} m of road on the tighter side of ` +
+        : `the roomiest well-sited window on the lap leaves ${aiRoom.toFixed(2)} m of road on the tighter side of ` +
           `the racing line (t=${tAI.toFixed(4)}, halfWidth ${sAtAI.halfWidth.toFixed(2)} m, line ` +
-          `${lineAtAI.toFixed(2)} m off centre` +
-          `${aiFellBack ? `; no window met the ${CFG.aiMinRadiusM} m straightness floor at all` : ''}). After a ` +
+          `${lineAtAI.toFixed(2)} m off centre; ${sitedWindows} of ${straightWindows} straight windows met the ` +
+          `${contamCapM.toFixed(2)} m contamination cap). After a ` +
           `${CFG.aiEdgeMarginM} m edge margin the offset would be ${offset.toFixed(2)} m, under the ` +
           `${CFG.aiMinOffsetM} m floor. Placing the kart anyway would put it off the road, where the AI is ` +
           `correctly recovering and its command says nothing about which side the line is on`
@@ -956,8 +1132,8 @@ async function battery(CFG) {
      * undocumented in `types.ts`, which is how two readings of it lived side by
      * side in the same repository without either looking wrong.
      */
-    const fromLeft = tooTight
-      ? { blocked: tooTight }
+    const fromLeft = cannotSite
+      ? { blocked: cannotSite }
       : await run(0, {
           driver: 'referenceAI',
           t: tAI,
@@ -965,8 +1141,8 @@ async function battery(CFG) {
           ticks: CFG.aiTicks,
           slice: CFG.aiSliceTicks,
         })
-    const fromRight = tooTight
-      ? { blocked: tooTight }
+    const fromRight = cannotSite
+      ? { blocked: cannotSite }
       : await run(0, {
           driver: 'referenceAI',
           t: tAI,
@@ -975,6 +1151,48 @@ async function battery(CFG) {
           slice: CFG.aiSliceTicks,
         })
     if (have.setInput) h.setDriver(pid, 'scripted')
+
+    /*
+     * SAY WHERE THIS LANDED AND HOW CLEAN IT IS, on every run, pass or fail. A
+     * sign is only as good as the placement that produced it, and the placement
+     * is the part of this check that has been wrong twice.
+     */
+    if (!cannotSite) {
+      aiCommand.notes.push(
+        `sited at t=${tAI.toFixed(4)} — ${sitedWindows} of ${straightWindows} straight windows on the lap keep the ` +
+          `pursuit chord's non-cross-track content under the ${contamCapM.toFixed(2)} m cap, and this is the roomiest ` +
+          `of them (${aiRoom.toFixed(2)} m to the tighter edge, offset ${offset.toFixed(2)} m). There the racing line ` +
+          `moves ${aiDriftM.toFixed(3)} m over a ${CFG.aiLookAheadM} m look-ahead and the road bends ` +
+          `${aiBendM.toFixed(3)} m, together ${(((aiDriftM + aiBendM) / Math.max(offset, CFG.epsilonM)) * 100).toFixed(1)}% ` +
+          `of the cross-track error being graded. The line's heading is ${aiHeadingErrDeg.toFixed(2)}° off the ` +
+          `centreline tangent that seek() places the kart on — that is the SAME term as the drift above, not a second ` +
+          `one, so bounding one bounded both and there is nothing to settle out first.`,
+      )
+      /*
+       * The two placements should be on the same surface as each other. If they
+       * are not, ai-outcome is comparing two different manoeuvres — one kart
+       * with grip and one without — and the convergence numbers are not mirror
+       * images even for a perfectly symmetric driver. REPORTED, never gated:
+       * a road is allowed to have a low-grip band and the sign is unmoved by it.
+       */
+      if (typeof track.surfaceAt === 'function') {
+        const sLine = track.surfaceAt(tAI, lineAtAI)
+        const sLeft = track.surfaceAt(tAI, lineAtAI - offset)
+        const sRight = track.surfaceAt(tAI, lineAtAI + offset)
+        aiCommand.metrics.surfaceOnLine = sLine
+        aiCommand.metrics.surfaceLeft = sLeft
+        aiCommand.metrics.surfaceRight = sRight
+        if (sLeft !== sRight || sLeft !== sLine) {
+          aiCommand.notes.push(
+            `the two placements are not on the same surface: Surface ${sLeft} at ${offset.toFixed(2)} m left of the ` +
+              `line, ${sRight} at ${offset.toFixed(2)} m right, ${sLine} on the line itself (ITrack.surfaceAt, raw ` +
+              `enum). Reported, not gated — the COMMAND is a controller output and grip cannot move its sign — but ` +
+              `ai-outcome's two convergence numbers are then not mirror images of each other even for a symmetric ` +
+              `driver, and the smaller one should be read with that in mind.`,
+          )
+        }
+      }
+    }
 
     if (fromLeft.blocked || fromRight.blocked) {
       pend(aiCommand, `an AI run was blocked: ${fromLeft.blocked || fromRight.blocked}`)
@@ -1019,7 +1237,7 @@ async function battery(CFG) {
         if (!(cmdL > floor)) {
           fail(
             aiCommand,
-            `placed ${offset.toFixed(2)} m to the LEFT of the racing line at t=${t0.toFixed(4)}, the reference AI ` +
+            `placed ${offset.toFixed(2)} m to the LEFT of the racing line at t=${tAI.toFixed(4)}, the reference AI ` +
               `commanded a mean steer of ${cmdL === null ? 'nothing' : cmdL.toFixed(4)} over ${(CFG.aiTicks * CFG.simStep).toFixed(2)} s ` +
               `(source: ${aiCommand.metrics.source}; needs > +${floor}). The line is to its right; steer > 0 is the ` +
               `only correct request. ${why}`,
@@ -1042,6 +1260,23 @@ async function battery(CFG) {
       aiOutcome.metrics.closedFromRightM = -closedR
       aiOutcome.metrics.seconds = CFG.aiTicks * CFG.simStep
       aiOutcome.metrics.gateM = CFG.aiConvergenceM
+      /*
+       * The gate is an ABSOLUTE distance and the offset is not, so quote the
+       * margin. `aiConvergenceM` was derived against a 2.5 m offset ("a tenth of
+       * the error"); a re-sited probe with less room to work in makes the same
+       * gate a LARGER fraction of the error, which is the direction a threshold
+       * is allowed to move on its own. Scaling it down to keep the fraction
+       * would be relaxing a limit to fit a placement, and this file has already
+       * paid for that once.
+       */
+      aiOutcome.metrics.gateFracOfOffset = offset > 0 ? CFG.aiConvergenceM / offset : null
+      aiOutcome.notes.push(
+        `converged ${(-closedL / CFG.aiConvergenceM).toFixed(1)}x the gate from the left and ` +
+          `${(-closedR / CFG.aiConvergenceM).toFixed(1)}x from the right, over ${(CFG.aiTicks * CFG.simStep).toFixed(2)} s ` +
+          `from ±${offset.toFixed(2)} m. The ${CFG.aiConvergenceM} m gate is ${((CFG.aiConvergenceM / Math.max(offset, CFG.epsilonM)) * 100).toFixed(1)}% ` +
+          `of the error being closed — it was derived at a 2.5 m offset where it is 4.0%, so a tighter placement makes ` +
+          `this check harder rather than easier, and it was left alone deliberately.`,
+      )
       if (!(closedL < -CFG.aiConvergenceM)) {
         fail(
           aiOutcome,
@@ -1097,7 +1332,17 @@ async function battery(CFG) {
  * evidence.
  */
 function installReferenceWorld(sabotage) {
-  const S = sabotage || 'none'
+  /*
+   * Sabotages COMPOSE, joined with '+'. One name per failure mode reads well
+   * until the question is "does the detector still fire in a world that is also
+   * hostile to the probe's placement" — and that question is exactly the one a
+   * re-sited probe has to answer, because the cheapest way to make a check
+   * easier to pass is to move it somewhere nothing happens. `ai-negates+
+   * line-sawtooth` is a genuinely inverted AI in a world built to defeat the
+   * siting, and it is not expressible with a single string.
+   */
+  const SABS = new Set(String(sabotage || 'none').split('+'))
+  const S = (name) => SABS.has(name)
 
   function V(x, y, z) {
     this.x = x || 0
@@ -1231,7 +1476,7 @@ function installReferenceWorld(sabotage) {
     let lateral = dx * locScratch.right.x + dz * locScratch.right.z
     // The track's own sign convention, inverted. A kart that is correct now
     // looks wrong to the track anchor and stays right to the world anchor.
-    if (S === 'track-lateral-flip' || S === 'both-flipped') lateral = -lateral
+    if (S('track-lateral-flip') || S('both-flipped')) lateral = -lateral
     out.t = bt
     out.lateral = lateral
     out.height = dy
@@ -1240,10 +1485,33 @@ function installReferenceWorld(sabotage) {
     return out
   }
 
+  /*
+   * A LINE THAT IS NEVER PARALLEL TO THE ROAD — the `line-sawtooth` world.
+   *
+   * The real circuit's line is solved by minimising Σκ², and such a line runs
+   * DIAGONALLY across a straight between two corners: measured peak 0.4184 m of
+   * lateral per metre of arc. A probe sited where that is happening reads the
+   * line's diagonal instead of which side of it the kart is on. This is that
+   * property turned up until it holds EVERYWHERE, so there is nowhere on the lap
+   * the AI checks can honestly be sited — and the required answer is PENDING
+   * with the numbers, never a pass and never a red AI.
+   *
+   * 2.5 m of amplitude over a 25 m period is 0.4 m/m, matching the real lap's
+   * peak, and it keeps |line| well inside the 8 m half-width so the PENDING
+   * comes from the siting condition rather than from running out of road — those
+   * are different refusals and a self-test that cannot tell them apart proves
+   * neither.
+   */
+  const SAW_AMP = 2.5
+  const SAW_PERIOD = 25
+
   const rlScratch = mkSample()
   function racingLine(t) {
     frameAt(wrap01(t) * LENGTH, rlScratch)
-    return 0.55 * HALF_WIDTH * Math.tanh(rlScratch.curvature * 60)
+    const base = 0.55 * HALF_WIDTH * Math.tanh(rlScratch.curvature * 60)
+    if (!S('line-sawtooth')) return base
+    const u = ((wrap01(t) * LENGTH) % SAW_PERIOD) / SAW_PERIOD
+    return SAW_AMP * (1 - 4 * Math.abs(u - 0.5))
   }
 
   const track = {
@@ -1302,8 +1570,8 @@ function installReferenceWorld(sabotage) {
     const fwd = -Math.sin(kart.yaw) * dx + -Math.cos(kart.yaw) * dz
     const lat = Math.cos(kart.yaw) * dx + -Math.sin(kart.yaw) * dz
     let steer = 2.2 * Math.atan2(lat, Math.max(2, Math.abs(fwd)))
-    if (S === 'ai-negates' || S === 'ai-double-negation') steer = -steer
-    if (S === 'ai-lazy') steer *= 0.02
+    if (S('ai-negates') || S('ai-double-negation')) steer = -steer
+    if (S('ai-lazy')) steer *= 0.02
     return Math.max(-1, Math.min(1, steer))
   }
 
@@ -1318,8 +1586,8 @@ function installReferenceWorld(sabotage) {
     kart.wheelSteer = frame.steer * MAX_STEER_RAD
 
     let effective = frame.steer
-    if (S === 'steer-100x-weak') effective *= 0.01
-    if (S === 'nondeterministic') {
+    if (S('steer-100x-weak')) effective *= 0.01
+    if (S('nondeterministic')) {
       nonce = (nonce * 1103515245 + 12345) & 0x7fffffff
       effective += ((nonce / 0x7fffffff) - 0.5) * 0.02
     }
@@ -1329,7 +1597,7 @@ function installReferenceWorld(sabotage) {
       kart.speed += (target - kart.speed) * 0.02
       // A right-hand steer decreases yaw. `chassis-inverted` is the second
       // negation this whole harness exists to find.
-      const dir = S === 'chassis-inverted' || S === 'both-flipped' || S === 'ai-double-negation' ? +1 : -1
+      const dir = S('chassis-inverted') || S('both-flipped') || S('ai-double-negation') ? +1 : -1
       kart.yaw += dir * effective * (kart.speed / MIN_TURN_RADIUS) * SIM_STEP
       const fx = -Math.sin(kart.yaw)
       const fz = -Math.cos(kart.yaw)
@@ -1372,7 +1640,7 @@ function installReferenceWorld(sabotage) {
     // seek() places by the TRACK's own lateral convention, so an inverted track
     // places the kart on the mirrored side. That is faithful: it is what a real
     // seek built on ITrack would do, and the world anchor is unmoved by it.
-    const lat = S === 'track-lateral-flip' || S === 'both-flipped' ? -lateral : lateral
+    const lat = S('track-lateral-flip') || S('both-flipped') ? -lateral : lateral
     kart.x = s.position.x + s.right.x * lat
     kart.y = 0
     kart.z = s.position.z + s.right.z * lat
@@ -1479,6 +1747,36 @@ const SABOTAGES = [
     owner: 'repeatability',
     what: 'a per-tick perturbation — two runs of the same test stop being the same test',
   },
+  /*
+   * THE SITING SABOTAGES. Everything above breaks the SUBJECT; these two break
+   * the PLACE, and they are here because re-siting a probe is the cheapest way
+   * in the world to make a check easier to pass by measuring less.
+   *
+   * `line-sawtooth` is a completely correct world whose racing line is never
+   * parallel to the road. There is nowhere the AI checks can be sited honestly,
+   * and the required answer is PEND — not a pass (which would be a gate covering
+   * nothing) and not a red AI (which is the phantom inverted driver this file
+   * already reported for a whole round, from exactly this cause).
+   *
+   * `ai-negates+line-sawtooth` is the one that matters most. If the answer to a
+   * hostile world were ever "site it somewhere quieter and carry on", a genuinely
+   * inverted AI would ride out with it. It must NOT come back green.
+   */
+  {
+    name: 'line-sawtooth',
+    owner: 'ai-command',
+    expect: 'PEND',
+    also: ['ai-outcome'],
+    quiet: ['player-track-anchor', 'player-world-anchor', 'steer-response', 'repeatability'],
+    what: 'a correct world with a racing line that crosses the road at 0.4 m/m everywhere — nowhere to site the probe',
+  },
+  {
+    name: 'ai-negates+line-sawtooth',
+    owner: 'ai-command',
+    expect: 'NOT_PASS',
+    also: ['ai-outcome'],
+    what: 'an inverted AI in that same world — the refusal must not launder it into a green check',
+  },
 ]
 
 // ---------------------------------------------------------------------------
@@ -1518,7 +1816,13 @@ function summarise(c) {
     case 'steer-response':
       return `smallest ${fmt(m.smallestMagnitudeM)} m (floor ${fmt(m.minLateralM, 2)} m)  asymmetry ${m.asymmetry === undefined ? '-' : (m.asymmetry * 100).toFixed(1) + '%'}  monotone ${m.monotoneInSteer === undefined ? '-' : m.monotoneInSteer}`
     case 'ai-command':
-      return `from left ${fmt(m.fromLeftSteer, 4)}   from right ${fmt(m.fromRightSteer, 4)}   via ${m.source ?? '-'}`
+      return (
+        `from left ${fmt(m.fromLeftSteer, 4)}   from right ${fmt(m.fromRightSteer, 4)}   via ${m.source ?? '-'}\n` +
+        `        sited t=${fmt(m.tAI, 4)} offset ±${fmt(m.offsetM, 2)} m  line drift ${fmt(m.lineDriftM, 3)} m + road bend ` +
+        `${fmt(m.roadBendM, 3)} m = ${fmt(m.contaminationM, 3)} m (cap ${fmt(m.contaminationCapM, 2)} m, ` +
+        `${m.contaminationFracOfOffset === null || m.contaminationFracOfOffset === undefined ? '-' : (m.contaminationFracOfOffset * 100).toFixed(1) + '%'} of the error graded)  ` +
+        `line heading ${fmt(m.headingErrDeg, 2)}°`
+      )
     case 'ai-outcome':
       return `closed ${fmt(m.closedFromLeftM)} m / ${fmt(m.closedFromRightM)} m of ${fmt(m.startedLeftBy, 2)} m in ${fmt(m.seconds, 2)} s`
     default:
@@ -1765,7 +2069,18 @@ async function main() {
       const out = await runIn(page)
       const byId = new Map((out.checks || []).map((c) => [c.id, c]))
       const target = byId.get(sab.owner)
-      const caught = Boolean(target && target.status === 'FAIL')
+      /*
+       * WHAT "CAUGHT" MEANS depends on what the sabotage broke. A broken SUBJECT
+       * must go FAIL. A world where the question cannot be asked must go PEND,
+       * and calling that a miss would push the file toward answering anyway —
+       * which is the failure this whole re-siting exists to prevent. NOT_PASS is
+       * the weakest honest verdict: for an inverted AI in an unaskable world,
+       * either answer is defensible and only green is not.
+       */
+      const want = sab.expect || 'FAIL'
+      const statusOf = (id) => (byId.get(id) ? byId.get(id).status : 'absent')
+      const meets = (st) => (want === 'NOT_PASS' ? st === 'FAIL' || st === 'PEND' : st === want)
+      const caught = Boolean(target && meets(target.status) && (sab.also || []).every((id) => meets(statusOf(id))))
       /*
        * "Quiet" means DID NOT FIRE, not "reported PASS". A check that is PENDING
        * because the contract cannot reach it — ai-command without `lastInput` —
@@ -1782,14 +2097,19 @@ async function main() {
       const ok = caught && noisy.length === 0
       rows.push({ name: sab.name, owner: sab.owner, caught, noisy, collateral })
       console.log(
-        `${ok ? 'CAUGHT' : 'MISSED'}  ${sab.name.padEnd(20)} -> ${sab.owner.padEnd(21)} ${sab.what}` +
+        `${ok ? 'CAUGHT' : 'MISSED'}  ${sab.name.padEnd(24)} -> ${sab.owner.padEnd(21)} [${want}] ${sab.what}` +
           (collateral.length ? `\n                                                    also red: ${collateral.join(', ')}` : '') +
+          ((sab.also || []).length ? `\n                                                    and with it: ${sab.also.map((id) => `${id} ${statusOf(id)}`).join(', ')}` : '') +
           ((sab.quiet || []).length ? `\n                                                    must stay quiet: ${sab.quiet.join(', ')} — ${noisy.length ? 'DID NOT: ' + noisy.join(', ') : 'held'}` : ''),
       )
       if (caught) {
-        console.log(`                             ${target.problems[0].split('\n')[0].slice(0, 140)}`)
+        const said = (target.problems[0] || target.notes[0] || '(no message)').split('\n')[0]
+        console.log(`                             ${said.slice(0, 140)}`)
       } else {
-        misses.push(`${sab.name}: ${sab.owner} stayed ${target ? target.status : 'absent'}`)
+        misses.push(
+          `${sab.name}: ${sab.owner} was ${target ? target.status : 'absent'}, wanted ${want}` +
+            ((sab.also || []).length ? ` (with ${sab.also.map((id) => `${id} ${statusOf(id)}`).join(', ')})` : ''),
+        )
       }
       if (noisy.length) {
         misses.push(
