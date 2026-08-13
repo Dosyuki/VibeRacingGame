@@ -293,6 +293,36 @@ export interface ITrack {
   /** Lateral offset in metres of the ideal line at `t`. AI and ghost use it. */
   racingLine(t: number): Metres
   /**
+   * Signed lateral offset of the COLLIDABLE canyon face on one side at `t`.
+   * `side` follows STEERING SIGN: +1 is the driver's right, and the returned
+   * value carries that sign, so `wallLimit(t, +1) > 0`.
+   *
+   * WHY THIS IS ON THE CONTRACT AND NOT DERIVED BY THE CALLER. A kart cannot
+   * compute it: the envelope is `halfWidth + setback - talusRun`, where
+   * `setback` comes from an eight-row table private to `world/terrain.ts` and
+   * `talusRun` from that section's height over `tan(32°)`, all noise-modulated
+   * from `ctx.rngFor` streams. Measured over 480 rays, the face sits between
+   * 0.55 m and 53.87 m beyond the road edge — a factor of 5.2 in the ratio to
+   * `halfWidth`. THERE IS NO CONSTANT AND NO MULTIPLE THAT WORKS: pick the low
+   * end and you put walls on the shoulder, deleting `Surface.OffTrack`; pick
+   * the high end and you are 27 m inside The Slot's rock. `src/kart/` may not
+   * import `src/world/`, so this is the channel.
+   *
+   * NEVER inboard of `halfWidth + BARRIER_MARGIN`. Off-track driving is a
+   * designed penalty — grip 0.5, drag 9.0 — and a barrier must not delete it.
+   * `world/` already clamps its toe to exactly that line.
+   *
+   * Measured at chassis height, not at the crest: `world/` guarantees nothing
+   * overhangs below 4 m, so one lateral number is sufficient for a kart.
+   *
+   * Returns `Infinity` where the section has no wall. That is a legal answer
+   * and means "no barrier", not "unknown" — a caller must treat a non-finite
+   * value as free space rather than clamping to it.
+   *
+   * Allocation-free, and on the MUST NOT ALLOCATE list beside `surfaceAt`.
+   */
+  wallLimit(t: number, side: -1 | 1): Metres
+  /**
    * Ordered, ascending, `checkpoints[0] === 0` (the start line). A lap counts
    * only when every checkpoint was crossed in ascending index order, each in
    * the forward direction; crossing backward decrements. Wrapping from the last

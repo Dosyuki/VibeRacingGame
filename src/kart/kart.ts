@@ -32,6 +32,23 @@ const WHEEL_RADIUS = 0.36
 const WHEEL_INERTIA = 1.55
 const HALF_TRACK = 0.64
 /*
+ * Wall contact. See the barrier block in `step`.
+ *
+ * Restitution is deliberately low. A canyon face is rock and scree, not a
+ * tyre wall: 0.25 gives enough of a nudge that a kart pinned against the face
+ * peels off instead of grinding along it, without the pinball bounce that
+ * turns The Slot into a corridor a kart ricochets down. `HitKind` at
+ * types.ts:332 deliberately excludes 'wall', so there is no stun to hide a
+ * bounce behind — whatever this does is what the player feels.
+ */
+const WALL_RESTITUTION = 0.25
+/** Fraction of speed lost per m/s of closing speed. */
+const WALL_SCRUB_PER_MPS = 0.02
+/** Ceiling on that, so a very fast square hit still leaves the kart moving. */
+const WALL_SCRUB_MAX = 0.3
+/** Closing speed below which contact is a graze, not an event. See the emit. */
+const WALL_EVENT_MIN_SPEED = 1.0
+/*
  * The mass centre sits AHEAD of the wheelbase midpoint, and those four
  * centimetres are the whole reason this kart stopped spinning.
  *
@@ -579,6 +596,108 @@ export const createKart: KartFactory = (
 
       track.locate(position, centreLocation)
       track.sample(centreLocation.t, centreSample)
+
+      /*
+       * THE BARRIER. Until this existed a kart at full lock reached 27.6 m
+       * INSIDE The Slot's rock with `wallHits` still zero, because nothing in
+       * `src/` had ever emitted `'kart:wall'` and nothing had ever stopped a
+       * kart from leaving the canyon. The suspension cannot catch it: the rays
+       * cast against the road plane, which extrapolates sideways forever, so
+       * `grounded` stayed true and `height` stayed at ride height through a
+       * 36 m excursion. There is no geometric test here that could have found
+       * the wall either — `src/kart/` may not import `src/world/`. The one
+       * channel is the contract, and `wallLimit` is it.
+       *
+       * IT RUNS AT THE TOP OF THE TICK, ON LAST TICK'S INTEGRATION. Correcting
+       * after `position.addScaledVector(velocity, step)` would need a second
+       * `track.locate` — the expensive call, five of which already run per kart
+       * per tick — to find the post-integration lateral. Doing it here costs
+       * nothing extra and lags by one tick, which at 120 Hz and 30 m/s is at
+       * most 0.25 m of overshoot, corrected before anything reads the position.
+       *
+       * IT IS INERT ON THE ROAD, and that is a measurement requirement as much
+       * as a gameplay one. `over <= 0` writes nothing at all — not a zero, not
+       * a multiply by one — so every on-road number stays bit-identical to the
+       * build before this block and `slip-check`'s exact-zero gate still holds.
+       */
+      {
+        const lateral = centreLocation.lateral
+        const side: -1 | 1 = lateral >= 0 ? 1 : -1
+        const limit = track.wallLimit(centreLocation.t, side)
+        /*
+         * NON-FINITE IS FREE SPACE, and this guard is load-bearing rather than
+         * defensive. The contract returns Infinity where a section has no wall
+         * — the dune sweep's outside is a 0.7 m berm 50 m out, and stopping a
+         * kart dead against that in open desert is worse than no wall. It also
+         * catches the harness case: `scratchpad/pull.mjs` and `bench.mjs`
+         * hand-roll a synthetic `ITrack` and call `createKart` directly, so an
+         * implementation that predates this method returns `undefined`, and
+         * `undefined` arithmetic is `NaN` with NO type error anywhere. Without
+         * the guard `over > 0` is false forever (barrier silently dead) or, one
+         * sign flip away, true everywhere (kart welded to the centreline).
+         */
+        if (Number.isFinite(limit)) {
+          // The kart has width: its shell touches the face `HALF_TRACK` before
+          // its centreline does.
+          const over = Math.abs(lateral) - (Math.abs(limit) - HALF_TRACK)
+          if (over > 0) {
+            position.addScaledVector(centreSample.right, -side * over)
+            // `locate` measures lateral along this same `right`, so the
+            // correction moves it by exactly `-side * over`. Written back
+            // rather than re-located: `surfaceAt` two lines below must see the
+            // kart where it now is, not where it briefly was.
+            centreLocation.lateral = lateral - side * over
+
+            /*
+             * CLOSING SPEED — the component of velocity into the face. The
+             * contract declares `'kart:wall': { kartId, speed }` and does not
+             * say which speed, and its neighbour `kart:land` carries
+             * `impactSpeed`, so this is a choice and it is stated here: the
+             * NORMAL component, positive only when the kart is actually moving
+             * into the wall. It is the number `fx/` wants — sparks and camera
+             * shake scale with how hard you hit, not with how fast you were
+             * travelling past. A kart brushing a wall at 30 m/s down a straight
+             * emits ~1 m/s and should.
+             */
+            const closingSpeed = velocity.dot(centreSample.right) * side
+            if (closingSpeed > 0) {
+              velocity.addScaledVector(
+                centreSample.right,
+                -side * closingSpeed * (1 + WALL_RESTITUTION),
+              )
+              /*
+               * Scrub scales with the closing speed, not with a flat factor.
+               * A flat multiply makes a glancing brush cost the same as a
+               * square hit, which reads as the wall being sticky and is the
+               * exact complaint every kart racer that gets this wrong earns.
+               * Here a 1 m/s graze keeps 98% of its speed and slides; a 15 m/s
+               * head-on keeps 70% of what the rebound left it.
+               */
+              const scrub = 1 - Math.min(WALL_SCRUB_MAX, closingSpeed * WALL_SCRUB_PER_MPS)
+              velocity.multiplyScalar(scrub)
+              /*
+               * THE THRESHOLD IS WHAT MAKES `wallHits` MEAN "HITS".
+               *
+               * The correction above runs every tick the kart is against the
+               * face, and while it is held there under steering the closing
+               * speed is a fraction of a m/s every tick. Measured: one 480-tick
+               * full-lock run into The Slot emitted 240 events — the counter
+               * was reporting TICKS IN CONTACT and calling them hits, which
+               * would have made `autoplay.mjs`'s wall-contact rate fiction the
+               * first time it ever printed a number, and would have had `fx/`
+               * spraying sparks for four seconds of a single scrape.
+               *
+               * 1 m/s is below anything a player would call a hit and above
+               * the per-tick residual of being pressed into rock.
+               */
+              if (closingSpeed >= WALL_EVENT_MIN_SPEED) {
+                ctx.events.emit('kart:wall', { kartId: identity.id, speed: closingSpeed })
+              }
+            }
+          }
+        }
+      }
+
       const previousSurface = state.surface
       state.surface = track.surfaceAt(centreLocation.t, centreLocation.lateral)
       if (state.surface !== previousSurface) {

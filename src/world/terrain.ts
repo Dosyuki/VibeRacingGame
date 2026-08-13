@@ -72,6 +72,25 @@ import { BARRIER_MARGIN, Surface } from '../types'
 import type { Ctx, ITrack, RNG, StartSlot, TrackLocation, TrackSample } from '../types'
 import { makeRockSurface } from '../render/procedural'
 /*
+ * The section table, the corner resolution, the talus repose run and the four
+ * noise fields that jitter them USED TO LIVE IN THIS FILE. They moved out the
+ * day a kart started colliding with what this file draws: `world/track.ts` has
+ * to answer `ITrack.wallLimit` from the same numbers, and a second copy of the
+ * envelope is a barrier that agrees with the rock today and drifts from it
+ * silently. `wall-profile.ts` says the rest; nothing here re-derives any of it.
+ */
+import {
+  CORRIDOR_CLEARANCE,
+  makeResolvedSection,
+  makeWallProfilePoint,
+  createWallNoise,
+  resolveSection,
+  ringNoise2,
+  wallProfileAt,
+  type Noise2,
+  type ResolvedSection,
+} from './wall-profile'
+/*
  * THE ONE THING THIS FILE IMPORTS FROM A SIBLING, AND WHY.
  *
  * `road.ts` and this file both used to draw the ground immediately beside the
@@ -253,33 +272,6 @@ const GYPSUM_CENTRE = 0.41
 const OXIDE_MIN = 0.4
 const OXIDE_MAX = 0.8
 
-/** §5c: talus at 32° repose. `run = height / tan(32°)`. */
-const TALUS_RUN_PER_METRE = 1 / Math.tan((32 * Math.PI) / 180)
-
-/*
- * EXTRA METRES BEYOND `halfWidth + BARRIER_MARGIN` THAT THE PROFILE MUST LEAVE
- * ALONE — and every one of them is derived, not chosen.
- *
- * `halfWidth + BARRIER_MARGIN` is the corridor, from the contract. Two
- * discretisation errors sit between that line and what this file actually
- * emits, and both are one-sided in the dangerous direction:
- *
- *   - The corridor is tested against STATIONS, 4.5 m apart, as a union of
- *     discs. A union of discs of radius R at spacing s under-covers the true
- *     tube around the polyline by `R - sqrt(R^2 - (s/2)^2)` in the gaps. At the
- *     tightest corridor on the lap (The Slot, R = 8.0 + 1.5 = 9.5 m) that is
- *     0.27 m.
- *   - The swept surface is a chord between two stations 4.5 m apart, and the
- *     road it must clear is a curve of radius >= 47.8 m (tools/track-check
- *     reports the minimum). The chord cuts inside the arc by the sagitta,
- *     4.5^2 / (8 * 47.8) = 0.053 m.
- *
- * 0.27 + 0.05 = 0.32, rounded up to 0.5 for the arithmetic to stay obviously
- * safe rather than exactly safe. This is not a tuning knob: raise the station
- * spacing and the first term grows as s^2 and this number has to be re-derived.
- */
-const CORRIDOR_CLEARANCE = 0.5
-
 /*
  * HEADROOM: how far above the road the corridor extends.
  *
@@ -365,25 +357,7 @@ function smoothstep(edge0: number, edge1: number, x: number): number {
   return t * t * (3 - 2 * t)
 }
 
-type Noise2 = (x: number, y: number) => number
 type Noise3 = (x: number, y: number, z: number) => number
-
-/**
- * PERIODIC noise over the lap.
- *
- * Sampling `noise(arcLength / wavelength)` does not wrap: `arc = 0` and
- * `arc = length` are different points in the field, so every field driving wall
- * height, erosion and band thickness would step discontinuously across the
- * start line. Walking a circle in the noise domain instead makes the whole
- * family exactly periodic in `t`, at the cost of one sin and one cos.
- *
- * `wavelength` is in metres of centreline; `lapLength` converts it to turns.
- */
-function ringNoise2(n: Noise2, t: number, lapLength: number, wavelength: number): number {
-  const a = t * Math.PI * 2
-  const r = lapLength / wavelength / (Math.PI * 2)
-  return n(Math.cos(a) * r, Math.sin(a) * r)
-}
 
 function ringNoise3(
   n: Noise3,
@@ -406,295 +380,6 @@ function angularSepDeg(a: number, b: number): number {
   let d = Math.abs(a - b) % 360
   if (d > 180) d = 360 - d
   return d
-}
-
-// ---------------------------------------------------------------------------
-// Section table — ART_DIRECTION §1
-// ---------------------------------------------------------------------------
-
-/**
- * Per-side values are `[left, right]` where "right" is the driver's right, i.e.
- * `+TrackSample.right`.
- *
- * `openOutside` and `bankWall` are resolved against the SAMPLED curvature and
- * bank rather than against a hard-coded side. §1 says the dune sweep is a
- * right-hander with no wall on the outside, and The Wall banks 20° — but this
- * file must not encode which way the real `track.ts` decided to lay those out.
- * Reading `curvature` and `bank` makes "outside" a derived fact. `hint` is the
- * fallback for a section that turns out nearly straight, and it is the only
- * place §1's stated handedness is assumed.
- */
-interface Section {
-  readonly name: string
-  readonly start: number
-  /** Crest height above the road, metres, `[left, right]`. */
-  readonly height: readonly [number, number]
-  /** Face base offset beyond `halfWidth`, metres, `[left, right]`. */
-  readonly setback: readonly [number, number]
-  /** Crest offset / base offset. < 1 overhangs inward; > 1 slopes back. */
-  readonly topScale: readonly [number, number]
-  /** Face curve exponent. > 1 keeps the base steep and slopes the top back. */
-  readonly facePower: number
-  /** Talus height as a fraction of wall height. §5c. */
-  readonly talusFrac: number
-  /** 0 = bare scree shoulder, 1 = sand shoulder. */
-  readonly sand: number
-  /** Gradient of the hinterland behind the crest. Low = plateau. */
-  readonly backGrade: number
-  /** 0..1 — how far the OUTSIDE of the corner opens out and drops its wall. */
-  readonly openOutside: number
-  /** 0..1 — how far the OUTSIDE instead becomes a tall tight retaining wall. */
-  readonly bankWall: number
-  /** -1 outside-is-left, +1 outside-is-right, 0 none. Used only when flat. */
-  readonly hint: -1 | 0 | 1
-}
-
-const SECTIONS: readonly Section[] = [
-  // Hardpan grid. Open enough for §1's sky occupancy floor at `grid`.
-  {
-    name: 'hardpan-grid',
-    start: 0.0,
-    height: [14, 12],
-    setback: [20, 24],
-    topScale: [1.55, 1.6],
-    facePower: 1.2,
-    talusFrac: 0.24,
-    sand: 0.3,
-    backGrade: 0.35,
-    openOutside: 0,
-    bankWall: 0,
-    hint: 0,
-  },
-  // Dune sweep. §1: sand shoulders both sides, no wall on the outside.
-  {
-    name: 'dune-sweep',
-    start: 0.11,
-    height: [12, 12],
-    setback: [26, 26],
-    topScale: [1.9, 1.9],
-    facePower: 1.05,
-    talusFrac: 0.4,
-    sand: 0.85,
-    backGrade: 0.3,
-    openOutside: 0.92,
-    bankWall: 0,
-    hint: -1,
-  },
-  // Strata esses. §1: a 34 m face with all six bands legible. The `strata-wall`
-  // vantage is graded here and nowhere else.
-  {
-    name: 'strata-esses',
-    start: 0.23,
-    height: [34, 31],
-    setback: [13, 15],
-    topScale: [1.28, 1.3],
-    facePower: 1.3,
-    talusFrac: 0.26,
-    sand: 0.1,
-    backGrade: 0.4,
-    openOutside: 0,
-    bankWall: 0,
-    hint: 0,
-  },
-  /*
-   * The Slot. `topScale` 0.34 is the whole section.
-   *
-   * §1 asks for 26 m walls and sky reduced to a 9° strip. Those two numbers are
-   * only compatible if the walls LEAN IN: with a base 8 m off the centreline and
-   * a vertical face, 26 m up the gap is 16 m wide and subtends 34°, not 9°. At
-   * `topScale` 0.34 the crests close to about 2.7 m each side and the strip lands
-   * near 11°, which is as close as this gets without the roof meeting itself.
-   *
-   * Nothing overhangs below 4 m, so a kart at the barrier line never touches
-   * it. That was a claim about this table's numbers and nothing enforced it;
-   * `CORRIDOR_HEADROOM` is now that 4 m, and `corridorMinU` is what holds the
-   * lean above it. The lap sweep found 0.60 m of basal shale inside the barrier
-   * line here at ride height while this sentence was still true of the table —
-   * the erosion field had moved the face after the table had spoken.
-   */
-  {
-    name: 'the-slot',
-    start: 0.35,
-    height: [26, 26],
-    setback: [2.4, 2.4],
-    topScale: [0.34, 0.34],
-    facePower: 1.35,
-    talusFrac: 0.1,
-    sand: 0.05,
-    backGrade: 0.12,
-    openOutside: 0,
-    bankWall: 0,
-    hint: 0,
-  },
-  // Mesa climb. Everything gets out of the way: §1 wants the longest sightline
-  // on the lap and five silhouette layers, and a 34 m wall 13 m out kills both.
-  {
-    name: 'mesa-climb',
-    start: 0.44,
-    height: [10, 8],
-    setback: [42, 50],
-    topScale: [2.0, 2.1],
-    facePower: 0.95,
-    talusFrac: 0.45,
-    sand: 0.55,
-    backGrade: 0.5,
-    openOutside: 0,
-    bankWall: 0,
-    hint: 0,
-  },
-  // The Wall. The outside of the bank gets a near-vertical retaining face that
-  // the banked road runs up against; the inside opens.
-  {
-    name: 'the-wall',
-    start: 0.57,
-    height: [12, 12],
-    setback: [16, 16],
-    topScale: [1.3, 1.3],
-    facePower: 1.15,
-    talusFrac: 0.22,
-    sand: 0.2,
-    backGrade: 0.38,
-    openOutside: 0.35,
-    bankWall: 0.9,
-    hint: -1,
-  },
-  // Wash descent. A dry riverbed: low cut banks, deep loose scree.
-  {
-    name: 'wash-descent',
-    start: 0.69,
-    height: [11, 13],
-    setback: [11, 9],
-    topScale: [1.55, 1.5],
-    facePower: 1.1,
-    talusFrac: 0.5,
-    sand: 0.45,
-    backGrade: 0.35,
-    openOutside: 0,
-    bankWall: 0,
-    hint: 0,
-  },
-  // Arch tunnel. This builds the gorge, not the roof — see the file header.
-  {
-    name: 'arch-tunnel',
-    start: 0.83,
-    height: [24, 24],
-    setback: [3.2, 3.2],
-    topScale: [0.62, 0.62],
-    facePower: 1.3,
-    talusFrac: 0.12,
-    sand: 0.05,
-    backGrade: 0.15,
-    openOutside: 0,
-    bankWall: 0,
-    hint: 0,
-  },
-]
-
-/** Half-width in `t` of the cross-fade between adjacent sections. */
-const SECTION_BLEND = 0.018
-
-interface ResolvedSection {
-  /** `[left, right]`. */
-  readonly height: [number, number]
-  readonly setback: [number, number]
-  readonly topScale: [number, number]
-  facePower: number
-  readonly talusFrac: [number, number]
-  readonly sand: [number, number]
-  backGrade: number
-}
-
-function sectionIndexAt(t: number): number {
-  let i = 0
-  for (let k = 0; k < SECTIONS.length; k++) if (t >= SECTIONS[k]!.start) i = k
-  return i
-}
-
-/**
- * Blend the section table at `t`, then resolve the per-side corner terms from
- * the sampled curvature and bank.
- *
- * Writes into `out` — this runs once per station per build, so it is not a hot
- * path, but the shape of the data wants a fixed object anyway.
- */
-function resolveSection(t: number, curvature: number, bank: number, out: ResolvedSection): void {
-  const n = SECTIONS.length
-  const i = sectionIndexAt(t)
-  const prevB = SECTIONS[i]!.start
-  const nextB = i + 1 < n ? SECTIONS[i + 1]!.start : 1
-  const dPrev = t - prevB
-  const dNext = nextB - t
-
-  let other = i
-  let w = 1
-  if (dPrev < SECTION_BLEND) {
-    other = (i - 1 + n) % n
-    w = 0.5 + 0.5 * smoothstep(0, 1, dPrev / SECTION_BLEND)
-  } else if (dNext < SECTION_BLEND) {
-    other = (i + 1) % n
-    w = 0.5 + 0.5 * smoothstep(0, 1, dNext / SECTION_BLEND)
-  }
-
-  const a = SECTIONS[other]!
-  const b = SECTIONS[i]!
-
-  for (let s = 0; s < 2; s++) {
-    out.height[s] = lerp(a.height[s]!, b.height[s]!, w)
-    out.setback[s] = lerp(a.setback[s]!, b.setback[s]!, w)
-    out.topScale[s] = lerp(a.topScale[s]!, b.topScale[s]!, w)
-    out.talusFrac[s] = lerp(a.talusFrac, b.talusFrac, w)
-    out.sand[s] = lerp(a.sand, b.sand, w)
-  }
-  out.facePower = lerp(a.facePower, b.facePower, w)
-  out.backGrade = lerp(a.backGrade, b.backGrade, w)
-
-  const openOutside = lerp(a.openOutside, b.openOutside, w)
-  const bankWall = lerp(a.bankWall, b.bankWall, w)
-  const hint = w > 0.5 ? b.hint : a.hint
-
-  /*
-   * Which side is the outside of this corner.
-   *
-   * `curvature > 0` curves right (contract), so the outside is the driver's
-   * LEFT. `bank > 0` banks the road down toward the driver's right, which puts
-   * the high — outside — edge on the left as well. The two agree, so they can be
-   * maxed together: whichever signal is stronger wins, and a section with
-   * neither falls back to §1's stated handedness through `hint`.
-   *
-   * 160 is the curvature gain: it saturates at about a 90 m radius, so a
-   * genuinely fast sweeper still reads as a corner instead of a straight.
-   */
-  const curvSign = clamp(curvature * 160, -1, 1)
-  const bankSign = clamp(bank * 6, -1, 1)
-  let wl = Math.max(0, curvSign, bankSign)
-  let wr = Math.max(0, -curvSign, -bankSign)
-  if (wl + wr < 0.3 && hint !== 0) {
-    if (hint < 0) wl = 0.6
-    else wr = 0.6
-  }
-  const outside: [number, number] = [wl, wr]
-
-  for (let s = 0; s < 2; s++) {
-    const ow = outside[s]! * openOutside
-    if (ow > 0) {
-      // §1 dune sweep: sand shoulders and no wall on the outside. The wall does
-      // not vanish — it collapses into a low dune berm, so the horizon still has
-      // an edge and the §9b variance floor still has something to sit on.
-      out.height[s] = out.height[s]! * (1 - 0.94 * ow)
-      out.setback[s] = out.setback[s]! + 26 * ow
-      out.sand[s] = lerp(out.sand[s]!, 0.95, ow)
-      out.talusFrac[s] = lerp(out.talusFrac[s]!, 0.66, ow)
-      out.topScale[s] = lerp(out.topScale[s]!, 2.6, ow)
-    }
-    const bw = outside[s]! * bankWall
-    if (bw > 0) {
-      out.height[s] = lerp(out.height[s]!, 26, bw)
-      out.setback[s] = lerp(out.setback[s]!, 2.6, bw)
-      out.topScale[s] = lerp(out.topScale[s]!, 1.02, bw)
-      out.talusFrac[s] = lerp(out.talusFrac[s]!, 0.1, bw)
-      out.sand[s] = lerp(out.sand[s]!, 0.08, bw)
-    }
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -968,13 +653,21 @@ export function buildCanyonTerrain(
   rock.roughnessMap.repeat.set(1, 1)
 
   const fieldRng = ctx.rngFor('world/terrain/fields')
+  /*
+   * The four envelope fields come from `wall-profile.ts` rather than being
+   * forked here, so that the barrier `world/track.ts` reports and the rock this
+   * file sweeps are driven by the SAME field objects, not by two independently
+   * forked copies that happen to agree. The fork names are unchanged, so every
+   * vertex this file has ever produced is bit-identical.
+   */
+  const wallNoise = createWallNoise(ctx)
   const fields: Fields = {
-    crestLow: createNoise2D(fieldRng.fork('crest-low')),
-    crestHigh: createNoise2D(fieldRng.fork('crest-high')),
-    notch: createNoise2D(fieldRng.fork('notch')),
+    crestLow: wallNoise.crestLow,
+    crestHigh: wallNoise.crestHigh,
+    notch: wallNoise.notch,
     bandThickness: createNoise2D(fieldRng.fork('band-thickness')),
     seamThickness: createNoise2D(fieldRng.fork('seam-thickness')),
-    setback: createNoise2D(fieldRng.fork('setback')),
+    setback: wallNoise.setback,
     erode: createNoise3D(fieldRng.fork('erode')),
     mottle: createNoise3D(fieldRng.fork('mottle')),
     varnish: createNoise3D(fieldRng.fork('varnish')),
@@ -1336,15 +1029,8 @@ function sampleStations(
     bank: 0,
     curvature: 0,
   }
-  const resolved: ResolvedSection = {
-    height: [0, 0],
-    setback: [0, 0],
-    topScale: [1, 1],
-    facePower: 1,
-    talusFrac: [0, 0],
-    sand: [0, 0],
-    backGrade: 0.35,
-  }
+  const resolved: ResolvedSection = makeResolvedSection()
+  const profile = makeWallProfilePoint()
 
   const seamV = new Vector3()
   const out: Station[] = []
@@ -1392,49 +1078,19 @@ function sampleStations(
     const baseY: [number, number] = [0, 0]
 
     for (let side = 0; side < 2; side++) {
-      // Crest line. Two octaves plus an occasional notch — §1 Trap 4 is about
-      // mesas, but a crest that is a smooth offset of the road is the same
-      // failure at a different scale.
-      const phase = side === 0 ? 0 : 0.5
-      const nLow = ringNoise2(fields.crestLow, t + phase, lapLength, 70)
-      const nHigh = ringNoise2(fields.crestHigh, t + phase, lapLength, 22)
-      const notch = smoothstep(0.55, 0.95, 1 - Math.abs(ringNoise2(fields.notch, t + phase, lapLength, 150)))
-      let h = resolved.height[side]! * (1 + nLow * 0.22 + nHigh * 0.09)
-      h *= 1 - notch * 0.38
-      h = Math.max(0.6, h)
-      wallH[side] = h
-
-      // Face base sits at halfWidth + setback, jittered. The talus then runs
-      // DOWN and IN from there at the §5c 32° repose angle, so the toe is what
-      // moves when there is not enough room — never the face.
-      const setJitter = ringNoise2(fields.setback, t + phase * 1.7, lapLength, 55) * 0.16
-      const base = halfWidth + Math.max(0.6, resolved.setback[side]! * (1 + setJitter))
-      let tH = Math.min(resolved.talusFrac[side]! * h, 7)
-      let run = tH * TALUS_RUN_PER_METRE
       /*
-       * BARRIER_MARGIN is the shoulder a kart may legally be on. Nothing this
-       * module emits starts inboard of it — and that used to be a comment over
-       * `BARRIER_MARGIN * 0.4`, which let the scree toe sit 0.6 m off the road
-       * on a 1.5 m margin. The comment was right and the code was not; a kart
-       * inside its own legal run-off was inside a talus slope. Full margin.
-       *
-       * Plus CORRIDOR_CLEARANCE, and that is not belt-and-braces. This is a
-       * STATION, 4.5 m from its neighbours, and the road it must clear is a
-       * curve; a toe placed at exactly `halfWidth + BARRIER_MARGIN` here
-       * measures up to 0.32 m INSIDE the barrier line when it is projected back
-       * through `ITrack.locate` from a point between stations. The lap sweep
-       * measured 0.08 m of exactly that before this term existed. The clearance
-       * is the discretisation error, derived where it is declared.
+       * The crest noise, the setback jitter, the 32° talus run and the
+       * `minToe` clamp used to be forty lines here. They are now one call, and
+       * `ITrack.wallLimit` makes the identical one. That is the point: the
+       * barrier a kart hits is not "derived the same way" as this rock, it is
+       * the same arithmetic on the same fields.
        */
-      const minToe = halfWidth + BARRIER_MARGIN + CORRIDOR_CLEARANCE
-      if (base - run < minToe) {
-        run = Math.max(0, base - minToe)
-        tH = run / TALUS_RUN_PER_METRE
-      }
-      talusH[side] = tH
-      toeU[side] = base - run
-      faceBaseU[side] = base
-      faceTopU[side] = Math.max(0.8, base * resolved.topScale[side]!)
+      wallProfileAt(t, lapLength, halfWidth, resolved, side as 0 | 1, fields, profile)
+      wallH[side] = profile.height
+      talusH[side] = profile.talusHeight
+      toeU[side] = profile.toe
+      faceBaseU[side] = profile.faceBase
+      faceTopU[side] = Math.max(0.8, profile.faceBase * resolved.topScale[side]!)
 
       // The seam, taken whole from its owner. `spacing` is this module's
       // station spacing and is the only input road.ts cannot already see; it is
@@ -2910,6 +2566,25 @@ export interface OvalTrackOptions {
 }
 
 const _fx = { x: 0, z: 0, tx: 0, tz: 0, curv: 0 }
+const _ovalResolved = makeResolvedSection()
+const _ovalProfile = makeWallProfilePoint()
+/*
+ * The fixture's stand-in for the envelope noise. See the note on its
+ * `wallLimit`.
+ *
+ * `notch` returns 1, not 0, and that is not a typo. The notch term is
+ * `smoothstep(0.55, 0.95, 1 - |noise|)`, so a field of zeros reads as a notch
+ * at FULL depth everywhere and quietly shortens every wall on the fixture by
+ * 38%. "Unmodulated" is |noise| = 1 for that one field and 0 for the others.
+ */
+const _zeroNoise: Noise2 = () => 0
+const _oneNoise: Noise2 = () => 1
+const FLAT_WALL_NOISE = {
+  crestLow: _zeroNoise,
+  crestHigh: _zeroNoise,
+  notch: _oneNoise,
+  setback: _zeroNoise,
+}
 const _tan = new Vector3()
 const _rgt = new Vector3()
 const _nrm = new Vector3()
@@ -3066,6 +2741,27 @@ export function makeOvalTrack(options: OvalTrackOptions = {}): ITrack {
       if (a > hw - 0.6) return Surface.Kerb
       if (a > hw - 2.2) return Surface.SandDrift
       return Surface.DustyAsphalt
+    },
+
+    /*
+     * The fixture answers `wallLimit` from the SAME `wall-profile.ts` the real
+     * circuit does — the table, the corner resolution and the talus run all
+     * apply to any `ITrack`, and this one exists precisely to exercise them
+     * where the half-width changes 2:1 and "outside" swaps sides mid-lap.
+     *
+     * What it cannot share is the noise: `createWallNoise` needs a `Ctx` and
+     * this fixture takes none, by design — it is constructed by harnesses that
+     * have no world seed. The un-jittered envelope is therefore what it
+     * reports, and it says so rather than pretending: a fixture whose barrier
+     * is a few per cent off the fixture's own rock is fine, because nothing
+     * grades the fixture's rock.
+     */
+    wallLimit(t: number, side: -1 | 1): number {
+      const tw = wrap(t)
+      frame(tw)
+      resolveSection(tw, _fx.curv, 0, _ovalResolved)
+      wallProfileAt(tw, length, halfWidthAt(tw), _ovalResolved, side > 0 ? 1 : 0, FLAT_WALL_NOISE, _ovalProfile)
+      return side * _ovalProfile.barrier
     },
 
     racingLine(t: number): number {

@@ -89,6 +89,19 @@ import type {
   TrackSample,
 } from '../types'
 import { buildRoad, disposeRoad } from './road'
+/*
+ * `wallLimit` has to answer where the ROCK is, and the rock is `terrain.ts`'s
+ * to draw. Neither file may own the answer alone: a barrier derived here and a
+ * face swept there would agree on the day they were written and nowhere after.
+ * The envelope therefore lives in one module that both read.
+ */
+import {
+  createWallNoise,
+  makeResolvedSection,
+  makeWallProfilePoint,
+  resolveSection,
+  wallProfileAt,
+} from './wall-profile'
 
 const DEG = Math.PI / 180
 
@@ -1099,6 +1112,37 @@ export const createTrack: TrackFactory = (ctx: Ctx): ITrack & Subsystem => {
 
   const racingLineAt = (t: number): Metres => lerpAt(racing, t)
 
+  // --- the collidable canyon face ------------------------------------------
+  /*
+   * `wallLimit` is `surfaceAt`'s neighbour on the MUST NOT ALLOCATE list, and
+   * unlike `surfaceAt` it evaluates four simplex octaves. Scratch objects are
+   * built once here; `resolveSection` and `wallProfileAt` write into them.
+   *
+   * Both take t in [0,1) and read the same `curvature` and `bank` the terrain
+   * builder gets from `sample`, because "which side is the outside of this
+   * corner" is resolved from those two and nothing else. Sampling them through
+   * `lerpAt` rather than calling `sample` avoids touching the Vector3s.
+   */
+  const wallNoise = createWallNoise(ctx)
+  const wallResolved = makeResolvedSection()
+  const wallProfile = makeWallProfilePoint()
+
+  const wallLimitAt = (t: number, side: -1 | 1): Metres => {
+    const w = wrap01(t)
+    const hw = lerpAt(halfWidth, w)
+    resolveSection(w, lerpAt(curvature, w), lerpAt(bank, w), wallResolved)
+    // `Section`'s pairs are `[left, right]`; the contract's `side` is the
+    // steering sign, -1 for the driver's left. One mapping, stated once.
+    wallProfileAt(w, length, hw, wallResolved, side > 0 ? 1 : 0, wallNoise, wallProfile)
+    /*
+     * `Infinity * side` is `±Infinity`, which is the contract's "no barrier".
+     * It is deliberately NOT collapsed to a large finite number: a caller that
+     * clamps to a large number puts an invisible wall in open desert, and the
+     * docblock requires the non-finite answer to be distinguishable.
+     */
+    return side * wallProfile.barrier
+  }
+
   /** `[t0, t1, lat0, lat1]` per pad, lateral resolved against the ideal line. */
   const pads = new Float64Array(BOOST_PADS.length * 4)
   for (let i = 0; i < BOOST_PADS.length; i++) {
@@ -1477,6 +1521,8 @@ export const createTrack: TrackFactory = (ctx: Ctx): ITrack & Subsystem => {
     },
 
     racingLine: racingLineAt,
+
+    wallLimit: wallLimitAt,
 
     build(): void {
       group.add(
