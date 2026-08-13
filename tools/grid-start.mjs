@@ -31,12 +31,18 @@
  * `activate()` calls the same `race.start()`). Everything it asserts has to come
  * out of that state.
  *
- * Two harness calls are made DURING the run, both after the measurements that
- * could be affected by them, and both are named where they happen:
+ * Harness calls are made DURING the run, all after the measurements that could
+ * be affected by them, and all are named where they happen:
  *   - `setDriver(playerKartId, 'referenceAI')` at GO+8 s, so the player kart
  *     eventually leaves the grid and the camera can be measured against a MOVING
  *     kart and across the t=0 seam. Everything check 4 asserts about the resting
  *     player is already measured by then. It repositions nothing.
+ *   - `injectInput('keyboard', ...)` during the countdown, which PRESSES A KEY:
+ *     a real `KeyboardEvent` through `core/input.ts`, the same path a player's
+ *     ArrowUp takes. It repositions nothing either, and the key is released
+ *     0.6 s before GO so the player kart is still at exact rest when
+ *     `launch-player` looks at it. This is what closed the player half of
+ *     `countdown-hold`; see the injection block for why `setInput` could not.
  * Nothing else touches the world.
  *
  * WHAT IT ASSERTS
@@ -75,7 +81,11 @@
  *                     a human found the field driving through 3-2-1 while the
  *                     three checks above were all green: they grade the phases,
  *                     the timing and the clock, and none of them ever asked
- *                     whether a kart moved.
+ *                     whether a kart moved. Its PLAYER half is graded from a
+ *                     REAL INJECTED KEYPRESS — full throttle and full lock held
+ *                     through the lights — against a kart that acts on exactly
+ *                     0.000000 of it. Commanded lock, acted-on zero: that is the
+ *                     gate, not an absence of driving.
  *   launch-field      Every AI kart accelerates away, against a known-good
  *                     reference measured from the real game.
  *   launch-player     The player kart is at EXACTLY zero with no input. This is
@@ -321,6 +331,18 @@ const TOL = {
    * looks like.
    */
   countdownSpeed: 0.05,
+  /**
+   * Seconds before GO at which the injected key is RELEASED.
+   *
+   * The player kart is held by the gate, not by the absence of a command, so the
+   * moment the gate opens a still-held throttle would launch it — and
+   * `launch-player` asserts the player is at EXACTLY rest at GO+1s with nothing
+   * injected, which is a claim worth keeping. Releasing 0.6 s early costs a
+   * dozen graded samples out of ~48 and leaves the keyboard rack, whose release
+   * ramp is 111 ms centre-to-lock (`core/input.ts:STEER_RELEASE_PER_SEC`), five
+   * ramp-lengths of margin to reach zero before the lights go out.
+   */
+  injectReleaseSeconds: 0.6,
 
   // --- check 4: the launch ------------------------------------------------
   /**
@@ -802,6 +824,15 @@ async function battery(opts) {
   let holdSamples = 0
   /** Largest throttle any driver COMMANDED during the countdown. See below. */
   let holdCommandPeak = 0
+  /*
+   * THE PLAYER HALF OF countdown-hold. Every one of these is a real keyboard
+   * frame pushed through `core/input.ts` by `HarnessAPI.injectInput` — see the
+   * injection block inside the loop for why nothing else will do.
+   */
+  const injectRuns = []
+  let injectError = null
+  let injectPending = false
+  let injectHeld = false
   let windowStartTick = startTick
   const metresThisSecond = {}
   for (const id of kartIds) metresThisSecond[id] = 0
@@ -930,6 +961,83 @@ async function battery(opts) {
             `kart ${r.id} is doing ${f(spd)} m/s at ${f((tick - startTick) * STEP, 2)} s after START, ` +
             `clock ${f(tel.clock, 2)} s — a standing start is standing (max ${TOL.countdownSpeed} m/s)`)
         }
+      }
+    }
+
+    // --- the injected keypress ---------------------------------------------
+    /*
+     * THE PLAYER HALF OF countdown-hold, WHICH WAS A PENDING UNTIL THIS EXISTED.
+     *
+     * The seven AI karts prove the gate by direct measurement: they are under a
+     * driver that would otherwise drive, so "commanded throttle, moved 0.000 m"
+     * is the gate visibly holding something. The player was in mode 'human' with
+     * NO KEYBOARD in a headless run, so its row read 0 m/s whether the gate
+     * existed or not — a row that is evidence of nothing, sitting in the middle
+     * of a table that looks like evidence.
+     *
+     * `setInput` cannot close it. It switches the player to 'scripted', and
+     * 'scripted' bypasses the countdown gate BY DESIGN (`main.ts`
+     * :inputReachesKart) so that a harness which has seized the controls is
+     * never silently overridden. Injecting there measures the bypass and passes
+     * identically on a build with no gate at all.
+     *
+     * `injectInput` is the real keyboard: a `KeyboardEvent` dispatched at
+     * `window`, through `classifyKey`, the steering rack and the device
+     * arbitration, into `input.frame`, which is what a player's ArrowUp does.
+     * So the player is now commanding full throttle and full right lock while
+     * the lights are on, and TWO independent readings grade it:
+     *
+     *   - `lastInput(player).throttle > 0` — the command reached the driver, so
+     *     the assertions below are not vacuous.
+     *   - `InputLatencySample.effectiveSteer === 0` while that command is
+     *     non-zero — `main.ts` fills that field with the steer the kart ACTUALLY
+     *     ACTED ON, gated. Commanded lock against an acted-on zero IS the gate,
+     *     read straight off the harness surface. On a build with no gate the two
+     *     numbers are equal and this fires.
+     *
+     * It costs one extra tick per injection, which is why it is done after every
+     * measurement in this iteration rather than before them.
+     */
+    if (!injectPending && !injectError && tel.phase === 'countdown' &&
+        tel.clock < -TOL.injectReleaseSeconds) {
+      try {
+        const at = performance.now()
+        const s = await h.injectInput('keyboard', { throttle: 1, steer: 1 }, at)
+        injectHeld = true
+        let li = null
+        try { li = h.lastInput(playerId) } catch (err) { li = null }
+        const ks = h.kartSnapshot(playerId)
+        const base = holdBase[playerId]
+        const after = h.telemetry()
+        const p = ks ? v(ks.position.x, ks.position.y, ks.position.z) : null
+        injectRuns.push({
+          tick: s.sampledTick,
+          clock: after.clock,
+          phase: after.phase,
+          kind: s.kind,
+          latencyMs: s.receivedAtMs - s.injectedAtMs,
+          effectiveSteer: s.effectiveSteer,
+          stunned: s.stunned,
+          commandedSteer: li ? li.steer : null,
+          commandedThrottle: li ? li.throttle : null,
+          speed: ks ? ks.speed : null,
+          drift: p && base ? lenXZ(sub(p, base.pos)) : null,
+        })
+      } catch (err) {
+        const msg = String((err && err.message) || err)
+        if (msg.indexOf('is not available yet') >= 0) injectPending = true
+        else injectError = msg
+      }
+    } else if (injectHeld &&
+               (tel.phase !== 'countdown' || tel.clock >= -TOL.injectReleaseSeconds)) {
+      // Release before GO. A held throttle at the moment the gate opens would
+      // launch the player kart and turn `launch-player` — "at EXACTLY rest with
+      // no input" — into a check about this harness rather than about the game.
+      try {
+        await h.injectInput('keyboard', { throttle: 0, steer: 0, brake: 0, drift: false, look: 0 }, performance.now())
+        injectHeld = false
+      } catch (err) {
+        injectError = String((err && err.message) || err)
       }
     }
 
@@ -1294,6 +1402,62 @@ async function battery(opts) {
    */
   if (holdCommandPeak <= 0) checks['countdown-hold'].measured = 0
 
+  /*
+   * ---- countdown-hold, THE PLAYER HALF -----------------------------------
+   *
+   * Graded here rather than in the loop so that the whole series of injections
+   * is available and a single flake cannot be read as a policy. Every failure
+   * below is a different way for the same claim to be false: A REAL KEY PRESSED
+   * BY A PLAYER DURING THE COUNTDOWN REACHES THE PLAYER'S DRIVER AND MOVES
+   * NOTHING.
+   */
+  let injectSteerLeak = 0
+  let injectCommandPeak = 0
+  let injectSpeedPeak = 0
+  let injectDriftPeak = 0
+  let latencySum = 0
+  let latencyWorst = 0
+  if (injectError) {
+    saw('countdown-hold')
+    bump('countdown-hold', 1,
+      `a real keyboard frame could not be pushed into the player kart during the countdown: ${injectError}`)
+  }
+  for (const r of injectRuns) {
+    if (r.commandedThrottle > injectCommandPeak) injectCommandPeak = r.commandedThrottle
+    if (Math.abs(r.effectiveSteer) > injectSteerLeak) injectSteerLeak = Math.abs(r.effectiveSteer)
+    if (Math.abs(r.speed) > injectSpeedPeak) injectSpeedPeak = Math.abs(r.speed)
+    if (r.drift !== null && r.drift > injectDriftPeak) injectDriftPeak = r.drift
+    if (isFinite(r.latencyMs)) {
+      latencySum += r.latencyMs
+      if (r.latencyMs > latencyWorst) latencyWorst = r.latencyMs
+    }
+
+    saw('countdown-hold', 4)
+    if (!(r.commandedThrottle > 0)) {
+      bump('countdown-hold', 1,
+        `an injected ArrowUp at clock ${f(r.clock, 2)} s produced a commanded throttle of ` +
+        `${f(r.commandedThrottle)} on the PLAYER kart — the key never reached the driver, so every ` +
+        `"the player did not move" reading in this run is evidence of nothing`)
+    }
+    if (r.kind !== 'keyboard') {
+      bump('countdown-hold', 1,
+        `the injected frame was owned by device '${r.kind}', not 'keyboard' — another device took the ` +
+        `frame off the player's keyboard, which is the bug a human reported as "it turns right by ` +
+        `itself and then I can't control anything"`)
+    }
+    if (Math.abs(r.effectiveSteer) > 1e-9) {
+      bump('countdown-hold', Math.abs(r.effectiveSteer),
+        `the player commanded steer ${f(r.commandedSteer)} at clock ${f(r.clock, 2)} s and the kart ` +
+        `ACTED ON ${f(r.effectiveSteer)} of it — the countdown gate is not holding the player's real ` +
+        `keyboard (it must act on exactly 0 while the lights are on)`)
+    }
+    if (Math.abs(r.speed) > TOL.countdownSpeed) {
+      bump('countdown-hold', Math.abs(r.speed),
+        `the player kart is doing ${f(r.speed)} m/s at clock ${f(r.clock, 2)} s with a real ArrowUp ` +
+        `held (max ${TOL.countdownSpeed} m/s)`)
+    }
+  }
+
   // ---- ticksWithoutProgress behaves --------------------------------------
   /*
    * NOT GATED ON ITS VALUE, per the header and per `autoplay.mjs:397-416`.
@@ -1413,6 +1577,19 @@ async function battery(opts) {
       countdownHold: {
         samples: holdSamples,
         commandPeak: holdCommandPeak,
+        player: {
+          injected: injectRuns.length,
+          pending: injectPending,
+          error: injectError,
+          commandPeak: injectCommandPeak,
+          steerLeak: injectSteerLeak,
+          speedPeak: injectSpeedPeak,
+          driftPeak: injectDriftPeak,
+          latencyMeanMs: injectRuns.length ? latencySum / injectRuns.length : null,
+          latencyWorstMs: injectRuns.length ? latencyWorst : null,
+          first: injectRuns[0] || null,
+          last: injectRuns[injectRuns.length - 1] || null,
+        },
         karts: kartIds.map((id) => ({
           id: id, drift: holdWorst[id].drift, dY: holdWorst[id].dY,
           speed: holdWorst[id].speed, samples: holdWorst[id].samples,
@@ -1625,6 +1802,29 @@ function gridStartSabotage(spec) {
         k.position.z + smp.tangent.z * 0.5 * (1 / 120),
       )
     })
+  } else if (spec.kind === 'player-deaf') {
+    /*
+     * THE PLAYER'S KEYBOARD IS SWALLOWED BY THE INPUT PATH.
+     *
+     * Channel 3: the real `injectInput` replaced by an honestly-wrong version of
+     * itself, one that pushes an EMPTY frame and reports on that. Nothing else
+     * about the game is touched — the countdown gate still works, the karts
+     * still hold, every position and speed reading in the run is unchanged.
+     *
+     * This is the sabotage for what the player half of `countdown-hold` newly
+     * asserts, and it is aimed at the failure that half exists to catch: a run
+     * in which nothing was ever asking to move, so "the player did not move"
+     * is true for a reason that has nothing to do with the gate. It is also a
+     * real bug class rather than an invented one — a device losing the frame is
+     * exactly what a human reported as "it turns right by itself and then I
+     * can't control anything", and every harness in this project was blind to it
+     * by construction until `injectInput` existed.
+     *
+     * If the check has been weakened back to grading only movement, this
+     * sabotage changes no number in the run and is reported as a MISS.
+     */
+    const inject0 = h.injectInput.bind(h)
+    h.injectInput = (kind, frame, atMs) => inject0(kind, {}, atMs)
   } else if (spec.kind === 'field-asleep') {
     // Nobody launches.
     const t = tel0()
@@ -1842,6 +2042,8 @@ const SABOTAGES = [
     what: 'IRace.clock never reports a negative value' },
   { kind: 'countdown-drive', owner: 'countdown-hold', horizon: 5,
     what: 'kart 4 rolls forward at 0.5 m/s while the lights are still on' },
+  { kind: 'player-deaf', owner: 'countdown-hold', horizon: 5,
+    what: 'the injected keypress is swallowed, so the player commands nothing during the countdown' },
   { kind: 'field-asleep', owner: 'launch-field', horizon: 12,
     what: 'no AI kart launches' },
   { kind: 'one-kart-asleep', owner: 'launch-field', horizon: 12,
@@ -1965,6 +2167,33 @@ function printFacts(F) {
       L.push(
         `  kart ${g.id}   moved ${String(fmt(g.drift, 3)).padStart(8)} m  ` +
         `dY ${String(fmt(g.dY, 3)).padStart(6)} m  peak speed ${String(fmt(g.speed, 3)).padStart(7)} m/s`,
+      )
+    }
+    const P = CH.player || {}
+    if (P.pending) {
+      L.push(
+        '                PLAYER HALF PENDING — this build reports HarnessAPI.injectInput as not ' +
+        'available yet, so no key could be pressed and the player row above is evidence of nothing.',
+      )
+    } else if (P.error) {
+      L.push(`                PLAYER HALF FAILED to inject: ${P.error}`)
+    } else if (!P.injected) {
+      L.push('                PLAYER HALF NOT MEASURED — no injection landed inside the countdown.')
+    } else {
+      L.push(
+        `                PLAYER HALF, by real keypress: ${P.injected} keyboard frame(s) injected ` +
+        `through core/input.ts (ArrowUp + ArrowRight held) while the lights were on.`,
+      )
+      L.push(
+        `                commanded throttle peaked at ${fmt(P.commandPeak, 3)} and commanded steer at ` +
+        `${fmt((P.last || {}).commandedSteer, 3)}; the kart ACTED ON ${fmt(P.steerLeak, 6)} of that steer, ` +
+        `reached ${fmt(P.speedPeak, 4)} m/s and moved ${fmt(P.driftPeak, 4)} m. A commanded lock against ` +
+        `an acted-on zero is the countdown gate, read off the harness surface rather than inferred.`,
+      )
+      L.push(
+        `                input path latency (event received - injected): mean ` +
+        `${fmt(P.latencyMeanMs, 2)} ms, worst ${fmt(P.latencyWorstMs, 2)} ms, device '` +
+        `${(P.last || {}).kind}' — the injected frame won the device arbitration on every sample.`,
       )
     }
   }
@@ -2128,20 +2357,36 @@ try {
         'unmeasured rather than as a pass. A camera that never rotates passes a swing gate perfectly.',
       )
     }
-    pendings.push(
-      'countdown-hold, the PLAYER half — this check proves the countdown gate for the seven AI karts by ' +
-      'direct measurement, because they are under a driver that would otherwise drive. The player kart ' +
-      'is in mode \'human\' with no keyboard in a headless run, so it reads 0 m/s whether the gate exists ' +
-      'or not, and its row of the table is evidence of nothing on its own. It CANNOT be closed with ' +
-      '`setInput`: that switches the player to \'scripted\', and \'scripted\' bypasses the countdown gate ' +
-      'BY DESIGN (`main.ts:inputReachesKart`) so that a harness which has seized the controls is never ' +
-      'silently overridden. Injecting throttle here would therefore measure the bypass, not the gate, ' +
-      'and would pass identically on a build with no gate at all — a vacuous pass, which is the worst ' +
-      'output an instrument can produce. What covers the player is that the gate is ONE predicate ' +
-      'evaluated ahead of the driver-mode switch, so \'human\' and \'referenceAI\' cannot diverge, plus ' +
-      'the `countdown-drive` sabotage in --broken. Closing it properly needs a keyboard the harness can ' +
-      'press — `HarnessAPI.injectInput`, which this build reports as not available yet.',
-    )
+    /*
+     * THIS PENDING IS CLOSED WHEN A KEY WAS ACTUALLY PRESSED, AND ONLY THEN.
+     *
+     * It used to be unconditional, and its text explained at length why the
+     * player half of `countdown-hold` could not be measured: the player is in
+     * mode 'human' with no keyboard in a headless run, so it reads 0 m/s whether
+     * the gate exists or not, and `setInput` cannot substitute because
+     * 'scripted' bypasses the gate by design. `HarnessAPI.injectInput` is the
+     * thing that was missing. The condition below is what keeps this honest on a
+     * build where it goes away again — a PENDING that stops printing because the
+     * measurement stopped happening is the same output as one that was closed.
+     */
+    const playerHalf = (clean.facts.countdownHold || {}).player || {}
+    if (playerHalf.pending || playerHalf.error || !playerHalf.injected) {
+      pendings.push(
+        'countdown-hold, the PLAYER half — this check proves the countdown gate for the seven AI karts ' +
+        'by direct measurement, because they are under a driver that would otherwise drive. The player ' +
+        'kart is in mode \'human\', so with no key pressed it reads 0 m/s whether the gate exists or not ' +
+        'and its row of the table is evidence of nothing on its own. It CANNOT be closed with ' +
+        '`setInput`: that switches the player to \'scripted\', and \'scripted\' bypasses the countdown ' +
+        'gate BY DESIGN (`main.ts:inputReachesKart`), so injecting throttle there would measure the ' +
+        'bypass and pass identically on a build with no gate at all. Closing it needs a keyboard the ' +
+        'harness can press — `HarnessAPI.injectInput` — and on this run ' +
+        (playerHalf.pending
+          ? 'this build reports that method as not available yet.'
+          : playerHalf.error
+            ? `injection failed: ${playerHalf.error}`
+            : 'no injection landed inside the countdown.'),
+      )
+    }
     pendings.push(
       'the simultaneous eight-kart first corner — the player kart is correctly stationary through the ' +
       'launch window (that is check 4), so it reaches turn one alone, ~8 s behind the seven AI karts. ' +

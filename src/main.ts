@@ -61,6 +61,8 @@ import type {
   HarnessAPI,
   IKart,
   InputFrame,
+  InputKind,
+  InputLatencySample,
   KartIdentity,
   KartState,
   QualityTier,
@@ -455,6 +457,9 @@ const drivers: DriverSlot[] = karts.map((kart) => ({
   ai: createAIDriver(ctx, track, kart, { mode: 'drift' }),
 }))
 
+/** Index of the player kart in `karts`, resolved once. -1 if there is none. */
+const playerIndex = karts.findIndex((k) => k.identity.isPlayer)
+
 /** The frame each driver produced last tick, for `HarnessAPI.lastInput`. */
 const lastFrames: InputFrame[] = karts.map(() => ({
   steer: 0,
@@ -651,6 +656,25 @@ function inputReachesKart(index: number): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// Injected input — see `HarnessAPI.injectInput` at the bottom of this file
+// ---------------------------------------------------------------------------
+
+/**
+ * The receipt for one injected frame, filled in by the tick that consumed it.
+ *
+ * EVERY FIELD IS A SIMULATION QUANTITY: a tick number, a steer value, a
+ * boolean. No wall clock is read to fill it, which is what keeps `injectInput`
+ * on the right side of CLAUDE.md convention 2 — see the method itself.
+ */
+interface PendingInjection {
+  seen: boolean
+  sampledTick: number
+  effectiveSteer: number
+  stunned: boolean
+}
+let pendingInjection: PendingInjection | null = null
+
+// ---------------------------------------------------------------------------
 // Frame loop
 // ---------------------------------------------------------------------------
 
@@ -824,6 +848,30 @@ const loop = createLoop({
     }
 
     /*
+     * THE RECEIPT FOR AN INJECTED FRAME, TAKEN ON THE TICK THAT CONSUMED IT.
+     *
+     * `input.sample` ran at the top of this function, so by here the player's
+     * driver has already turned the injected device state into a command and
+     * `IKart.step` has already been handed whatever the countdown gate allowed
+     * through. This is therefore the only moment at which "the steer the kart
+     * actually acted on" exists, and it is recorded GATED — a countdown that
+     * holds the player reports 0 here against a non-zero `lastInput`, which is
+     * the gate being observable at the harness surface rather than inferred.
+     *
+     * Nothing here reads a clock. `sampledTick` is the tick counter, which is a
+     * simulation quantity; the wall-clock half of the latency sample is stamped
+     * outside the loop by the real event listener in `core/input.ts`.
+     */
+    if (pendingInjection && !pendingInjection.seen && playerIndex >= 0) {
+      pendingInjection.seen = true
+      pendingInjection.sampledTick = loop.clock.tick
+      pendingInjection.effectiveSteer = inputReachesKart(playerIndex)
+        ? lastFrames[playerIndex]!.steer
+        : 0
+      pendingInjection.stunned = karts[playerIndex]!.state.stunTime > 0
+    }
+
+    /*
      * `race` and `items` are stepped by their own `fixedUpdate` below, through
      * the subsystem loop. Calling `race.step` here as well ran the whole race
      * at double rate — the three-second countdown finished in 1.55 s, and every
@@ -906,6 +954,97 @@ loop.start()
 // ---------------------------------------------------------------------------
 // Harness surface
 // ---------------------------------------------------------------------------
+
+/**
+ * THE KEYS A PLAYER PRESSES, in `event.code`, which is what
+ * `core/input.ts:classifyKey` classifies.
+ *
+ * Duplicated here rather than imported, deliberately. `classifyKey` is a
+ * private mapping from a physical key to an intent; this is the inverse
+ * question — "which key would a player have to hold to ask for this frame" —
+ * and a harness that imported the game's own table could never catch the table
+ * being wrong. What makes the duplication safe is that `injectInput` ASSERTS
+ * the frame it asked for actually arrived, so a drift between the two tables
+ * fails loudly on the next run instead of silently injecting nothing.
+ */
+const INJECT_KEY_CODES = [
+  'ArrowLeft',
+  'ArrowRight',
+  'ArrowUp',
+  'ArrowDown',
+  'Space',
+  'KeyE',
+  'KeyC',
+  'KeyV',
+] as const
+
+/** The item key. Always released before an injection — see `dispatchKeyboard`. */
+const INJECT_ITEM_KEY = 'KeyE'
+
+/**
+ * The device state each injected `kind` is currently holding.
+ *
+ * A `Partial<InputFrame>` is merged onto THIS, not onto an idle frame, because
+ * that is what a physical device does: omitting `throttle` from an injection
+ * leaves the throttle key exactly where the player left it. A held key emits no
+ * further events, so the alternative — rebuilding the whole device state from
+ * every partial — would silently release keys the caller never mentioned.
+ */
+const injectedDevice: Record<InputKind, InputFrame> = {
+  keyboard: { ...idleFrame },
+  touch: { ...idleFrame },
+  gamepad: { ...idleFrame },
+}
+
+/** Which keys a frame implies are HELD DOWN right now. */
+function keysHeldFor(f: InputFrame): string[] {
+  const down: string[] = []
+  if (f.steer > 0) down.push('ArrowRight')
+  else if (f.steer < 0) down.push('ArrowLeft')
+  if (f.throttle > 0) down.push('ArrowUp')
+  if (f.brake > 0) down.push('ArrowDown')
+  if (f.drift) down.push('Space')
+  if (f.useItem) down.push(INJECT_ITEM_KEY)
+  if (f.look > 0) down.push('KeyV')
+  else if (f.look < 0) down.push('KeyC')
+  return down
+}
+
+/**
+ * Dispatch the real `KeyboardEvent`s that put the keyboard into the requested
+ * state, at `window`, where `core/input.ts` listens.
+ *
+ * These are not trusted events and they do not need to be: `core/input.ts`
+ * checks `isTrusted` nowhere, on purpose and with a comment saying so, precisely
+ * so that this path is the SAME path a player's keydown takes — the listener,
+ * `classifyKey`, `keyHeld`, `markEvent`, the steering rack's ramp and the device
+ * arbitration in `sample`. Anything that shortcut into `input.frame` would
+ * measure a mock of the input path rather than the input path.
+ *
+ * ORDER: releases first, then presses, so a steer reversal never has both
+ * direction keys down on the same tick.
+ *
+ * THE ITEM KEY IS ALWAYS RELEASED FIRST, even when the injection asks for it.
+ * `useItem` is a one-tick pulse fired on the key's rising edge and latched until
+ * the key comes back up, so injecting it twice running would produce exactly one
+ * pulse and the second call's assertion would fail against a working game. It
+ * has a second job: it guarantees that EVERY injection dispatches at least one
+ * event, so `IInput.lastEventAtMs` is never a stale reading left behind by an
+ * earlier one — which would report a flattering latency nobody could see was
+ * fiction.
+ */
+function dispatchKeyboard(f: InputFrame): void {
+  const down = keysHeldFor(f)
+  for (const code of INJECT_KEY_CODES) {
+    if (code !== INJECT_ITEM_KEY && down.includes(code)) continue
+    window.dispatchEvent(new KeyboardEvent('keyup', { code, bubbles: true, cancelable: true }))
+  }
+  for (const code of down) {
+    window.dispatchEvent(
+      new KeyboardEvent('keydown', { code, bubbles: true, cancelable: true, repeat: false }),
+    )
+  }
+}
 
 function notYet(what: string): never {
   throw new Error(
@@ -1030,7 +1169,200 @@ const harness: HarnessAPI = {
     if (i >= 0 && drivers[i]!.mode === 'scripted') drivers[i]!.mode = 'human'
   },
 
-  injectInput: () => notYet('injectInput'),
+  /**
+   * PRESS A KEY. The only route by which anything outside the page can.
+   *
+   * `setInput` is not this. It writes `scriptedInput`, which switches the player
+   * to `'scripted'` and is read INSTEAD of `input.frame` — so it measures the
+   * kart's response to a frame that never went near `core/input.ts`, and it
+   * bypasses the countdown gate by design (see `inputReachesKart`). Everything
+   * between the event listener and the frame — `classifyKey`, the steering
+   * rack's attack/release ramps, the item pulse's rising edge, and the device
+   * arbitration that decides which of keyboard/touch/gamepad owns the frame at
+   * all — is invisible to it. That arbitration is where the one input bug a
+   * human has actually reported in this project lived, and no harness could see
+   * it. This method exists so one can.
+   *
+   * ---------------------------------------------------------------------------
+   * THE WALL-CLOCK STAMP STOPS AT THIS FUNCTION.
+   *
+   * `atMs` is read here, compared against `performance.now()` here, and copied
+   * into the returned sample here. What crosses into the simulation is
+   * `loop.stepTicks(1)` — a COUNT OF TICKS — and what comes back out is a
+   * receipt carrying a tick number, a steer value and a boolean. Nothing inside
+   * `fixedUpdate` reads, branches on or integrates the stamp, so an injection
+   * made on a loaded machine advances the simulation by exactly the same single
+   * SIMULATION_STEP as one made on an idle machine. That is CLAUDE.md
+   * convention 2, and it is also why `receivedAtMs` is taken from
+   * `IInput.lastEventAtMs` — stamped by the real listener at event entry, on the
+   * event loop, outside the tick — rather than by a `performance.now()` inside
+   * `fixedUpdate`. The contract's field comment says "when `IInput.sample` first
+   * observed it"; listener entry is a few microseconds EARLIER than that and it
+   * is honest in the direction that matters, because the alternative is putting
+   * a wall clock inside the fixed step to buy back a difference no player could
+   * measure.
+   *
+   * An `atMs` that is not plausibly a `performance.now()` reading in this page's
+   * time origin — zero, a `Date.now()` epoch, a moment in the future — falls
+   * back to the instant of dispatch. Same guard `core/input.ts` applies to
+   * `Gamepad.timestamp` and for the same reason: a latency computed from a stamp
+   * from another epoch is a confident, precise, entirely fictional number.
+   *
+   * ---------------------------------------------------------------------------
+   * "RETURNS ONCE THE TICK THAT CONSUMED IT HAS RUN" is the whole synchronisation
+   * contract and it is bought by dispatching and stepping in ONE synchronous
+   * block. `dispatchEvent` is synchronous, so the listeners have run — and
+   * `keyHeld` is set — before `loop.stepTicks` is called; `stepTicks` stops the
+   * live rAF loop as its first act, so the free-running loop cannot slip a tick
+   * in between and consume the frame off-book. Exactly one tick then runs, its
+   * `input.sample` is the first to see the new key state, and the receipt is
+   * filled from inside it. Await this and the kart has already moved.
+   *
+   * ---------------------------------------------------------------------------
+   * IT MUST WIN THE DEVICE ARBITRATION HONESTLY, AND IT IS CHECKED RATHER THAN
+   * ASSUMED. `core/input.ts` hands the frame to one device — the one being used
+   * — and an injected keyboard frame claims it the same way a player's does, by
+   * `markEvent` on a real `keydown`. The assertion block below refuses to return
+   * a sample if `input.kind` is not the kind that was asked for, or if the frame
+   * that came out does not agree with the frame that went in. A harness that
+   * reports a latency for a device that lost the frame is measuring its own
+   * injection.
+   */
+  async injectInput(kind, frame, atMs): Promise<InputLatencySample> {
+    if (kind !== 'keyboard') {
+      /*
+       * Touch and gamepad are refused rather than approximated.
+       *
+       * Touch needs the stick radius from `core/input.ts` (a private constant
+       * derived from the viewport's short edge) to turn a requested `steer` into
+       * a pointer displacement, and a gamepad has no event at all — `sample`
+       * polls `navigator.getGamepads()`, so injecting one means standing a
+       * virtual pad up in front of the real API and seeding its neutral over two
+       * polls before it can claim anything. Both are real work and both are
+       * reachable from here; neither is done, so neither is claimed.
+       */
+      notYet(
+        `injectInput('${kind}') — only 'keyboard' is wired. Touch needs the stick radius ` +
+          "from core/input.ts and gamepad needs a virtual pad in front of navigator.getGamepads()",
+      )
+    }
+    if (pendingInjection) {
+      throw new Error('[harness] injectInput: a previous injection has not been consumed yet')
+    }
+    if (playerIndex < 0) notYet('injectInput — no player kart')
+    /*
+     * A SCRIPTED PLAYER CANNOT RECEIVE A KEYPRESS, so we refuse instead of
+     * reporting `effectiveSteer` off a frame that came from `setInput`. That
+     * number would be real, precise, and about a completely different input
+     * path — the exact shape of reading this project keeps paying to discover.
+     */
+    if (drivers[playerIndex]!.mode !== 'human' || scriptedInput !== null) {
+      throw new Error(
+        `[harness] injectInput: the player kart is in driver mode ` +
+          `'${drivers[playerIndex]!.mode}'${scriptedInput ? ' with a scripted frame set' : ''}, so ` +
+          'the real input path cannot reach it. Call releaseInput()/setDriver(id, \'human\') first.',
+      )
+    }
+
+    const device = injectedDevice[kind]
+    Object.assign(device, frame)
+
+    const dispatchedAtMs = performance.now()
+    const injectedAtMs = atMs > 0 && atMs <= dispatchedAtMs ? atMs : dispatchedAtMs
+
+    const receipt: PendingInjection = {
+      seen: false,
+      sampledTick: -1,
+      effectiveSteer: 0,
+      stunned: false,
+    }
+    // Where the steering rack was before this injection. A RELEASE cannot be
+    // asserted against zero — see the steer clause of the arrival check.
+    const steerBefore = input.frame.steer
+
+    pendingInjection = receipt
+    try {
+      dispatchKeyboard(device)
+      await loop.stepTicks(1)
+    } finally {
+      pendingInjection = null
+    }
+
+    if (!receipt.seen) {
+      throw new Error('[harness] injectInput: no tick consumed the injected frame')
+    }
+
+    // ---- the frame that went in is the frame that came out ------------------
+    const got = input.frame
+    const sign = (v: number): number => (v > 0 ? 1 : v < 0 ? -1 : 0)
+    // `look` is the one axis `core/input.ts` may legitimately negate, and it
+    // says so where it does it: the setting is the player's, not a sign bug.
+    const wantLook = ctx.settings.invertLook ? -sign(device.look) : sign(device.look)
+    const problems: string[] = []
+    if (input.kind !== kind) {
+      problems.push(`the frame is owned by '${input.kind}', not by the injected '${kind}'`)
+    }
+    /*
+     * THE STEERING AXIS IS ASSERTED BY DIRECTION, NEVER BY VALUE, AND A RELEASE
+     * IS NOT A ZERO.
+     *
+     * A key is a step function and a steering rack is not. One tick after a
+     * keydown the real value is STEER_KICK (0.153, `core/input.ts`) and not the
+     * requested 1.0; one tick after a keyUP it is still most of the way to lock,
+     * because the release ramp is 9/s and centre is 111 ms — thirteen ticks —
+     * away. Both of those ARE the input path this method exists to measure, so
+     * asserting the requested number would fail against a perfectly working
+     * game, which is precisely how this clause was found: `grid-start` released
+     * its injected key and this check refused a frame that had arrived exactly
+     * as it should.
+     *
+     * So: a press must show the requested direction on the first tick, and a
+     * release must be UNWINDING — no further from centre than it was, and not
+     * across it. Those two catch a key that never arrived, which is the failure
+     * being guarded, and neither one grades the ramp's tuning.
+     */
+    if (device.steer !== 0) {
+      if (sign(got.steer) !== sign(device.steer)) {
+        problems.push(
+          `steer came out ${got.steer.toFixed(3)}, which disagrees in sign with the injected ${device.steer}`,
+        )
+      }
+    } else if (Math.abs(got.steer) > Math.abs(steerBefore) + 1e-6 || sign(got.steer) === -sign(steerBefore)) {
+      problems.push(
+        `steer was released but came out ${got.steer.toFixed(3)} against ${steerBefore.toFixed(3)} before ` +
+          'the injection — a released key unwinds toward centre, it does not grow or cross it',
+      )
+    }
+    if (got.throttle > 0 !== device.throttle > 0) {
+      problems.push(`throttle came out ${got.throttle}, injected ${device.throttle}`)
+    }
+    if (got.brake > 0 !== device.brake > 0) {
+      problems.push(`brake came out ${got.brake}, injected ${device.brake}`)
+    }
+    if (got.drift !== device.drift) problems.push(`drift came out ${got.drift}, injected ${device.drift}`)
+    if (got.useItem !== device.useItem) {
+      problems.push(`useItem came out ${got.useItem}, injected ${device.useItem}`)
+    }
+    if (sign(got.look) !== wantLook) {
+      problems.push(`look came out ${got.look}, injected ${device.look}`)
+    }
+    if (problems.length > 0) {
+      throw new Error(
+        `[harness] injectInput('${kind}'): the injected frame did not arrive — ${problems.join('; ')}. ` +
+          'Either the key map in main.ts has drifted from core/input.ts:classifyKey, or another ' +
+          'device won the arbitration. Refusing to report a latency for a frame the game did not use.',
+      )
+    }
+
+    return {
+      kind: input.kind,
+      injectedAtMs,
+      receivedAtMs: input.lastEventAtMs,
+      sampledTick: receipt.sampledTick,
+      effectiveSteer: receipt.effectiveSteer,
+      stunned: receipt.stunned,
+    }
+  },
 
   /*
    * `IKart` exposes no position or velocity setter, so this reaches the
