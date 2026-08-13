@@ -170,6 +170,116 @@ const LOOK_MAX: Metres = 32
 const K_UNDERSTEER = 0.011
 
 /**
+ * THE CROSS-TRACK WEIGHT, and the frame error it exists to fix.
+ *
+ * Pure pursuit's chord to an aim point `d` metres down the road carries THREE
+ * things added together, and they are not the same size:
+ *
+ *     dRight  ≈  e  +  ψ·d  +  κ·d²/2
+ *                │     │        └─ the road's own bend over the look-ahead
+ *                │     └────────── heading error against the line
+ *                └──────────────── how far the line is to my right, HERE
+ *
+ * Only the first term says which side of the racing line the kart is on, and
+ * pure pursuit divides the whole sum by d², so that term arrives attenuated by
+ * 1/d² while the other two arrive attenuated by 1/d and 1/1. On Vermilion Nine
+ * the racing line crosses the road at up to 0.41 m per metre — `world/track.ts`
+ * solves it by minimising path curvature, and a minimum-curvature line runs
+ * DIAGONALLY across a straight between two corners — so at the 18 m look-ahead
+ * the ψ·d term reaches 6 m while the whole road is 8 m wide. The cross-track
+ * error is then not a small correction to the sum, it is a rounding error in
+ * it, and the command comes out with the sign of the line's drift rather than
+ * the sign of the error. Measured: placed 2.5 m either side of the line at
+ * t = 0.343, the driver commanded +0.81 and +0.22 — right-hand from both sides,
+ * with no negation anywhere and none needed to explain it.
+ *
+ * So the cross-track error is read a SECOND time, in the frame where it is
+ * unambiguous: at the kart's own station, against the line at that station.
+ * `laneLateral(loc.t) - loc.lateral` is positive exactly when the line is to
+ * the driver's right — `TrackLocation.lateral` says so and `ITrack.racingLine`
+ * says so — and a positive value asks for positive steer. That is the same
+ * convention as everything else in this file and it is READ, not assumed.
+ *
+ * 2 makes the term worth 2 m of aim-point offset per metre of error, and it is
+ * the LOWEST value the harness supports rather than a preference. Every row
+ * below varies K_CROSS and nothing else, on this file, against `steer-test` at
+ * its re-sited probe (632ba8c) and a clean-mode field over 150 s:
+ *
+ *     K_CROSS   ai-command L / R      ai-outcome   field laps   respawns
+ *       0       0.2207 / -0.1264      FAIL           2.19          1-2
+ *       1       0.4364 / -0.2384      FAIL           1.39          3-5
+ *       2       0.6756 / -0.3459      PASS           2.21          1     <- here
+ *       2.5     0.7684 / -0.4006      PASS           2.21          1
+ *
+ * `ai-outcome` — the kart actually converging on the line, which no amount of
+ * correct sign substitutes for — is what sets the floor at 2; `ai-command`
+ * passes without this term at all once the probe is sited where the line does
+ * not move across it. The field column is quoted with `insideCurvature` in
+ * place, and it must be: without it the same rows read 2.19 / 1.39 / 1.37 /
+ * 1.42, and the term looks like a 37% pace regression. See `insideCurvature`
+ * for why the two changes are only correct together.
+ *
+ * It is a gain, not a sign: getting it wrong makes the driver sloppy, never
+ * inverted.
+ */
+const K_CROSS = 2
+
+/**
+ * HOW MUCH ERROR THE CROSS-TRACK TERM IS ALLOWED TO SEE, in metres.
+ *
+ * The term's job is to decide which side of the line the kart is on and to make
+ * it converge — a signal of a metre or two. It is NOT the path follower; pure
+ * pursuit is, and pure pursuit is the thing that has to handle a kart 11 m off
+ * line. Letting the gain run unsaturated over that range is what a first
+ * version did, and the arithmetic is the whole story: the racing line at the
+ * start line sits 11.3 m to the right of a kart on the grid, so at a gain of 4
+ * the term contributed 45 m of aim-point offset, the field charged at the line
+ * and left the road within seven seconds of the lights. Measured on that build
+ * (gain 4, unsaturated, and the old 1.6 m lane spread): a clean-mode field that
+ * otherwise completes 2.2 laps in 150 s completed 0.27-1.28 with five to eight
+ * respawns each.
+ *
+ * The loop's damping is why turning the gain down instead is not the answer.
+ * Writing it out with `e' = ψ` gives `ζ = 1/√(2(1+K_CROSS))`, 0.71 at 0 and
+ * 0.41 at 2 — the gain that buys convergence is the same gain that rings on a
+ * large error. Saturating the INPUT keeps the authority where the signal is
+ * small and hands the large-error case back to pure pursuit, which is well
+ * damped and was never the part that was wrong.
+ *
+ * 2.5 m: wider than the road's share of a lane offset and wider than any error
+ * a kart on the line accumulates, narrower than the excursions that pure pursuit
+ * should own.
+ */
+const CROSS_LIMIT: Metres = 2.5
+
+/**
+ * DAMPING FOR THE CROSS-TRACK TERM, in metres of aim-point offset per radian.
+ *
+ * A proportional term on cross-track error carries no damping of its own:
+ * writing the loop out with `e' = ψ` gives `ζ = 1/√(2(1+K_CROSS))`, so the gain
+ * that breaks the tie also rings, and the ring is what puts a kart off the road
+ * at every corner where the line rides the inside limit — which on this circuit
+ * is most of them.
+ *
+ * DERIVATIVE ON THE MEASUREMENT, NOT ON THE ERROR, and that choice is the whole
+ * point. The setpoint here is the racing line and it moves across the road at
+ * up to 0.41 m per metre, so differencing the ERROR would feed the line's own
+ * drift into the damper — the textbook derivative kick from a moving setpoint,
+ * and here it would cancel exactly the signal the term exists to produce. The
+ * measurement is `loc.lateral`, and its derivative along the road is the angle
+ * between the nose and the ROAD tangent. So this brakes the kart's rate of
+ * crossing the road and nothing else: it is identically zero for a kart running
+ * parallel to the road, whatever the line is doing.
+ *
+ * It buys ζ = (d + K_CROSS·D)/(d·√(2(1+K_CROSS))), which at K_CROSS = 2, D = 6
+ * and an 18 m look-ahead is 0.68 against 0.41 without it. The cost is a standing
+ * lag where the line crosses the road fastest — `K_CROSS·D·slope/(1+K_CROSS)`,
+ * about 0.7 m at the lap's steepest transition (0.418 m/m) — and the lag is
+ * toward the middle of the road, which is the safe side to be wrong on.
+ */
+const CROSS_DAMP: Metres = 6
+
+/**
  * Closed-loop yaw-rate correction, in units of lock per rad/s of error.
  *
  * This is what makes the mirrored constants above survivable. The feed-forward
@@ -218,13 +328,6 @@ const LAT_UTIL_CLEAN = 0.82
 const LAT_UTIL_DRIFT = 0.76
 /** Fraction of peak grip spent on braking. The rest stays for turning. */
 const BRAKE_UTIL = 0.78
-/**
- * The ideal line is straighter than the centreline, and `TrackSample.curvature`
- * is the centreline's. Without this the AI brakes for a corner it is not going
- * to drive. 0.88 is conservative — under-cooking entry speed costs lap time,
- * over-cooking it costs the lap.
- */
-const RACING_LINE_RELIEF = 0.88
 /** Never crawl. Below this the corner is not the reason the kart is slow. */
 const MIN_TARGET_SPEED = 8
 
@@ -304,8 +407,26 @@ const RECOVERY_AHEAD: Metres = 15
 const STALL_SPEED = 2.5
 const STALL_SECONDS: Seconds = 1.6
 
-/** Metres of lateral spread between drivers so eight karts are not one kart. */
-const LANE_SPREAD: Metres = 1.6
+/**
+ * Metres of lateral spread between drivers so eight karts are not one kart.
+ *
+ * WAS 1.6, AND THE ROAD DOES NOT HAVE IT. `world/track.ts` puts the ideal line
+ * 1.35 m from the sand wherever the width clamp bites, and it bites through
+ * every long corner on this circuit — the line reaches 13.46 m on a 14.00 m
+ * half-width, leaving 0.54 m of road outside it. A ±1.6 m preference there is
+ * not a lane, it is a clamp: `laneLateral` returns the same edge value for
+ * every driver whose preference points outward, so the spread it was supposed
+ * to buy does not exist, while the ones pointing inward aim a full 1.6 m off
+ * the line all the way round.
+ *
+ * It also sits directly on top of the cross-track reading. At the steer-test
+ * placement the preference is 38% of the 2.5 m probe offset, so the driver was
+ * being graded on a target it had deliberately moved; 0.7 leaves the spread
+ * real (0.4 m of separation between adjacent drivers is more than a kart's
+ * width of overlap) and stops the lane offset from dominating the error the
+ * driver is trying to null.
+ */
+const LANE_SPREAD: Metres = 0.7
 /** Clearance the AI keeps from the road edge when placing its target. */
 const EDGE_MARGIN: Metres = 1.6
 
@@ -468,11 +589,72 @@ export function createAIDriver(
   }
 
   /**
+   * CURVATURE OF THE ARC THE KART ACTUALLY DRIVES at `t`. `s` must be the
+   * sample at that same `t` — passed in rather than re-sampled, because this is
+   * called thirteen times a tick and `step` is on the MUST NOT ALLOCATE list.
+   *
+   * `TrackSample.curvature` is the CENTRELINE's, and the racing line is not
+   * parallel to it. This used to be a constant 0.88 "racing-line relief", on
+   * the reasoning that the ideal line is straighter than the road. Where the
+   * road is wide enough that is true — `world/track.ts` minimises path
+   * curvature and comes out straight — but where it is not, the width clamp
+   * bites and the line runs parallel to the INSIDE edge, so the arc is tighter
+   * than the road rather than straighter. On The Wall the centreline is R = 74 m
+   * and the line sits 12.46 m inside it: the kart drives R = 61.5 m while 0.88
+   * modelled 84 m. That is 37% out in curvature, 17% in speed, in the direction
+   * that says "go faster", through the fastest corner on the lap.
+   *
+   * Derived, not tuned. With `P(s) = C(s) + l(s)·R(s)`, `T' = κR`, `R' = −κT`,
+   * the offset curve's arc-length ratio is `1 − κl`, so `κ_p = κ/(1 − κl)`.
+   *
+   * THE `l''` TERM IS DELIBERATELY ABSENT and this is the load-bearing part of
+   * the comment. The full formula carries `+ l''/(1−κl)²` — the line's own bend
+   * where it crosses the road — and it cannot be had from a finite difference
+   * of `racingLine`, because the line KINKS where it meets the lateral clamp at
+   * a corner entry. A 6 m second difference across that kink returns −0.017 1/m,
+   * larger than the corner itself and opposite in sign, so the driver brakes for
+   * a corner that turns the other way. Measured with it in: the clean field went
+   * from 2.21 laps per 150 s to 1.50 with three respawns each. Whoever wants
+   * that term should get it from `world/`, which solved the line and has its
+   * curvature without differencing anything.
+   *
+   * THIS CHANGE AND THE CROSS-TRACK TERM ARE ONLY CORRECT TOGETHER, which is
+   * the thing that makes both of them hard to find alone:
+   *
+   *     K_CROSS   corner model          clean laps/150 s   respawns   off-track
+   *       0       centreline x 0.88          2.19            1-2         135
+   *       0       this one                   1.50            3            —
+   *       2       centreline x 0.88          1.37            4-5         853
+   *       2       this one                   2.21            1             0
+   *
+   * At K_CROSS = 0 the driver never actually reached the racing line — pure
+   * pursuit lagged it and cut across the middle of the road, where the arc is
+   * close to the centreline's, so the old constant described what was really
+   * being driven and braking for the true line was pure loss. The cross-track
+   * term put the kart ON the line, which is what made the speed model wrong;
+   * fixing the speed model is what pays for the cross-track term. Neither
+   * ordering shows a win on its own, and the pair is better than the build
+   * before either.
+   */
+  function insideCurvature(t: number, s: TrackSample): number {
+    /*
+     * `1 − κl` is the ratio of the offset arc to the centreline arc, and it
+     * reaches zero only where the line passes through the centre of curvature,
+     * which no road can do. Clamped for the same reason as the bank denominator
+     * below: an unguarded division there returns an infinite curvature, and the
+     * AI brakes to a standstill on a straight.
+     */
+    return s.curvature / clamp(1 - s.curvature * track.racingLine(t), 0.25, 4)
+  }
+
+  /**
    * The speed this corner can be taken at, from grip, curvature and bank.
-   * See the LAT_UTIL comment block for the derivation.
+   * See the LAT_UTIL comment block for the derivation. `curvature` is the
+   * DRIVEN arc's, from `insideCurvature` — see there for why it is not the
+   * centreline's with a constant on it.
    */
   function cornerSpeed(curvature: number, bank: number, grip: number, util: number): number {
-    const k = Math.abs(curvature) * RACING_LINE_RELIEF
+    const k = Math.abs(curvature)
     if (k < 1e-5) return 1e4
     const mu = grip * util
     // Positive when the road falls toward the inside of THIS corner.
@@ -484,6 +666,39 @@ export function createAIDriver(
     const denom = Math.max(0.3, 1 - mu * tb)
     const aLat = Math.max(1, (G * (mu + tb)) / denom)
     return Math.sqrt(aLat / k)
+  }
+
+  /**
+   * WHERE THIS DRIVER WANTS TO BE at track parameter `t`: the track's one
+   * racing line, plus this driver's standing lane preference faded out as the
+   * corner tightens, clamped inside the road. `s` must be the sample at `t`.
+   *
+   * ONE function, called at the look-ahead AND at the kart's own station. Two
+   * copies of this policy would let "where I am going" and "where I should be"
+   * disagree about the lane offset, and the cross-track term would then drive
+   * the kart to a standing error of exactly that disagreement — a bias that
+   * looks like a steering bug and is a bookkeeping one.
+   */
+  function laneLateral(t: number, s: TrackSample, isRecovering: boolean): Metres {
+    let lat = track.racingLine(t)
+    if (!isRecovering) {
+      // Lane preference, faded out as the corner tightens: spread the field on
+      // the straights, share the one correct line through the corners.
+      const cornerness = clamp(Math.abs(s.curvature) / 0.012, 0, 1)
+      lat += lanePreference * (1 - 0.78 * cornerness)
+
+      /*
+       * Drift mode enters wide. A bigger entry angle is what buys a slip angle
+       * the kart can hold for a second and a half without running out of road,
+       * and running out of road is the thing that turns a tier-3 attempt into
+       * a tier-0 attempt plus a wall hit.
+       */
+      if (driver.mode === 'drift' && phase === 'idle' && cornerDist < 40) {
+        lat -= cornerSign * 1.5
+      }
+    }
+    const limit = Math.max(0.3, s.halfWidth - EDGE_MARGIN)
+    return clamp(lat, -limit, limit)
   }
 
   function endAttempt(cooldown: Seconds): void {
@@ -593,26 +808,7 @@ export function createAIDriver(
        * the boost pads (which are placed against `racingLine`) on three
        * different lines, and only the pads would visibly disagree.
        */
-      let targetLat = track.racingLine(tAim)
-
-      if (!recovering) {
-        // Lane preference, faded out as the corner tightens: spread the field on
-        // the straights, share the one correct line through the corners.
-        const cornerness = clamp(Math.abs(aim.curvature) / 0.012, 0, 1)
-        targetLat += lanePreference * (1 - 0.78 * cornerness)
-
-        /*
-         * Drift mode enters wide. A bigger entry angle is what buys a slip angle
-         * the kart can hold for a second and a half without running out of road,
-         * and running out of road is the thing that turns a tier-3 attempt into
-         * a tier-0 attempt plus a wall hit.
-         */
-        if (driver.mode === 'drift' && phase === 'idle' && cornerDist < 40) {
-          targetLat -= cornerSign * 1.5
-        }
-      }
-      const lateralLimit = Math.max(0.3, aim.halfWidth - EDGE_MARGIN)
-      targetLat = clamp(targetLat, -lateralLimit, lateralLimit)
+      const targetLat = laneLateral(tAim, aim, recovering)
       aimPoint.copy(aim.position).addScaledVector(aim.right, targetLat)
 
       // --- pure pursuit, in the kart's own frame ---------------------------
@@ -626,9 +822,55 @@ export function createAIDriver(
        */
       toAim.copy(aimPoint).sub(state.position)
       toAim.addScaledVector(here.normal, -toAim.dot(here.normal))
-      const dRight = toAim.dot(kartRight)
+      const dRightAim = toAim.dot(kartRight)
       const dForward = toAim.dot(kartForward)
-      const d2 = Math.max(1, dRight * dRight + dForward * dForward)
+
+      /*
+       * THE CROSS-TRACK ERROR, READ WHERE IT IS UNAMBIGUOUS.
+       *
+       * `dRightAim` cannot say which side of the line the kart is on, because
+       * the line moves under the look-ahead: see the K_CROSS block for the
+       * decomposition and the measurement. This reads the same error a second
+       * time in the frame that does not move — the kart's own station, against
+       * the line at that station — and adds it to the pursuit's lateral offset
+       * rather than to the chord, so the geometry of the chord is untouched and
+       * only the term that was being divided away gets its weight back.
+       *
+       * NO NEGATION, and none is possible here: `laneLateral` returns "signed
+       * metres from the centreline, positive is the driver's right" because
+       * `ITrack.racingLine` is defined that way, `loc.lateral` is defined the
+       * same way by `TrackLocation`, so their difference is "how far the line is
+       * to my right" in the same units and the same sense as `dRightAim`. A
+       * positive value asks for positive steer, exactly as the contract says.
+       */
+      const crossRight = laneLateral(loc.t, here, recovering) - loc.lateral
+
+      /*
+       * The kart's heading against the ROAD, which is `d(loc.lateral)/ds` — how
+       * fast it is crossing the road, and the only derivative in this solve.
+       * `atan2(forward·right, forward·tangent)` in that argument order is
+       * positive when the nose points to the driver's right, the same sense as
+       * everything else here; subtracting it therefore opposes a rightward
+       * crossing, which is damping and not a sign flip. Clamped because a spun
+       * or reversing kart reads near ±π, and recovery owns that case.
+       */
+      const crossRate = clamp(
+        Math.atan2(kartForward.dot(here.right), kartForward.dot(here.tangent)),
+        -0.5,
+        0.5,
+      )
+      const dRight =
+        dRightAim +
+        K_CROSS * (clamp(crossRight, -CROSS_LIMIT, CROSS_LIMIT) - CROSS_DAMP * crossRate)
+
+      /*
+       * `d2` stays the REAL chord to the aim point. The cross-track term above
+       * corrects the lateral offset the pursuit is solving for; it is not a
+       * second target, and folding it into the chord as well would shorten the
+       * pursuit circle at the same time as widening its offset — two changes
+       * for one reading, and the gain would then be quadratic in the error.
+       */
+      const d2 = Math.max(1, dRightAim * dRightAim + dForward * dForward)
       const kappaDesired = (2 * dRight) / d2
 
       const lock = availableLock(speed)
@@ -655,7 +897,7 @@ export function createAIDriver(
       // Braking distance from here to a standstill, plus a margin. Any corner
       // beyond this horizon cannot yet require a lift.
       const horizon = clamp((speed * speed) / (2 * brakeAccel) + 10, 22, 190)
-      let targetSpeed = cornerSpeed(here.curvature, here.bank, gripHere, latUtil)
+      let targetSpeed = cornerSpeed(insideCurvature(loc.t, here), here.bank, gripHere, latUtil)
 
       const probes = 12
       for (let i = 1; i <= probes; i++) {
@@ -663,7 +905,7 @@ export function createAIDriver(
         const ts = loc.t + s / length
         track.sample(ts, probe)
         const surf = track.surfaceAt(ts, track.racingLine(ts))
-        const vCorner = cornerSpeed(probe.curvature, probe.bank, SURFACE_PROPS[surf].grip, latUtil)
+        const vCorner = cornerSpeed(insideCurvature(ts, probe), probe.bank, SURFACE_PROPS[surf].grip, latUtil)
         // The speed we may be doing HERE and still shed to `vCorner` in `s`
         // metres. This is the braking curve, evaluated backwards.
         const vAllowed = Math.sqrt(vCorner * vCorner + 2 * brakeAccel * s)
