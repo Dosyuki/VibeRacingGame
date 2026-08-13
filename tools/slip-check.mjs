@@ -1,11 +1,13 @@
 /**
- * DOES THE KART STAY POINTED WHERE IT IS GOING, OVER A LONG RUN?
+ * DOES THE KART STAY POINTED WHERE IT IS GOING, AND ON A ROAD THAT STAYS PUT,
+ * OVER A WHOLE LAP AT RACING SPEED?
  *
  *   node tools/slip-check.mjs              # gate the live build
  *   node tools/slip-check.mjs --broken     # self-test: prove every detector fires
  *   node tools/slip-check.mjs --reference  # run the battery on the built-in reference only
  *   node tools/slip-check.mjs --seconds=60 # longer cruise
  *   node tools/slip-check.mjs --stride=2   # sample every 2nd tick (cheaper, coarser)
+ *   node tools/slip-check.mjs --windows=0  # skip the lap sweep (much faster, much blinder)
  *
  * WHY THIS FILE EXISTS AND WHY NOTHING ELSE IN THE REPO ANSWERS IT
  * ---------------------------------------------------------------
@@ -35,6 +37,71 @@
  *   4. WHETHER IT CORRELATES WITH CURVATURE. Slip in a corner is expected. Slip
  *      on a straight is not. Reported in separate bins, because one pooled
  *      number over a circuit that is half corners means nothing at all.
+ *
+ * THE SECOND DIMENSION: RIDE QUALITY, OVER A WHOLE LAP, AT RACING SPEED
+ * --------------------------------------------------------------------
+ * A human played the build and reported a second thing: "in the last part
+ * before the finish line you can go through the map, and the kart bounces."
+ *
+ * `wheel-contact` below looks like it covers that and does not. It gates the
+ * STRAIGHT curvature bin only — a bounce in a corner is outside it entirely.
+ * The cruise that feeds it starts from the grid, runs 40 s, and reaches roughly
+ * 700 m of a 1620 m circuit, so The Wall, the wash, the arch and the final
+ * corner are never driven at all. And the cruise's speed cap sat under the
+ * kart's own terminal, so the top of the speed range was never reached either.
+ * Three separate ways for a defect to be outside the measurement while the
+ * measurement printed green.
+ *
+ * So five more questions, and the machinery that makes them answerable:
+ *
+ *   5. CONTACT PER BIN, OVER THE WHOLE LAP. `lap-contact` grades straight,
+ *      transition and corner SEPARATELY and never pools them, plus each bin's
+ *      worst one-second window — because a hundred metres of bouncing is 6% of
+ *      this circuit and a lap-wide mean dilutes it to nothing.
+ *   6. IS THE KART BOUNCING, OR IS THE SUSPENSION WORKING? Not the same thing,
+ *      and `ride-quality` is built to tell them apart. The road's roughness
+ *      profile has a 1.10 m wavelength; at 14 m/s that is a 12.7 Hz input
+ *      against a 3.1 Hz sprung mass, so a working suspension transmits
+ *      (3.1/12.7)² ≈ 6% of it to the body. WHEELS MOVING AND BODY STILL is
+ *      correct: measured on the fixed build, body ride-height SD 0.0005-0.0014 m
+ *      against wheel compression SD 0.070 of travel. Body moving with the wheels
+ *      — or worse, body moving while the wheels do not — is the defect, and the
+ *      two are reported side by side so nobody has to take one on trust.
+ *   7. IS THE GROUND WHERE IT SHOULD BE? A step under a kart and a kart bouncing
+ *      on good ground are different defects with different owners, and a single
+ *      "it bounces" number cannot separate them. `road-continuity` scans the
+ *      road's own geometry over the whole lap with no kart in the measurement at
+ *      all, then checks the ground UNDER the kart against the gradient that scan
+ *      measured, then recomputes `TrackLocation.height` from `ITrack.sample` and
+ *      requires the two to agree — and requires the chassis to be ABOVE the road
+ *      plane rather than inside it, which is the player's "through the map".
+ *   8. DOES IT HAPPEN AT THE SEAM? The lap wraps at the finish line and that is
+ *      where the report points. `lap-seam` grades a window anchored to STRADDLE
+ *      t = 0, and REFUSES to grade — PENDING, loudly — unless the recorded `t`
+ *      was observed wrapping. A check that never crosses the seam cannot see a
+ *      seam defect, and must not print a pass for one.
+ *   9. WAS THE PREMISE TRUE? Every slip verdict on this page rests on "the tyres
+ *      were never asked for the limit", which was asserted against a constant
+ *      nobody had measured. `demand-headroom` measures the limit with a
+ *      full-lock probe and fails if the commanded budget is not under it.
+ *
+ * HOW A WHOLE LAP IS DRIVEN WITH SEVEN PARKED KARTS IN THE WAY
+ * -----------------------------------------------------------
+ * It cannot be done in one run, and pretending otherwise is how the coverage
+ * hole got there. `resetRace` parks the field on the start grid, which
+ * `world/track.ts` puts 6-27 m BEFORE the finish line — so a cruise that drives
+ * a full lap ends by driving into eight stationary karts, at the exact place
+ * the player is complaining about.
+ *
+ * `seek` scatters the field instead: `src/main.ts` respawns kart k at
+ * `(t + k/karts.length) % 1`. That leaves exactly `length / fieldSize` metres of
+ * clear road ahead of a seek — 202 m here — and not one metre more. So the lap
+ * is covered by a SWEEP of seek-anchored windows, each entered at the speed the
+ * controller would be carrying there, each driving that clearance less a margin,
+ * spaced so they overlap and cover the lap end to end. One of them is anchored
+ * to straddle the finish line by construction. Both the clearance and the window
+ * count are computed at run time from `track.length` and the field `telemetry()`
+ * reports — never from an assumption about either.
  *
  * THE HARD PART IS THE THRESHOLD, AND IT IS NOT INVENTED HERE
  * ----------------------------------------------------------
@@ -251,17 +318,44 @@ const CFG = {
 
   // -- how the cruise is driven ---------------------------------------------
   /*
-   * guess: 8 m/s² is 0.82 g. The whole design of this probe is that the tyres
-   * are never asked for the limit — the cruise picks its speed from
-   * v = sqrt(budget / |curvature|) so the lateral demand is capped here
-   * everywhere on the lap. If a kart slides while never being asked for more
-   * than 0.82 g on a 0.88-grip road, the slide is not the driver's fault. Raise
-   * this and the probe stops being able to make that argument.
+   * DERIVED, and it replaces a number that was wrong in a way that mattered.
+   *
+   * This was 8, justified in its own comment as "0.82 g on a 0.88-grip road".
+   * 0.88 is `SURFACE_PROPS[DustyAsphalt].grip` — a MULTIPLIER ON TYRE FORCE, not
+   * a g figure — so the sentence compared a number in m/s² against a
+   * dimensionless coefficient and the safety margin it claimed did not exist.
+   * The chassis' measured peak lateral acceleration is 7.85-7.88 m/s², i.e.
+   * 0.80 g, so a budget of 8 sat ABOVE the limit: the controller commanded
+   * 19.51 m/s at ess-2 against a measured limit of 19.07 and was over at ess-1
+   * and final-corner too, while this file printed a pass. A probe whose entire
+   * argument is "the tyres were never asked for the limit" was asking for more
+   * than the limit and gating on nothing that could notice.
+   *
+   * 6 m/s² is 0.61 g. It is four fifths of the measured limit — see
+   * `latAccelMarginFrac` — and `demand-headroom` MEASURES that limit on the
+   * build in front of it with a full-lock probe and fails if this number is not
+   * under it. The old value survived because the premise was asserted in a
+   * comment and checked by nothing; it is now a check.
    */
-  latAccelBudget: 8,
-  /** guess. Fast enough that the tyres are doing real work, slow enough that a
-   *  simple pursuit controller is stable. */
-  speedMax: 24,
+  latAccelBudget: 6,
+  /*
+   * DERIVED, raised from 24 once the reason for the old number stopped applying.
+   *
+   * This caps the speed on STRAIGHT road, where the lateral budget above does
+   * not bind: at the straight bin's own curvature limit of 1/400 the demand at
+   * 28 m/s is v²κ = 1.96 m/s², a third of the budget. So the old "slow enough
+   * that a simple pursuit controller is stable" was buying nothing on a straight
+   * and costing the whole top of the speed range — and suspension and tyre-load
+   * faults are a function of SPEED far more often than of elapsed time.
+   *
+   * The drivetrain's own terminal is ~27.8 m/s (`world/track.ts` derives the
+   * racing line from it). 28 therefore makes the KART the limit rather than this
+   * file, which is the only honest place for the ceiling to be. `wheel-contact`
+   * and `ride-quality` print the peak actually reached either way: a green is
+   * green up to the speed the run got to and no further, and that stays true
+   * however this constant moves.
+   */
+  speedMax: 28,
   /** guess. A floor so the cruise does not crawl through the tightest bend. */
   speedMin: 7,
   /** guess. Pure pursuit looks ~0.7 s down the road; shorter oscillates, longer
@@ -426,6 +520,240 @@ const CFG = {
    * into the slip gates.
    */
   minMeanGroundedWheels: 3.5,
+  /*
+   * DERIVED on the direction, guess on the numbers, and SEPARATE from the two
+   * above on purpose. `wheel-contact` grades flat level straight road, where
+   * four is the physical answer and anything else is a defect. A corner is not
+   * that: a kerb, a crest and lateral load transfer can each legitimately unload
+   * the inside wheel, so the corner and transition bins get a floor of three —
+   * one wheel light, continuously — and a much tighter separate gate on being
+   * FULLY airborne, which nothing about cornering explains. The bins are never
+   * pooled: a bounce in a corner averaged against a lap of clean straights is a
+   * bounce nobody sees, and that is the hole this file was extended to fill.
+   */
+  minMeanGroundedCorner: 3,
+  maxAirborneFracCorner: 0.02,
+  /*
+   * DERIVED. A defect a hundred metres long is 6% of this circuit, and a
+   * lap-wide fraction dilutes it below every gate above while the kart is
+   * unmistakably bouncing for four seconds. So every bin is ALSO graded on its
+   * WORST one-second window: 120 ticks at 20 m/s is 20 m of road, about a
+   * kart-length either side of a single bad joint. A bin passes only if its
+   * worst second passes too, and the report says where that second was.
+   */
+  worstWindowSeconds: 1,
+  /*
+   * guess. The circuit climbs 0-52 m and has crests on it, and a crest can
+   * legitimately launch a kart for a fraction of a second on road that is
+   * straight in PLAN — which is what the curvature bins measure. A quarter of
+   * one second fully airborne is that; more, or repeatedly, is not.
+   */
+  maxAirborneFracWorstWindow: 0.25,
+
+  // -- the lap sweep: whole-lap coverage, at racing speed ---------------------
+  /*
+   * DERIVED from the field and the circuit, both read at run time.
+   *
+   * `HarnessAPI.seek` scatters the rest of the field EVENLY around the lap —
+   * `src/main.ts` respawns kart k at `(t + k/karts.length) % 1` — so the road
+   * ahead of a seek is clear for exactly `track.length / fieldSize` metres and
+   * not one more. A window may drive that clearance less this margin; covering
+   * the lap needs `ceil(length / that)` windows, which is computed rather than
+   * chosen. If the arithmetic does not close — a field of one, a circuit shorter
+   * than a window — the sweep reports PENDING and says which.
+   *
+   * The margin itself is DERIVED from `neighbourExclusionM`: twice it, so that
+   * no measured tick is inside the exclusion radius AND the approach to it is
+   * not being driven at a kart that is about to start excluding ticks.
+   */
+  sweepClearanceMarginM: 30,
+  /** guess. Windows overlap by this much so the seams BETWEEN windows are
+   *  covered twice and never fall in a gap — a sweep whose blind spots are at
+   *  fixed places on the lap is worse than one with none, because the same
+   *  metres are invisible on every run forever. */
+  sweepOverlapM: 10,
+  /*
+   * DERIVED. `seek` teleports; `HarnessAPI` says it clears velocity, drift,
+   * boost and stun, so the only transient left is vertical — the sprung mass
+   * settling from a placed pose, at ~3.1 Hz. 90 ticks is 0.75 s, over two
+   * periods of it. Those ticks are driven and discarded, and the count is
+   * printed: a settle window is an exclusion like any other.
+   */
+  sweepSettleTicks: 90,
+  /*
+   * guess with the arithmetic written out. A window is ~172 m. The tightest
+   * corner on the circuit is ess-2, centreline radius 47.6 m, which under
+   * `latAccelBudget` is sqrt(6/(1/47.6)) = 16.9 m/s — so a window that is
+   * ALL of ess-2 takes 10.2 s. 16 s is a 57% allowance before the harness stops
+   * waiting, and a window that hits the cap reports the distance it did cover
+   * rather than pretending to the full one.
+   */
+  sweepWindowSecondsCap: 16,
+  /** guess. A window that covered less than this fraction of its intended
+   *  distance did not measure the road it was pointed at, and is reported as
+   *  short rather than folded in silently. */
+  sweepMinDistanceFrac: 0.6,
+  /** Override for the DERIVED window count. Negative means "derive it"; 0 skips
+   *  the sweep entirely, and every lap-scale check then reports PENDING — never
+   *  skipped, because a gate that quietly covers nothing prints the same green
+   *  as one that passed. */
+  sweepWindows: Math.round(argNum('windows', -1)),
+
+  // -- ride quality: is the body bouncing, or is the suspension working? -----
+  /*
+   * DERIVED from a measurement on a build this repo has already fixed, and the
+   * derivation is the whole distinction the check exists to make.
+   *
+   * `src/kart/kart.ts` perturbs the suspension ray target by
+   * `sin(t * length * 5.7) * roughness * 0.42` — 5.7 rad/m is a 1.10 m
+   * wavelength — and at 14 m/s that is a 12.7 Hz input. The sprung mass sits at
+   * 3.1 Hz. A second-order system driven four times above its own natural
+   * frequency transmits (fn/f)² ≈ 0.06 of the input to the body, so the WHEELS
+   * move the full amplitude of the bump and the BODY barely moves at all.
+   * Measured on the fixed build: body ride-height SD 0.0005-0.0014 m, wheel
+   * compression SD 0.070 of travel. Those two numbers TOGETHER are "the
+   * suspension is working"; either alone is not.
+   *
+   * The gate is 4x the top of that measured-correct range — the same multiple
+   * §10c uses over a noise floor. The multiple is a guess. The floor under it is
+   * a measurement, which is the part that matters, and it is why this is not
+   * "0.005 looked about right".
+   */
+  rideHeightSdMaxM: 0.0056,
+  /*
+   * DERIVED, and it needs no tuning: a suspension can only PUSH. At 1 g of
+   * downward acceleration the springs are carrying nothing and every wheel is
+   * unloaded; past it the body is being thrown rather than suspended. Graded on
+   * settled straight road, where there is no bank to add a normal-load term.
+   */
+  bodyVertAccelMaxG: 1,
+  /*
+   * guess, with the headroom argued. In a corner the road banks — The Wall at
+   * 20°, ess-2 at 10° — and the normal load rises with the cornering load, so
+   * the same rule needs room: 1.4 g of cornering through a 20° bank is already
+   * 1.3 g of vertical. 2 g leaves that room and still catches a body being
+   * pumped, which reaches many g and does not stop at two.
+   */
+  bodyVertAccelCornerG: 2,
+  /*
+   * guess on the value, DERIVED on the rule. `WheelState.compression` MUST move:
+   * the road has a bump profile and the spring is the thing that feels it. A
+   * compression SD collapsed toward zero WHILE the body's has not is the exact
+   * signature of a suspension that has stopped absorbing and a body that is
+   * following the road instead — which is the difference between "it bounces"
+   * and "the suspension is working", stated as a number. 0.01 of travel is a
+   * seventh of the 0.070 the fixed build measures and orders above float noise.
+   */
+  minCompressionSd: 0.01,
+  /** DERIVED: 2 s of settled samples. Below that a standard deviation is a
+   *  statement about a transient, and the check reports PENDING. */
+  minRideTicks: 240,
+
+  // -- is the ground where it should be? -------------------------------------
+  /*
+   * DERIVED: 0.5 m stations. The road is authored as a piecewise-linear gradient
+   * profile with its corners rounded over tens of metres, so half a metre is far
+   * shorter than any feature it is meant to have and long enough that 2048
+   * samples do not miss a joint between segments.
+   */
+  roadScanStationM: 0.5,
+  /*
+   * guess on the multiple, DERIVED on the shape. A STEP is an outlier against
+   * the road's OWN smoothness, so the gate is the road's own p99 second
+   * difference times this, not a number chosen in advance — the same
+   * self-calibration the slip gate uses, for the same reason. 8x, because a
+   * smooth road's second difference is dominated by where its authored gradient
+   * changes and those are legitimate.
+   */
+  roadStepOutlierMultiple: 8,
+  /** guess. The arithmetic floor under that, so a perfectly smooth road does not
+   *  fail on float noise multiplied by eight. 5 mm over a 0.5 m station is a 1%
+   *  slope change, invisible to a driver and enormous to a difference. */
+  roadStepFloorM: 0.005,
+  /*
+   * guess on the tolerance, DERIVED on the rule. The ground under a moving kart
+   * may only rise or fall as fast as the road's own gradient allows at the speed
+   * the kart is doing — and the gradient is MEASURED by the lap scan above, not
+   * remembered from a comment. The tolerance covers the bank term across the
+   * road's width (a kart moving sideways on a banked corner changes its road
+   * height without the road having any gradient at all) and 0.5 m sampling.
+   */
+  roadRateTolerance: 1.8,
+  /** guess. The floor under that rate gate, so a kart crawling through a
+   *  hairpin is not graded against a rate budget of nearly zero. */
+  roadRateFloorMs: 0.5,
+  /*
+   * guess on the tolerance, DERIVED on the pair. `TrackLocation.height` is
+   * "Metres above the road plane at that point"; the road plane at (t, lateral)
+   * is reconstructible from `ITrack.sample` alone as
+   * `position + right*lateral`, with `normal` as its up. Two routes to one fact,
+   * exactly as `surface-report` does for `Surface`. 5 cm allows for `locate`
+   * choosing a slightly different `t` than the one it reports; a larger gap
+   * means the location service and the geometry disagree about where the road
+   * is, and everything downstream of `height` is then wrong in the same way.
+   */
+  heightAgreementM: 0.05,
+  /*
+   * guess on the fraction, DERIVED on the rule. "You can go through the map" is
+   * a claim about the chassis being INSIDE the road, and the contract gives the
+   * quantity directly: `TrackLocation.height` is signed and measured from the
+   * road plane. Zero is the surface. The gate is a fraction of the ride height
+   * the run itself settles at, so it needs no constant out of `src/kart/`: half
+   * of it puts the wheel centres below the plane on any kart whose wheels are
+   * smaller than its ride height, which is every kart.
+   */
+  minRideHeightFrac: 0.5,
+
+  // -- the seam ---------------------------------------------------------------
+  /*
+   * DERIVED from the report. The player said "the last part before the finish
+   * line", the lap wraps at t = 0, and `world/track.ts` puts the 35 m apron and
+   * the 132 m final corner immediately before it. 60 m either side is three
+   * seconds at racing speed and covers the apron, the line and the run onto the
+   * grid straight. The window that carries it is anchored to STRADDLE t = 0, and
+   * the check refuses to grade unless `t` was observed wrapping.
+   */
+  seamHalfWindowM: 60,
+  /*
+   * guess. How much worse the seam may be than the same statistic over the rest
+   * of the lap before it is called a SEAM defect rather than a lap-wide one.
+   * Three: two is inside the legitimate variation between one corner and
+   * another on a circuit with a 20° banked wall on it, and a factor of three
+   * localised to sixty metres either side of one line is not that.
+   */
+  seamExcessMultiple: 3,
+
+  // -- the premise, measured rather than asserted -----------------------------
+  /*
+   * guess on the fraction, DERIVED on the rule. The cruise's whole argument is
+   * that the tyres were never asked for the limit. That is a claim about a
+   * number this file did not possess until the limit probe measured it. 0.8
+   * means `latAccelBudget` must sit at or under four fifths of what the chassis
+   * was OBSERVED to deliver at full lock — a fifth of margin, which is the same
+   * order as the 4x §10c puts over a noise floor, relaxed because the
+   * denominator here is a measured capability rather than a noise floor.
+   */
+  latAccelMarginFrac: 0.8,
+  /** DERIVED: 180 ticks is 1.5 s, several times a single-track vehicle's yaw
+   *  settling time, and short enough that a kart at full lock has not yet left
+   *  the road. The peak within it is the number; the probe is reset afterwards. */
+  limitProbeTicks: 180,
+  /*
+   * DERIVED, and it is what makes the probe measure GRIP rather than a spin.
+   *
+   * Full lock at speed ends in a spin, and a spinning kart's velocity vector
+   * rotates with the body: at 10 rad/s and 20 m/s that is a perfectly real
+   * 200 m/s² of centripetal acceleration and a completely fictional statement
+   * about how much grip the tyres have. Only the ticks BEFORE the slip angle
+   * runs away are the tyres at their limit. `spinDeg / 3` = 15°: a third of the
+   * angle past which this file already says no corner is driveable, so the
+   * window closes well before the kart is sideways.
+   */
+  limitProbeMaxSlipDeg: 15,
+  /** DERIVED: the same 60 ticks of full throttle `commandProbeSpinUpTicks` uses,
+   *  for the same reason — a steer angle at a standstill produces no lateral
+   *  acceleration and would measure a limit of zero. */
+  limitProbeSpinUpTicks: 60,
 
   // -- monotone lane drift ---------------------------------------------------
   /*
@@ -609,8 +937,34 @@ async function battery(CFG) {
   const slipAgreement = mk('slip-agreement', "the kart's own reported slip angle matches an independent one")
   const wheelContact = mk('wheel-contact', 'on flat level road the wheels stay on the ground')
   const straightHold = mk('straight-hold', 'open loop, steer released, on the longest straight')
+  const demandHeadroom = mk('demand-headroom', "the cruise never asked for more than the chassis can deliver")
+  const lapContact = mk('lap-contact', 'over a whole lap, per curvature bin, the wheels stay down')
+  const rideQuality = mk('ride-quality', 'the wheels follow the road and the body does not')
+  const roadContinuity = mk('road-continuity', 'the ground is where the geometry says, and the kart is above it')
+  const lapSeam = mk('lap-seam', 'the lap wrap at the finish line, crossed and graded')
 
-  const graded = [placement, commandPath, driving, determinism, slipStraight, slipCorner, laneDrift, surfaceReport, slipAgreement, wheelContact, straightHold]
+  const graded = [placement, commandPath, driving, determinism, slipStraight, slipCorner, laneDrift, surfaceReport, slipAgreement, wheelContact, straightHold, demandHeadroom, lapContact, rideQuality, roadContinuity, lapSeam]
+
+  /** Everything downstream of "a kart was driven by this file", in one list so a
+   *  new check cannot be added to the page and forgotten by the four places
+   *  that have to downgrade all of them at once. */
+  const downstream = [
+    commandPath,
+    driving,
+    determinism,
+    slipStraight,
+    slipCorner,
+    laneDrift,
+    surfaceReport,
+    slipAgreement,
+    wheelContact,
+    straightHold,
+    demandHeadroom,
+    lapContact,
+    rideQuality,
+    roadContinuity,
+    lapSeam,
+  ]
 
   const needed = ['track', 'playerKartId', 'telemetry', 'resetRace', 'startRace', 'setDriver', 'setInput', 'stepTicks', 'kartSnapshot']
   const lack = needed.filter((n) => !have[n])
@@ -787,12 +1141,46 @@ async function battery(CFG) {
       driftSlipDeg: [],
       grounded: [],
       compression: [],
+      compressionMin: [],
+      compressionMax: [],
       wheelSteerRad: [],
       halfWidth: [],
       bank: [],
       usable: [],
       bin: [],
       t: [],
+      /*
+       * THE VERTICAL AXIS, RECORDED RAW. Every derived number — standard
+       * deviations, vertical velocity, vertical acceleration, the rate the
+       * ground moves — is computed in POST-PROCESSING from these arrays, so the
+       * identical arithmetic runs over the cruise, over every sweep window and
+       * over the seam window. A statistic computed one way here and another way
+       * there is two statistics with one name.
+       */
+      /** `TrackLocation.height`: metres above the road plane, by contract. */
+      height: [],
+      /** The same quantity recomputed from `ITrack.sample` alone. Two routes. */
+      heightFromSample: [],
+      /** World y of the chassis. */
+      posY: [],
+      /** World y of the ROAD under the kart, from track geometry and nothing
+       *  else — `sample.position + right * lateral`. */
+      roadY: [],
+      /** World y of the CENTRELINE at the same `t`, i.e. the road's own height
+       *  along the driven path with the camber term removed. This is what must
+       *  not move faster than the road's measured gradient allows; `roadY` minus
+       *  this is the kart's own sideways motion across a banked surface, which
+       *  is not the ground moving. */
+      centreY: [],
+      /** Horizontal velocity and the chassis' right axis, for the achieved
+       *  lateral acceleration. Differencing the WORLD velocity and projecting
+       *  onto the body right axis gives the full specific force, centripetal
+       *  term included — which is the lateral g the tyres are actually
+       *  producing, not the demand the road is making. */
+      vx: [],
+      vz: [],
+      rx: [],
+      rz: [],
     }
     const info = {
       reversingTicks: 0,
@@ -834,6 +1222,7 @@ async function battery(CFG) {
     let blankFor = 0
     let prev = null
     let commanded = null
+    let stoppedOnDistance = false
 
     for (let done = 0; done < totalTicks; done += CFG.stride) {
       const n = Math.min(CFG.stride, totalTicks - done)
@@ -904,13 +1293,19 @@ async function battery(CFG) {
       }
       let grounded = null
       let compression = null
+      let compressionMin = null
+      let compressionMax = null
       let wheelSteer = null
       if (snap.wheels && snap.wheels.length >= 4) {
         grounded = 0
         compression = 0
+        compressionMin = Infinity
+        compressionMax = -Infinity
         for (const w of snap.wheels) {
           if (w.grounded) grounded++
           compression += w.compression
+          if (w.compression < compressionMin) compressionMin = w.compression
+          if (w.compression > compressionMax) compressionMax = w.compression
         }
         compression /= snap.wheels.length
         // Front left and front right, per KartState.wheels' stated order.
@@ -992,6 +1387,27 @@ async function battery(CFG) {
         blankFor <= 0 &&
         Math.abs(snap.speed) >= CFG.speedFloor
 
+      /*
+       * THE ROAD PLANE UNDER THE KART, from `ITrack.sample` and nothing else.
+       *
+       * `sTmp` was sampled at `loc.t` above. The road surface at the kart's own
+       * lateral offset is `position + right * lateral` — `right` is banked by
+       * contract ("tangent × normal", with `normal` already rotated by the bank
+       * angle), so this follows a cambered road across its width rather than
+       * assuming it is flat. `roadY` is where the ground IS; `height` is how far
+       * the kart is above it; and the two are independent of each other, which
+       * is the only reason a step in one can be told from a bounce in the other.
+       */
+      const rpx = sTmp.position.x + sTmp.right.x * loc.lateral
+      const rpy = sTmp.position.y + sTmp.right.y * loc.lateral
+      const rpz = sTmp.position.z + sTmp.right.z * loc.lateral
+      const heightFromSample =
+        (snap.position.x - rpx) * sTmp.normal.x +
+        (snap.position.y - rpy) * sTmp.normal.y +
+        (snap.position.z - rpz) * sTmp.normal.z
+      rotQ(rightV, { x: 1, y: 0, z: 0 }, snap.quaternion)
+      const rl = Math.hypot(rightV.x, rightV.z)
+
       rec.tick.push(done + n)
       rec.slipDeg.push(slipDeg)
       rec.lateral.push(loc.lateral)
@@ -1004,16 +1420,45 @@ async function battery(CFG) {
       rec.driftSlipDeg.push(driftSlipDeg)
       rec.grounded.push(grounded)
       rec.compression.push(compression)
+      rec.compressionMin.push(compressionMin === Infinity ? null : compressionMin)
+      rec.compressionMax.push(compressionMax === -Infinity ? null : compressionMax)
       rec.wheelSteerRad.push(wheelSteer)
+      rec.height.push(loc.height)
+      rec.heightFromSample.push(heightFromSample)
+      rec.posY.push(snap.position.y)
+      rec.roadY.push(rpy)
+      rec.centreY.push(sTmp.position.y)
+      rec.vx.push(snap.velocity.x)
+      rec.vz.push(snap.velocity.z)
+      rec.rx.push(rl < 1e-6 ? null : rightV.x / rl)
+      rec.rz.push(rl < 1e-6 ? null : rightV.z / rl)
       if (Math.abs(snap.speed) > info.maxSpeed) info.maxSpeed = Math.abs(snap.speed)
       rec.halfWidth.push(sTmp.halfWidth)
       rec.bank.push(sTmp.bank)
       rec.usable.push(usable)
       rec.bin.push(bin)
       rec.t.push(loc.t)
+
+      /*
+       * DISTANCE-TERMINATED, not time-terminated, and only when asked. A sweep
+       * window has to stop before it reaches the next parked kart, and how long
+       * that takes depends on the corner it is driving. A window that ran to its
+       * tick cap instead reports the distance it did cover — `sweepMinDistanceFrac`
+       * grades that — rather than being quietly counted as a full one.
+       */
+      if (o.stopAfterM !== undefined && info.distanceM >= o.stopAfterM) {
+        stoppedOnDistance = true
+        break
+      }
     }
 
-    return { rec, info, seconds: totalTicks * CFG.simStep, samples: rec.tick.length }
+    return {
+      rec,
+      info,
+      seconds: rec.tick.length * CFG.stride * CFG.simStep,
+      samples: rec.tick.length,
+      stoppedOnDistance,
+    }
   }
 
   // =========================================================================
@@ -1108,7 +1553,7 @@ async function battery(CFG) {
   R.info.racing = racing
   R.info.fieldSize = tel0.karts.length
   if (!racing.ok) {
-    for (const c of [commandPath, driving, determinism, slipStraight, slipCorner, laneDrift, surfaceReport, slipAgreement, wheelContact, straightHold]) {
+    for (const c of downstream) {
       pend(
         c,
         `the race never reached phase 'racing' (${racing.why}) — a kart that is not racing does not respond to ` +
@@ -1173,7 +1618,7 @@ async function battery(CFG) {
   await h.resetRace({ drivers })
   const racingAgain = await ensureRacing()
   if (!racingAgain.ok) {
-    for (const c of [commandPath, driving, determinism, slipStraight, slipCorner, laneDrift, surfaceReport, slipAgreement, wheelContact, straightHold]) {
+    for (const c of downstream) {
       pend(c, `the race did not return to phase 'racing' after the command probe (${racingAgain.why})`)
     }
     return R
@@ -1182,7 +1627,7 @@ async function battery(CFG) {
   const cruiseTicks = Math.round(CFG.runSeconds / CFG.simStep)
   const cruise = await drive(cruiseTicks, {})
   if (cruise.blocked) {
-    for (const c of [commandPath, driving, determinism, slipStraight, slipCorner, laneDrift, surfaceReport, slipAgreement, wheelContact, straightHold]) {
+    for (const c of downstream) {
       pend(c, `the cruise was blocked: ${cruise.blocked}`)
     }
     return R
@@ -2034,10 +2479,11 @@ async function battery(CFG) {
       wheelContact.notes.push(
         `graded over ${(sTicks * CFG.stride * CFG.simStep).toFixed(1)} s of straight road up to a peak of ` +
           `${info.maxSpeed.toFixed(1)} m/s, which is the ceiling this probe commands (CFG.speedMax = ` +
-          `${CFG.speedMax} m/s, chosen from the lateral-acceleration budget and not from anything about the ` +
-          `suspension). A contact failure that only appears ABOVE that speed is outside this run's range and this ` +
-          `check says nothing about it. Raise --seconds or CFG.speedMax to extend the range; do not read this pass ` +
-          `as covering speeds it never reached.`,
+          `${CFG.speedMax} m/s, set just above the drivetrain's own ~27.8 terminal so the ceiling here is the KART's ` +
+          `rather than this file's). A contact failure that only appears ABOVE that speed is outside this run's ` +
+          `range and this check says nothing about it — a boosted kart is the obvious case, and nothing on this page ` +
+          `fires a pad, banks a drift tier or uses an item. This is the 40 s CRUISE only, from the grid: ` +
+          `'lap-contact' covers the whole lap and every curvature bin.`,
       )
     }
   }
@@ -2157,6 +2603,1175 @@ async function battery(CFG) {
     }
   }
 
+  // =========================================================================
+  // The vertical axis: one set of derivations, used by every check below
+  // =========================================================================
+  /*
+   * BODY MOTION IS MEASURED AGAINST THE ROAD, NOT AGAINST THE WORLD.
+   *
+   * A kart cresting a hill has a large world-frame vertical acceleration and is
+   * doing nothing wrong; a kart at a constant world height on a road that is
+   * dropping away is airborne. So "the body moved" means
+   * `TrackLocation.height` — metres above the road plane, by contract — moved,
+   * and its first and second differences are the body's vertical velocity and
+   * acceleration RELATIVE TO THE ROAD. That is what "it bounces" describes and
+   * it is not the same quantity as `position.y` changing.
+   *
+   * Differences are only taken between samples that are ADJACENT IN THE SAME
+   * RUN and both selected. A difference across a `seek`, across a window
+   * boundary or across an excluded tick is a difference across a teleport, and
+   * the enormous fake acceleration it produces would dominate every percentile
+   * on the page.
+   */
+  function collectVertical(rec, pick, out) {
+    const dt = CFG.simStep * CFG.stride
+    const n = rec.tick.length
+    for (let i = 0; i < n; i++) {
+      if (!pick(i)) continue
+      if (rec.height[i] === null || rec.height[i] === undefined) continue
+      out.height.push(rec.height[i])
+      if (rec.compression[i] !== null && rec.compression[i] !== undefined) out.compression.push(rec.compression[i])
+      if (rec.heightFromSample[i] !== null && rec.heightFromSample[i] !== undefined) {
+        out.heightGap.push(Math.abs(rec.heightFromSample[i] - rec.height[i]))
+      }
+      if (i === 0 || !pick(i - 1) || rec.height[i - 1] === null) continue
+      out.bodyVy.push((rec.height[i] - rec.height[i - 1]) / dt)
+      out.roadRate.push((rec.centreY[i] - rec.centreY[i - 1]) / dt)
+      out.roadRateSpeed.push(Math.abs(rec.speed[i]))
+      out.camberRate.push(
+        (rec.roadY[i] - rec.centreY[i] - (rec.roadY[i - 1] - rec.centreY[i - 1])) / dt,
+      )
+      /*
+       * ACHIEVED lateral acceleration, not demanded. The world velocity
+       * difference projected onto the chassis' own right axis carries the
+       * centripetal term with it, so this is the lateral specific force the
+       * tyres are actually producing — which is the quantity `latAccelBudget`
+       * is a budget for, and the quantity nothing on this page used to measure.
+       * Projected onto the HORIZONTAL right axis, matching `v²κ`.
+       *
+       * CENTRED, and that is not tidiness. A forward difference reads the
+       * velocity change over a tick and projects it onto the axis at the END of
+       * that tick — but the axis has ROTATED during it, so a fraction Δψ of the
+       * forward velocity leaks into the lateral channel. At 20 m/s and 8 rad/s
+       * of yaw that is 20·Δψ/dt ≈ 130 m/s² of pure arithmetic, and it made the
+       * reference world report a 1.2x overstated limit. Centring cancels the
+       * leading term.
+       */
+      if (
+        rec.rx[i] !== null &&
+        rec.rx[i] !== undefined &&
+        i + 1 < n &&
+        pick(i + 1) &&
+        rec.height[i + 1] !== null
+      ) {
+        out.latAccel.push(
+          ((rec.vx[i + 1] - rec.vx[i - 1]) * rec.rx[i] + (rec.vz[i + 1] - rec.vz[i - 1]) * rec.rz[i]) /
+            (2 * dt),
+        )
+      }
+      if (i < 2 || !pick(i - 2) || rec.height[i - 2] === null) continue
+      out.bodyAy.push((rec.height[i] - 2 * rec.height[i - 1] + rec.height[i - 2]) / (dt * dt))
+    }
+    return out
+  }
+  const newVertical = () => ({
+    height: [],
+    compression: [],
+    heightGap: [],
+    bodyVy: [],
+    bodyAy: [],
+    roadRate: [],
+    roadRateSpeed: [],
+    camberRate: [],
+    latAccel: [],
+  })
+  function sd(a) {
+    if (a.length < 2) return null
+    const m = mean(a)
+    let s = 0
+    for (const x of a) s += (x - m) * (x - m)
+    return Math.sqrt(s / (a.length - 1))
+  }
+  /* Written as loops, not `Math.max.apply`. A sweep pools five figures of
+   * samples and `apply` has an argument-count ceiling — one that produces a
+   * RangeError on a long run and never on a short one, which is the worst
+   * possible place for a harness to fall over. */
+  function minOf(a) {
+    if (!a.length) return null
+    let m = a[0]
+    for (const x of a) if (x < m) m = x
+    return m
+  }
+  function maxOf(a) {
+    if (!a.length) return null
+    let m = a[0]
+    for (const x of a) if (x > m) m = x
+    return m
+  }
+  function absMax(a) {
+    if (!a.length) return null
+    let m = 0
+    for (const x of a) if (Math.abs(x) > m) m = Math.abs(x)
+    return m
+  }
+  /** Mean-crossing rate, as a frequency. Two crossings make one cycle. */
+  function crossingHz(a) {
+    if (a.length < 4) return null
+    const m = mean(a)
+    let c = 0
+    for (let i = 1; i < a.length; i++) if (a[i] > m !== a[i - 1] > m) c++
+    return c / 2 / (a.length * CFG.stride * CFG.simStep)
+  }
+
+  // =========================================================================
+  // The limit probe — the number the whole page's premise rests on
+  // =========================================================================
+  /*
+   * `latAccelBudget` exists so this file can say "the tyres were never asked for
+   * the limit". Until this probe, THE LIMIT WAS NEVER MEASURED: the constant was
+   * justified in a comment that compared 8 m/s² against `SURFACE_PROPS.grip` of
+   * 0.88 as though a force multiplier were a g figure, and the pass criteria
+   * gated on nothing that could have noticed. A premise a harness asserts and
+   * never checks is a premise that is eventually false.
+   *
+   * So: put the kart on the longest straight at speed, hold FULL LOCK for 1.5 s,
+   * and record the largest lateral acceleration the chassis actually produced.
+   * That is the limit — measured on this build, on this surface, with this tyre
+   * model — and `demand-headroom` gates the budget against it.
+   */
+  const limit = { ok: false, peak: null, why: null }
+  function longestStraight() {
+    const N = 2048
+    const ds = L / N
+    const straightAt = new Uint8Array(N)
+    for (let i = 0; i < N; i++) straightAt[i] = curvatureAt(i / N) <= CFG.straightCurvature ? 1 : 0
+    let bestStart = -1
+    let bestLen = 0
+    let start = -1
+    for (let i = 0; i < 2 * N; i++) {
+      const j = i % N
+      if (straightAt[j]) {
+        if (start < 0) start = i
+        const len = i - start + 1
+        if (len > bestLen && len <= N) {
+          bestLen = len
+          bestStart = start
+        }
+      } else start = -1
+    }
+    return { t: bestStart < 0 ? null : (bestStart % N) / N, metres: bestLen * ds }
+  }
+  {
+    if (!have.seek) {
+      limit.why = 'requires seek; it is not available in this build'
+    } else {
+      const st = longestStraight()
+      if (st.t === null) {
+        limit.why = 'the circuit has no stretch of road under the straight-curvature limit to run the probe on'
+      } else {
+        await h.seek({ t: st.t, lateral: -track.racingLine(st.t), speed: CFG.holdSpeed })
+        h.setDriver(pid, 'scripted')
+        h.setInput({ steer: 0, throttle: 1, brake: 0, drift: false, useItem: false, look: 0 })
+        await h.stepTicks(CFG.limitProbeSpinUpTicks)
+        const probe = await drive(CFG.limitProbeTicks, { steer: 1, throttle: 1 })
+        if (probe.blocked) {
+          limit.why = `the limit probe was blocked: ${probe.blocked}`
+        } else {
+          const pr = probe.rec
+          /*
+           * ONLY THE TICKS BEFORE THE SPIN. See `limitProbeMaxSlipDeg`: once the
+           * kart is sideways its velocity vector is rotating with the body and
+           * the centripetal term is enormous and says nothing about grip. The
+           * kart must also still be ON the road — full lock ends up off it, and
+           * OffTrack has half the grip of asphalt, so a sample taken out there
+           * would measure a different surface's limit and call it the road's.
+           */
+          const v = collectVertical(
+            pr,
+            (i) =>
+              Math.abs(pr.speed[i]) >= CFG.speedFloor &&
+              pr.onTrack[i] &&
+              pr.slipDeg[i] !== null &&
+              Math.abs(pr.slipDeg[i]) <= CFG.limitProbeMaxSlipDeg,
+            newVertical(),
+          )
+          /*
+           * p95, NOT the maximum, and the max is printed beside it.
+           *
+           * The achieved lateral acceleration is a finite difference in a
+           * rotating frame; a single tick of it can spike well above what the
+           * tyres sustained, and a LIMIT that a one-tick outlier can raise is a
+           * limit that quietly widens the budget's allowance. p95 over the
+           * qualifying window is what the chassis held. On this build the two
+           * differ by about 4%, which is the size of the artefact.
+           */
+          const mags = sorted(v.latAccel.map(Math.abs))
+          const peak = mags.length ? quantile(mags, 0.95) : null
+          limit.maxTick = absMax(v.latAccel)
+          limit.median = mags.length ? quantile(mags, 0.5) : null
+          limit.gripTicks = v.latAccel.length
+          if (peak === null || v.latAccel.length < 10) {
+            limit.why =
+              `the probe produced only ${v.latAccel.length} tick(s) at speed, on track and under ` +
+              `${CFG.limitProbeMaxSlipDeg}° of slip — not enough to call anything a limit. The kart went sideways or ` +
+              `off the road before the tyres had been held at their limit for long enough to read one.`
+          } else {
+            limit.ok = true
+            limit.peak = peak
+            limit.samples = v.latAccel.length
+            limit.straightM = st.metres
+            limit.entrySpeed = CFG.holdSpeed
+          }
+        }
+      }
+    }
+  }
+
+  // =========================================================================
+  // demand-headroom — was the premise true on THIS build?
+  // =========================================================================
+  {
+    const cv = collectVertical(rec, (i) => rec.usable[i], newVertical())
+    const cruiseMags = sorted(cv.latAccel.map(Math.abs))
+    const cruiseP99 = cruiseMags.length ? quantile(cruiseMags, 0.99) : null
+    const cruisePeak = absMax(cv.latAccel)
+    const allowed = limit.peak === null ? null : limit.peak * CFG.latAccelMarginFrac
+    demandHeadroom.metrics = {
+      measuredLimitMs2: limit.peak,
+      measuredLimitG: limit.peak === null ? null : limit.peak / CFG.gravity,
+      measuredLimitMaxTickMs2: limit.maxTick ?? null,
+      measuredLimitMedianMs2: limit.median ?? null,
+      probeSamples: limit.samples ?? null,
+      commandedBudgetMs2: CFG.latAccelBudget,
+      marginFrac: CFG.latAccelMarginFrac,
+      allowedBudgetMs2: allowed,
+      cruiseP99AchievedMs2: cruiseP99,
+      cruiseMaxTickAchievedMs2: cruisePeak,
+      cruisePeakDemandedMs2: bCorner.maxLatAccel,
+    }
+    if (!limit.ok) {
+      pend(
+        demandHeadroom,
+        `the full-lock limit probe did not run (${limit.why}), so the chassis' lateral limit was NOT measured on this ` +
+          `build and CFG.latAccelBudget = ${CFG.latAccelBudget} m/s² is once again an assertion rather than a check. ` +
+          `Every slip verdict above rests on "the tyres were never asked for the limit"; unverified, that sentence is ` +
+          `exactly what let a budget of 8 m/s² sit ABOVE a measured limit of 7.85 while this file printed a pass.`,
+      )
+    } else if (!(CFG.latAccelBudget <= allowed)) {
+      fail(
+        demandHeadroom,
+        `the cruise commands a lateral-acceleration budget of ${CFG.latAccelBudget} m/s² ` +
+          `(${(CFG.latAccelBudget / CFG.gravity).toFixed(2)} g) against a chassis whose measured peak at full lock is ` +
+          `${limit.peak.toFixed(2)} m/s² (${(limit.peak / CFG.gravity).toFixed(2)} g). The budget must sit at or under ` +
+          `${allowed.toFixed(2)} m/s² — ${(CFG.latAccelMarginFrac * 100).toFixed(0)}% of it — for this file to be able ` +
+          `to say the tyres were never asked for the limit, and every slip gate above is quoted on the strength of ` +
+          `that sentence. The cruise actually achieved ` +
+          `${cruiseP99 === null ? '-' : cruiseP99.toFixed(2)} m/s² at p99 (worst tick ` +
+          `${cruisePeak === null ? '-' : cruisePeak.toFixed(2)}). Either lower CFG.latAccelBudget or stop claiming ` +
+          `the margin: a probe driving at the limit measures a tyre model, not a chassis fault.`,
+      )
+    } else {
+      demandHeadroom.notes.push(
+        `measured at full lock on ${limit.straightM.toFixed(0)} m of straight road from ${limit.entrySpeed} m/s over ` +
+          `${limit.samples} ticks under ${CFG.limitProbeMaxSlipDeg}° of slip: p95 ${limit.peak.toFixed(2)} m/s² ` +
+          `(${(limit.peak / CFG.gravity).toFixed(2)} g), median ${(limit.median ?? 0).toFixed(2)}, worst tick ` +
+          `${(limit.maxTick ?? 0).toFixed(2)}. The cruise commands ${CFG.latAccelBudget} and achieved ` +
+          `${cruiseP99 === null ? '-' : cruiseP99.toFixed(2)} at p99. This is the number the old comment guessed at ` +
+          `by calling SURFACE_PROPS' 0.88 grip MULTIPLIER a g figure; it is now measured, and the budget is gated ` +
+          `against it.` +
+          (cruiseP99 !== null && cruiseP99 > limit.peak
+            ? ` NOTE: the cruise's own p99 (${cruiseP99.toFixed(2)}) is ABOVE the measured limit, which means one of ` +
+              `the two is wrong — most likely the cruise is picking up kerb and bump transients that are not tyre ` +
+              `force. Reported, not gated: the gate is on the BUDGET, which is what this file controls.`
+            : ''),
+      )
+    }
+  }
+
+  // =========================================================================
+  // The lap sweep — a whole lap, at racing speed, with the field in the way
+  // =========================================================================
+  /*
+   * See the header. `resetRace` parks eight karts 6-27 m before the finish line,
+   * so a single run cannot drive a lap; `seek` scatters them at `t + k/n`, which
+   * leaves `length / fieldSize` metres of clear road and not one more. So the
+   * lap is tiled by seek-anchored windows sized from that clearance, with one of
+   * them anchored to straddle t = 0 by construction.
+   *
+   * Every number here is computed from `track.length` and the field size that
+   * `telemetry()` reports. If the arithmetic does not close — a field so large
+   * that a window is shorter than the settle, a circuit shorter than one window
+   * — the sweep does not run and every lap-scale check reports PENDING with the
+   * arithmetic printed. It does not quietly run a shorter one.
+   */
+  const sweep = {
+    ran: false,
+    why: null,
+    windows: [],
+    fieldSize: tel0.karts.length,
+    lengthM: L,
+    clearM: null,
+    driveM: null,
+    spacingM: null,
+    count: 0,
+    coveredM: 0,
+    seamWindow: null,
+  }
+  {
+    const clearM = sweep.fieldSize > 1 ? L / sweep.fieldSize : L
+    const usableM = clearM - CFG.sweepClearanceMarginM
+    const derivedCount = usableM > 0 ? Math.ceil(L / usableM) : 0
+    const count = CFG.sweepWindows >= 0 ? CFG.sweepWindows : derivedCount
+    sweep.clearM = clearM
+    sweep.derivedCount = derivedCount
+    sweep.count = count
+    if (!have.seek) {
+      sweep.why = 'requires seek; it is not available in this build'
+    } else if (count === 0) {
+      sweep.why =
+        CFG.sweepWindows === 0
+          ? 'the sweep was switched off with --windows=0. Nothing about the rest of the lap was measured.'
+          : `the field of ${sweep.fieldSize} karts leaves only ${clearM.toFixed(0)} m of clear road after a seek, which ` +
+            `is under the ${CFG.sweepClearanceMarginM} m clearance margin. No window fits.`
+    } else {
+      const spacingM = L / count
+      const driveM = Math.min(usableM, spacingM + CFG.sweepOverlapM)
+      sweep.spacingM = spacingM
+      sweep.driveM = driveM
+      /*
+       * THE SEAM WINDOW IS ANCHORED FIRST AND EVERYTHING ELSE IS SPACED OFF IT.
+       * A sweep whose windows happen to start at t = 0 would put the finish line
+       * at a window BOUNDARY — the one place a window cannot see — which is
+       * precisely the failure this whole addition exists to avoid.
+       */
+      const lead = clamp(driveM * 0.6, CFG.seamHalfWindowM, driveM - CFG.seamHalfWindowM)
+      const seamAnchorT = wrap01(1 - lead / L)
+      sweep.seamLeadM = lead
+      sweep.seamTrailM = driveM - lead
+      const capTicks = Math.round(CFG.sweepWindowSecondsCap / CFG.simStep)
+      const brakeM = Math.max(CFG.lookAheadMinM, CFG.speedMax * CFG.brakeLookSeconds)
+      const entrySpeedAt = (t) => {
+        let worst = 0
+        for (let i = 0; i <= 6; i++) {
+          const k = curvatureAt(t + (brakeM * i) / 6 / L)
+          if (k > worst) worst = k
+        }
+        return clamp(worst > 0 ? Math.sqrt(CFG.latAccelBudget / worst) : CFG.speedMax, CFG.speedMin, CFG.speedMax)
+      }
+
+      for (let j = 0; j < count; j++) {
+        const anchorT = wrap01(seamAnchorT + (j * spacingM) / L)
+        const entry = entrySpeedAt(anchorT)
+        await h.seek({ t: anchorT, lateral: -track.racingLine(anchorT), speed: entry })
+        h.setDriver(pid, 'scripted')
+        // Driven and DISCARDED: the sprung mass is settling from a placed pose,
+        // and a teleport transient in the first tenth of a second of every
+        // window would be the loudest thing on the page.
+        const settle = await drive(CFG.sweepSettleTicks, {})
+        if (settle.blocked) {
+          sweep.windows.push({ j, anchorT, blocked: settle.blocked })
+          continue
+        }
+        const w = await drive(capTicks, { stopAfterM: driveM })
+        if (w.blocked) {
+          sweep.windows.push({ j, anchorT, blocked: w.blocked })
+          continue
+        }
+        let wraps = 0
+        for (let i = 1; i < w.rec.t.length; i++) if (w.rec.t[i] < w.rec.t[i - 1] - 0.5) wraps++
+        sweep.windows.push({
+          j,
+          anchorT,
+          entrySpeed: entry,
+          rec: w.rec,
+          info: w.info,
+          seconds: w.seconds,
+          distanceM: w.info.distanceM,
+          hitCap: !w.stoppedOnDistance,
+          crossedSeam: wraps > 0,
+          isSeamWindow: j === 0,
+          samples: w.rec.tick.length,
+        })
+        sweep.coveredM += w.info.distanceM
+      }
+      const usableWindows = sweep.windows.filter((x) => !x.blocked)
+      sweep.ran = usableWindows.length > 0
+      sweep.blockedWindows = sweep.windows.length - usableWindows.length
+      sweep.shortWindows = usableWindows.filter((x) => x.distanceM < driveM * CFG.sweepMinDistanceFrac).length
+      sweep.seamWindow = sweep.windows.find((x) => x.isSeamWindow && !x.blocked) || null
+      if (!sweep.ran) sweep.why = 'every sweep window was blocked mid-run'
+    }
+  }
+  R.info.sweep = {
+    ran: sweep.ran,
+    why: sweep.why,
+    fieldSize: sweep.fieldSize,
+    lapLengthM: sweep.lengthM,
+    clearAfterSeekM: sweep.clearM,
+    windows: sweep.count,
+    windowDriveM: sweep.driveM,
+    windowSpacingM: sweep.spacingM,
+    coveredM: sweep.coveredM,
+    coverageOfLap: sweep.coveredM / L,
+    blockedWindows: sweep.blockedWindows ?? 0,
+    shortWindows: sweep.shortWindows ?? 0,
+    seamCrossed: sweep.seamWindow ? sweep.seamWindow.crossedSeam : null,
+    perWindow: sweep.windows.map((x) => ({
+      j: x.j,
+      anchorT: +x.anchorT.toFixed(5),
+      entrySpeed: x.entrySpeed ?? null,
+      distanceM: x.distanceM === undefined ? null : +x.distanceM.toFixed(1),
+      seconds: x.seconds === undefined ? null : +x.seconds.toFixed(2),
+      hitCap: x.hitCap ?? null,
+      crossedSeam: x.crossedSeam ?? null,
+      blocked: x.blocked ?? null,
+    })),
+  }
+
+  const sweepPend =
+    `the lap sweep did not run (${sweep.why}). This check therefore measured NOTHING about the rest of the lap: the ` +
+    `40 s cruise above starts on the grid and reaches roughly ${(info.distanceM / L * 100).toFixed(0)}% of the ` +
+    `circuit, so The Wall, the wash, the arch and the final corner — the part the player's report names — were never ` +
+    `driven. A gate that quietly covers nothing prints the same green as one that passed.`
+
+  // =========================================================================
+  // lap-contact — per curvature bin, over the whole lap, never pooled
+  // =========================================================================
+  /*
+   * `wheel-contact` above grades the 40 s cruise on the STRAIGHT bin only, and
+   * that is the right gate for the question it asks. It is also three separate
+   * blind spots: one bin, one seventh of the lap, and a speed ceiling under the
+   * kart's own terminal. This grades every bin, over every window of the sweep,
+   * and reports each separately — because a corner bounce averaged against a lap
+   * of clean straights is a corner bounce nobody sees.
+   *
+   * And a lap-wide FRACTION is itself an average. A hundred metres of bouncing
+   * is 6% of this circuit; it would sit under every fraction gate here while
+   * being unmistakable to drive. So the worst one-second window is graded too,
+   * and the report says where on the lap it was.
+   */
+  {
+    const bins = {}
+    for (const name of ['straight', 'transition', 'corner']) {
+      bins[name] = { samples: 0, groundSum: 0, air: 0, light: 0, speedSum: 0, maxSpeed: 0 }
+    }
+    let worst = null
+    let sweepMaxSpeed = 0
+    const perWin = Math.max(1, Math.round(CFG.worstWindowSeconds / (CFG.simStep * CFG.stride)))
+    for (const w of sweep.windows) {
+      if (w.blocked) continue
+      const r = w.rec
+      for (let i = 0; i < r.tick.length; i++) {
+        if (!r.usable[i] || r.grounded[i] === null) continue
+        const b = bins[r.bin[i]]
+        if (!b) continue
+        b.samples++
+        b.groundSum += r.grounded[i]
+        if (r.grounded[i] === 0) b.air++
+        if (r.grounded[i] <= 2) b.light++
+        b.speedSum += Math.abs(r.speed[i])
+        if (Math.abs(r.speed[i]) > b.maxSpeed) b.maxSpeed = Math.abs(r.speed[i])
+        if (Math.abs(r.speed[i]) > sweepMaxSpeed) sweepMaxSpeed = Math.abs(r.speed[i])
+      }
+      // The worst window is taken over CONSECUTIVE samples inside one sweep
+      // window, so it is a second of road and not a second of arithmetic
+      // stitched across two teleports.
+      for (let i = 0; i + perWin <= r.tick.length; i++) {
+        let seen = 0
+        let air = 0
+        const kinds = {}
+        for (let k = i; k < i + perWin; k++) {
+          if (r.grounded[k] === null || !r.onTrack[k]) continue
+          seen++
+          if (r.grounded[k] === 0) air++
+          kinds[r.bin[k]] = (kinds[r.bin[k]] || 0) + 1
+        }
+        if (seen < perWin * 0.75) continue
+        const frac = air / seen
+        if (worst === null || frac > worst.frac) {
+          worst = {
+            frac,
+            t: r.t[i],
+            seconds: r.tick[i] * CFG.simStep,
+            window: w.j,
+            bin: Object.keys(kinds).sort((a, b) => kinds[b] - kinds[a])[0],
+            speed: r.speed[i],
+          }
+        }
+      }
+    }
+    const out = {}
+    for (const name of ['straight', 'transition', 'corner']) {
+      const b = bins[name]
+      out[name] = {
+        samples: b.samples,
+        seconds: b.samples * CFG.stride * CFG.simStep,
+        meanGrounded: b.samples ? b.groundSum / b.samples : null,
+        airborneFrac: b.samples ? b.air / b.samples : null,
+        twoOrFewerFrac: b.samples ? b.light / b.samples : null,
+        meanSpeed: b.samples ? b.speedSum / b.samples : null,
+        maxSpeed: b.samples ? b.maxSpeed : null,
+      }
+    }
+    lapContact.metrics = {
+      coverageOfLap: sweep.ran ? sweep.coveredM / L : null,
+      coveredM: sweep.ran ? sweep.coveredM : null,
+      lapLengthM: L,
+      windows: sweep.count,
+      bins: out,
+      maxSpeedReached: sweepMaxSpeed,
+      speedCeilingCommanded: CFG.speedMax,
+      worstSecond: worst,
+      worstSecondGate: CFG.maxAirborneFracWorstWindow,
+      straightGates: { meanGrounded: CFG.minMeanGroundedWheels, airborneFrac: CFG.maxAirborneFrac },
+      cornerGates: { meanGrounded: CFG.minMeanGroundedCorner, airborneFrac: CFG.maxAirborneFracCorner },
+    }
+    if (!sweep.ran) {
+      pend(lapContact, sweepPend)
+    } else {
+      let anyGraded = false
+      /*
+       * `transition` is REPORTED and gated by nothing, exactly as it is in the
+       * slip bins above and for the same reason: it is the half second after a
+       * corner in which the yaw mode is still unwinding, it is a few percent of
+       * any lap, and folding it into either neighbour is how a harness invents a
+       * problem out of correct physics. The bin is printed; it is not a gate.
+       */
+      for (const name of ['straight', 'corner']) {
+        const b = out[name]
+        const strict = name === 'straight'
+        const gMin = strict ? CFG.minMeanGroundedWheels : CFG.minMeanGroundedCorner
+        const gAir = strict ? CFG.maxAirborneFrac : CFG.maxAirborneFracCorner
+        if (b.samples * CFG.stride < CFG.minBinTicks) {
+          pend(
+            lapContact,
+            `the '${name}' bin got only ${b.samples * CFG.stride} usable ticks over the whole sweep (floor ` +
+              `${CFG.minBinTicks}). That bin MEASURED NOTHING and the others cannot stand in for it — separate bins ` +
+              `is the entire point.`,
+          )
+          continue
+        }
+        anyGraded = true
+        if (!(b.meanGrounded >= gMin)) {
+          fail(
+            lapContact,
+            `over ${b.seconds.toFixed(1)} s of '${name}' road across the whole lap at ${b.meanSpeed.toFixed(1)} m/s ` +
+              `mean, the kart averaged ${b.meanGrounded.toFixed(2)} of 4 wheels in contact (floor ${gMin}). ` +
+              (strict
+                ? `Nothing on straight road launches a kart: no crest in plan, and lateral load transfer needs lateral ` +
+                  `acceleration a straight does not demand.`
+                : `A corner may legitimately run a wheel light over a kerb, which is why this floor is ${gMin} and not ` +
+                  `${CFG.minMeanGroundedWheels} — but a kart that cannot keep three wheels down through a corner has ` +
+                  `no grip to corner with, and no slip gate on this page need notice: a kart with a fraction of its ` +
+                  `grip still corners, just wide.`),
+          )
+        }
+        if (!(b.airborneFrac <= gAir)) {
+          fail(
+            lapContact,
+            `${(b.airborneFrac * 100).toFixed(1)}% of '${name}' ticks over the whole lap had ZERO wheels in contact ` +
+              `— the kart was fully airborne — against a limit of ${(gAir * 100).toFixed(0)}%. ` +
+              `${(b.twoOrFewerFrac * 100).toFixed(1)}% had two or fewer.`,
+          )
+        }
+      }
+      if (worst === null) {
+        pend(lapContact, 'no window of consecutive samples was long enough to grade a worst second')
+      } else if (!(worst.frac <= CFG.maxAirborneFracWorstWindow)) {
+        fail(
+          lapContact,
+          `the worst ${CFG.worstWindowSeconds} s of the sweep had the kart fully airborne for ` +
+            `${(worst.frac * 100).toFixed(1)}% of it (limit ${(CFG.maxAirborneFracWorstWindow * 100).toFixed(0)}%), on ` +
+            `'${worst.bin}' road at t=${worst.t.toFixed(4)} — ${(worst.t * L).toFixed(0)} m round the lap — at ` +
+            `${worst.speed.toFixed(1)} m/s, in sweep window ${worst.window}. The lap-wide fractions above may all be ` +
+            `inside their gates and that is the point: a hundred metres of this is 6% of the circuit and averages to ` +
+            `nothing, while being unmistakable to drive.`,
+        )
+      }
+      if (anyGraded) {
+        lapContact.notes.push(
+          `graded over ${sweep.coveredM.toFixed(0)} m of the ${L.toFixed(0)} m lap ` +
+            `(${((sweep.coveredM / L) * 100).toFixed(0)}%) in ${sweep.count} seek-anchored windows, each entered at ` +
+            `racing speed. Worst second: ${(worst === null ? 0 : worst.frac * 100).toFixed(1)}% airborne on ` +
+            `'${worst === null ? '-' : worst.bin}' road at t=${worst === null ? '-' : worst.t.toFixed(4)}.`,
+        )
+        /*
+         * WHAT SPEEDS THIS PASS COVERS, next to the pass. A contact fault is far
+         * more often a function of speed than of elapsed time, so a green here
+         * is green up to the number below and no further — and saying so is
+         * cheaper than a reader assuming otherwise. `CFG.speedMax` is now 28,
+         * above the drivetrain's own ~27.8 terminal, so the ceiling this run
+         * reaches is the KART's rather than this file's. What is still outside
+         * it is anything a BOOST reaches: nothing here fires a pad, banks a
+         * drift tier or uses an item.
+         */
+        lapContact.notes.push(
+          `speed coverage: peak ${sweepMaxSpeed.toFixed(1)} m/s across the sweep (straight bin peak ` +
+            `${(out.straight.maxSpeed || 0).toFixed(1)}, corner bin peak ${(out.corner.maxSpeed || 0).toFixed(1)}), ` +
+            `against a commanded ceiling of ${CFG.speedMax} m/s and a drivetrain terminal of about 27.8. Corner ` +
+            `speed is capped by CFG.latAccelBudget by design and always will be. Nothing on this page covers a ` +
+            `boosted kart: no pad, no drift tier, no item, so anything above terminal is outside this pass.`,
+        )
+      }
+    }
+  }
+
+  // =========================================================================
+  // ride-quality — the wheels should follow the road, the body should not
+  // =========================================================================
+  /*
+   * "The kart bounces" and "the suspension is working" produce the same answer
+   * to "did anything move vertically", and opposite answers to the question
+   * worth asking. So both are measured, side by side, and neither is allowed to
+   * stand for the other:
+   *
+   *   WHEEL compression SD   the bump being FELT. `src/kart/kart.ts` perturbs
+   *                          the ray target with a 1.10 m wavelength; at 14 m/s
+   *                          that is 12.7 Hz, and the fixed build measures 0.070
+   *                          of travel. Near zero means the suspension has
+   *                          stopped moving, which is not the same as calm.
+   *   BODY ride-height SD    the bump being TRANSMITTED. A 3.1 Hz sprung mass
+   *                          driven at 12.7 Hz passes (3.1/12.7)² ≈ 6% of it, so
+   *                          the fixed build measures 0.0005-0.0014 m. Larger is
+   *                          the defect and it is the defect a player calls
+   *                          bouncing.
+   *
+   * The pairing is what makes this diagnostic rather than descriptive: wheels
+   * moving and body still is correct; both moving is a suspension too soft or
+   * too fast for the input; body moving while the wheels DO NOT is a chassis
+   * being driven vertically by something that is not the road, and that is a
+   * different bug with a different owner.
+   */
+  {
+    /*
+     * ONLY TICKS WITH ALL FOUR WHEELS DOWN.
+     *
+     * `WheelState.compression` is 0 for a wheel that is not grounded — that is
+     * the contract's answer, and it is not a suspension reading. Graded without
+     * this filter, a kart hopping through the corners produces a compression
+     * standard deviation of nothing and this check calls it a rigid suspension,
+     * which is a second, wrong name for a fault `lap-contact` already owns and
+     * states correctly. One defect must not be reported twice under two
+     * different causes: the second report is what somebody then goes and fixes.
+     *
+     * A bin with too few fully-grounded ticks reports PENDING here — measured
+     * nothing — and `lap-contact` says why.
+     */
+    const perBin = {}
+    let notGrounded = 0
+    let totalTicks = 0
+    for (const name of ['straight', 'transition', 'corner']) {
+      const v = newVertical()
+      for (const w of sweep.windows) {
+        if (w.blocked) continue
+        collectVertical(
+          w.rec,
+          (i) => w.rec.usable[i] && w.rec.bin[i] === name && w.rec.grounded[i] === 4,
+          v,
+        )
+      }
+      perBin[name] = {
+        samples: v.height.length,
+        seconds: v.height.length * CFG.stride * CFG.simStep,
+        rideHeightSdM: sd(v.height),
+        rideHeightMeanM: mean(v.height),
+        rideHeightMinM: v.height.length ? minOf(v.height) : null,
+        bodyVertVelSdMs: sd(v.bodyVy),
+        bodyVertAccelP99G: v.bodyAy.length ? quantile(sorted(v.bodyAy.map(Math.abs)), 0.99) / CFG.gravity : null,
+        bodyVertAccelMaxG: v.bodyAy.length ? absMax(v.bodyAy) / CFG.gravity : null,
+        compressionSd: sd(v.compression),
+        compressionMean: mean(v.compression),
+        bodyHz: crossingHz(v.height),
+        compressionHz: crossingHz(v.compression),
+      }
+    }
+    for (const w of sweep.windows) {
+      if (w.blocked) continue
+      for (let i = 0; i < w.rec.tick.length; i++) {
+        if (!w.rec.usable[i] || w.rec.grounded[i] === null) continue
+        totalTicks++
+        if (w.rec.grounded[i] !== 4) notGrounded++
+      }
+    }
+    rideQuality.metrics = {
+      bins: perBin,
+      gradedOnlyFullyGroundedTicks: true,
+      ticksDroppedNotFullyGrounded: notGrounded,
+      ticksConsidered: totalTicks,
+      rideHeightSdGateM: CFG.rideHeightSdMaxM,
+      bodyVertAccelGateG: { straight: CFG.bodyVertAccelMaxG, corner: CFG.bodyVertAccelCornerG },
+      compressionSdFloor: CFG.minCompressionSd,
+      referenceCorrect: { rideHeightSdM: [0.0005, 0.0014], compressionSd: 0.07 },
+    }
+    if (!sweep.ran) {
+      pend(rideQuality, sweepPend)
+    } else {
+      let graded = 0
+      // `transition` reported, never gated — see lap-contact for why.
+      for (const name of ['straight', 'corner']) {
+        const b = perBin[name]
+        if (b.samples * CFG.stride < CFG.minRideTicks) {
+          pend(
+            rideQuality,
+            `the '${name}' bin got only ${b.samples * CFG.stride} usable ticks over the sweep (floor ` +
+              `${CFG.minRideTicks}); a standard deviation over less than that is a statement about a transient. That ` +
+              `bin MEASURED NOTHING.`,
+          )
+          continue
+        }
+        graded++
+        const accelGate = name === 'corner' ? CFG.bodyVertAccelCornerG : CFG.bodyVertAccelMaxG
+        /*
+         * The ride-height SD gate is on the STRAIGHT bin only, and the reason is
+         * physical rather than lenient: in a corner the body legitimately rolls
+         * and heaves with load transfer, which moves the ride height slowly and
+         * inflates its standard deviation without anything bouncing. The
+         * ACCELERATION gate is high-pass by construction — a second difference
+         * ignores a slow level change entirely — so it is the one that grades
+         * every bin, and it is the one a bounce cannot hide from.
+         */
+        if (name === 'straight' && !(b.rideHeightSdM <= CFG.rideHeightSdMaxM)) {
+          fail(
+            rideQuality,
+            `on settled straight road over ${b.seconds.toFixed(1)} s of the lap the BODY's ride height has a standard ` +
+              `deviation of ${b.rideHeightSdM.toFixed(5)} m (gate ${CFG.rideHeightSdMaxM} m), while the WHEELS' ` +
+              `compression has one of ${b.compressionSd === null ? '-' : b.compressionSd.toFixed(4)} of travel. The ` +
+              `fixed build measures 0.0005-0.0014 m of body against 0.070 of wheel: the wheels move the full ` +
+              `amplitude of the bump and the body does not, because a 3.1 Hz sprung mass driven at 12.7 Hz transmits ` +
+              `about 6% of it. A body moving this much is not the suspension working, it is the suspension not ` +
+              `working — and the two look identical to anything that measures only "did something move".`,
+          )
+        }
+        if (b.bodyVertAccelP99G !== null && !(b.bodyVertAccelP99G <= accelGate)) {
+          fail(
+            rideQuality,
+            `in the '${name}' bin the body's p99 vertical acceleration RELATIVE TO THE ROAD is ` +
+              `${b.bodyVertAccelP99G.toFixed(2)} g (limit ${accelGate} g, peak ` +
+              `${b.bodyVertAccelMaxG.toFixed(2)} g), over ${b.seconds.toFixed(1)} s at ` +
+              `${b.rideHeightMeanM.toFixed(3)} m mean ride height. A suspension can only PUSH: at 1 g downward the ` +
+              `springs are carrying nothing and every wheel is unloaded, so past it the body is being thrown rather ` +
+              `than suspended. This is a second difference, so a slow roll or a load transfer cannot produce it — ` +
+              `only something oscillating can. Body ${b.bodyHz === null ? '-' : b.bodyHz.toFixed(1)} Hz, wheels ` +
+              `${b.compressionHz === null ? '-' : b.compressionHz.toFixed(1)} Hz.`,
+          )
+        }
+        if (b.compressionSd !== null && !(b.compressionSd >= CFG.minCompressionSd)) {
+          fail(
+            rideQuality,
+            `in the '${name}' bin the wheels' compression barely moves — SD ${b.compressionSd.toFixed(5)} of travel, ` +
+              `floor ${CFG.minCompressionSd} — while the body's ride height has an SD of ` +
+              `${b.rideHeightSdM.toFixed(5)} m. The road HAS a bump profile and the spring is what feels it, so a ` +
+              `suspension that is not moving is not a calm one: it is a rigid link, and every metre of road is going ` +
+              `straight into the chassis. That is the difference between "it bounces" and "the suspension is doing ` +
+              `its job", and it is why both numbers are printed and both are gated.`,
+          )
+        }
+      }
+      if (graded) {
+        const s = perBin.straight
+        rideQuality.notes.push(
+          `straight bin: body ride-height SD ${s.rideHeightSdM === null ? '-' : s.rideHeightSdM.toFixed(5)} m at ` +
+            `${s.bodyHz === null ? '-' : s.bodyHz.toFixed(1)} Hz against wheel compression SD ` +
+            `${s.compressionSd === null ? '-' : s.compressionSd.toFixed(4)} at ` +
+            `${s.compressionHz === null ? '-' : s.compressionHz.toFixed(1)} Hz. The fixed build measures ` +
+            `0.0005-0.0014 m against 0.070 — wheels working, body still. Those two numbers are the answer to "is it ` +
+            `bouncing"; either one alone is not.`,
+        )
+      }
+    }
+  }
+
+  // =========================================================================
+  // road-continuity — is the GROUND where it should be?
+  // =========================================================================
+  /*
+   * A kart bouncing on good road and a road with a step in it produce the same
+   * complaint and want opposite fixes, so they are separated here by measuring
+   * the road with NO KART IN THE MEASUREMENT AT ALL, and then measuring the
+   * ground under the kart against what that scan found.
+   *
+   *   1. THE LAP SCAN. `ITrack.sample` every 0.5 m, across the road's width, all
+   *      the way round — INCLUDING ACROSS t = 1 -> 0, which is the wrap the
+   *      finish line sits on and the one a scan written as a simple loop from 0
+   *      to N-1 silently omits. A step is graded as an outlier against the
+   *      road's own second-difference distribution rather than against a number
+   *      chosen in advance.
+   *   2. THE GROUND UNDER THE KART may only rise and fall as fast as the
+   *      gradient THAT SCAN MEASURED allows at the speed the kart is doing.
+   *   3. `TrackLocation.height`, recomputed from `ITrack.sample` alone, must
+   *      agree with what `ITrack.locate` reports — two subsystems' routes to one
+   *      fact, the same argument `surface-report` makes about `Surface`. And the
+   *      chassis must be ABOVE the road plane, not inside it, which is the
+   *      player's "you can go through the map" stated as a signed number the
+   *      contract already defines.
+   */
+  {
+    const stations = Math.max(256, Math.round(L / CFG.roadScanStationM))
+    const ds = L / stations
+    const lanes = [-0.6, 0, 0.6]
+    const scan = mkSample()
+    const lane = []
+    for (let li = 0; li < lanes.length; li++) lane.push(new Float64Array(stations))
+    const gapX = new Float64Array(stations)
+    const gapZ = new Float64Array(stations)
+    const gapY = new Float64Array(stations)
+    const tanDot = new Float64Array(stations)
+    let prevTan = null
+    for (let i = 0; i < stations; i++) {
+      track.sample(i / stations, scan)
+      for (let li = 0; li < lanes.length; li++) {
+        lane[li][i] = scan.position.y + scan.right.y * (lanes[li] * scan.halfWidth)
+      }
+      gapX[i] = scan.position.x
+      gapY[i] = scan.position.y
+      gapZ[i] = scan.position.z
+      tanDot[i] = 0
+      if (prevTan) tanDot[i] = scan.tangent.x * prevTan.x + scan.tangent.y * prevTan.y + scan.tangent.z * prevTan.z
+      prevTan = { x: scan.tangent.x, y: scan.tangent.y, z: scan.tangent.z }
+    }
+    // The wrap, done explicitly and last, so it is impossible for it to be the
+    // iteration nobody wrote.
+    track.sample(0, scan)
+    tanDot[0] = scan.tangent.x * prevTan.x + scan.tangent.y * prevTan.y + scan.tangent.z * prevTan.z
+
+    /*
+     * TWO gradients, and using one for the other's job was a real weakening.
+     *
+     * `maxGradLane` is over the whole width, and on a banked corner it is
+     * dominated by the BANK RAMP: at 0.6 of an 11.6 m half-width, a 10° twist
+     * laid in over 20 m adds 19% of slope that the road itself does not have.
+     * Feeding that to the under-the-kart rate gate roughly doubled its
+     * allowance, which is a gate loosened by a number from somewhere else.
+     *
+     * `maxGradCentre` is lane 0 — the road's own elevation profile, the same
+     * quantity `centreY` records under the kart — and it is what that gate is
+     * quoted against. The wide one is reported, because a step is a step in any
+     * lane.
+     */
+    let maxGrad = 0
+    let maxGradCentre = 0
+    const steps = []
+    let worstStep = { v: -1, t: 0, lane: 0 }
+    const stepAt = new Float64Array(stations)
+    for (let li = 0; li < lanes.length; li++) {
+      const y = lane[li]
+      for (let i = 0; i < stations; i++) {
+        const a = y[(i - 1 + stations) % stations]
+        const b = y[i]
+        const c = y[(i + 1) % stations]
+        const g = Math.abs((c - a) / (2 * ds))
+        if (g > maxGrad) maxGrad = g
+        if (lanes[li] === 0 && g > maxGradCentre) maxGradCentre = g
+        const d2 = Math.abs(c - 2 * b + a)
+        steps.push(d2)
+        if (d2 > stepAt[i]) stepAt[i] = d2
+        if (d2 > worstStep.v) worstStep = { v: d2, t: i / stations, lane: lanes[li] }
+      }
+    }
+    const stepSorted = sorted(steps)
+    const stepP99 = quantile(stepSorted, 0.99)
+    const stepGate = Math.max(stepP99 * CFG.roadStepOutlierMultiple, CFG.roadStepFloorM)
+
+    // Station spacing across the seam, against the spacing everywhere else. A
+    // circuit whose spline does not close leaves its error HERE and nowhere
+    // else, and `world/track.ts` says so in as many words: 0.01 degrees over the
+    // Wall arc is 4 cm of seam.
+    const spans = []
+    for (let i = 0; i < stations; i++) {
+      const j = (i + 1) % stations
+      spans.push(Math.hypot(gapX[j] - gapX[i], gapY[j] - gapY[i], gapZ[j] - gapZ[i]))
+    }
+    const spanMed = quantile(sorted(spans), 0.5)
+    const spanDev = spans.map((s) => Math.abs(s - spanMed))
+    const spanDevSorted = sorted(spanDev)
+    const spanGate = Math.max(quantile(spanDevSorted, 0.99) * CFG.roadStepOutlierMultiple, CFG.roadStepFloorM)
+    const seamSpanDev = spanDev[stations - 1]
+    const seamStep = stepAt[0]
+    const worstTanDot = minOf(Array.prototype.slice.call(tanDot))
+    const seamTanDot = tanDot[0]
+
+    roadContinuity.metrics = {
+      lapScan: {
+        stations,
+        stationM: ds,
+        lanes,
+        maxGradientAnyLane: maxGrad,
+        maxGradientCentreline: maxGradCentre,
+        stepP99M: stepP99,
+        stepGateM: stepGate,
+        worstStepM: worstStep.v,
+        worstStepT: worstStep.t,
+        worstStepAtM: worstStep.t * L,
+        worstStepLane: worstStep.lane,
+        seamStepM: seamStep,
+        seamSpanDeviationM: seamSpanDev,
+        spanGateM: spanGate,
+        seamTangentDot: seamTanDot,
+        worstTangentDot: worstTanDot,
+      },
+    }
+
+    if (!(worstStep.v <= stepGate)) {
+      fail(
+        roadContinuity,
+        `the road surface has a ${worstStep.v.toFixed(4)} m second difference over a ${ds.toFixed(2)} m station at ` +
+          `t=${worstStep.t.toFixed(4)} — ${(worstStep.t * L).toFixed(0)} m round the lap, at ` +
+          `${(worstStep.lane * 100).toFixed(0)}% of the half-width — against a gate of ${stepGate.toFixed(4)} m. That ` +
+          `gate is the road's OWN p99 (${stepP99.toFixed(5)} m) times ${CFG.roadStepOutlierMultiple}, so this is an ` +
+          `outlier against the circuit's own smoothness rather than against a number anyone chose. A step or a kink ` +
+          `in the surface is a DIFFERENT defect from a kart bouncing on good road, with a different owner, and this is ` +
+          `the measurement that separates them: no kart took part in it.`,
+      )
+    }
+    if (!(seamSpanDev <= spanGate)) {
+      fail(
+        roadContinuity,
+        `the centreline station that spans the lap wrap is ${seamSpanDev.toFixed(4)} m off the median spacing of ` +
+          `${spanMed.toFixed(3)} m (gate ${spanGate.toFixed(4)} m). The spline does not close: a circuit's whole ` +
+          `closure error lands on this one station and nowhere else, which is why world/track.ts refuses to round the ` +
+          `fractional turns in its plan. The finish line sits exactly here, and so does the player's report.`,
+      )
+    }
+
+    // -- leg 2 and 3: the ground under the kart, over the sweep --------------
+    const v = newVertical()
+    for (const w of sweep.windows) {
+      if (w.blocked) continue
+      collectVertical(w.rec, (i) => w.rec.usable[i], v)
+    }
+    let worstRate = null
+    for (let i = 0; i < v.roadRate.length; i++) {
+      const allowed = Math.max(
+        CFG.roadRateFloorMs,
+        v.roadRateSpeed[i] * maxGradCentre * CFG.roadRateTolerance,
+      )
+      const excess = Math.abs(v.roadRate[i]) / allowed
+      if (worstRate === null || excess > worstRate.excess) {
+        worstRate = { excess, rate: v.roadRate[i], allowed, speed: v.roadRateSpeed[i] }
+      }
+    }
+    const heights = v.height
+    const medianRide = heights.length ? quantile(sorted(heights), 0.5) : null
+    const minRide = heights.length ? minOf(heights) : null
+    const rideFloor = medianRide === null ? null : medianRide * CFG.minRideHeightFrac
+    const gapP95 = v.heightGap.length ? quantile(sorted(v.heightGap), 0.95) : null
+    const gapMax = maxOf(v.heightGap)
+
+    roadContinuity.metrics.underKart = {
+      samples: v.roadRate.length,
+      worstRateMs: worstRate ? worstRate.rate : null,
+      worstRateAllowedMs: worstRate ? worstRate.allowed : null,
+      worstRateExcess: worstRate ? worstRate.excess : null,
+      maxCamberRateMs: absMax(v.camberRate),
+      medianRideHeightM: medianRide,
+      minRideHeightM: minRide,
+      rideHeightFloorM: rideFloor,
+      heightGapP95M: gapP95,
+      heightGapMaxM: gapMax,
+      heightGapGateM: CFG.heightAgreementM,
+    }
+
+    if (!sweep.ran) {
+      pend(
+        roadContinuity,
+        `the lap SCAN above ran — it needs no kart — but the ground-under-the-kart and TrackLocation.height legs did ` +
+          `not: ${sweepPend}`,
+      )
+    } else if (!v.roadRate.length) {
+      pend(roadContinuity, 'the sweep produced no adjacent usable pair to difference; nothing under the kart was measured')
+    } else {
+      if (worstRate && !(worstRate.excess <= 1)) {
+        fail(
+          roadContinuity,
+          `the ground under the kart moved at ${worstRate.rate.toFixed(2)} m/s vertically while the kart was doing ` +
+            `${worstRate.speed.toFixed(1)} m/s, against an allowance of ${worstRate.allowed.toFixed(2)} m/s. That ` +
+            `allowance is the circuit's own steepest measured CENTRELINE gradient ` +
+            `(${(maxGradCentre * 100).toFixed(1)}%) at that speed, ` +
+            `times ${CFG.roadRateTolerance} for camber and sampling — so the road moved faster than the road is ` +
+            `allowed to. THIS IS NOT THE KART BOUNCING: it is the surface arriving somewhere it was not, which is a ` +
+            `world/ defect and not a kart/ one, and the two are worth telling apart before anybody opens a file.`,
+        )
+      }
+      if (gapP95 !== null && !(gapP95 <= CFG.heightAgreementM)) {
+        fail(
+          roadContinuity,
+          `TrackLocation.height and the same quantity recomputed from ITrack.sample — the road plane at (t, lateral) ` +
+            `is position + right*lateral, with normal as its up — disagree by ${gapP95.toFixed(3)} m at p95 (worst ` +
+            `${gapMax.toFixed(3)} m, gate ${CFG.heightAgreementM} m). Two routes to one fact, and one of them is ` +
+            `wrong. Everything downstream of 'how far above the road is this kart' — the suspension ray, the camera, ` +
+            `every respawn — is then wrong in the same direction and none of it looks wrong.`,
+        )
+      }
+      if (minRide !== null && rideFloor !== null && !(minRide >= rideFloor)) {
+        fail(
+          roadContinuity,
+          `the chassis dropped to ${minRide.toFixed(3)} m above the road plane against a settled median of ` +
+            `${medianRide.toFixed(3)} m (floor ${rideFloor.toFixed(3)} m, half the median). TrackLocation.height is ` +
+            `signed and measured from the surface, so this is the kart going INTO the road rather than over it — ` +
+            `"you can go through the map", stated as the number the contract already defines. Half the settled ride ` +
+            `height puts the wheel centres below the plane on any kart whose wheels are smaller than its ride ` +
+            `height, which is every kart, so no constant out of src/kart/ was needed to say it.`,
+        )
+      }
+      roadContinuity.notes.push(
+        `lap scan: ${stations} stations of ${ds.toFixed(2)} m across ${lanes.length} lanes, wrap included and checked ` +
+          `explicitly — steepest gradient ${(maxGradCentre * 100).toFixed(1)}% on the centreline, ` +
+          `${(maxGrad * 100).toFixed(1)}% across the width where the bank ramps in, worst second difference ` +
+          `${worstStep.v.toFixed(4)} m at t=${worstStep.t.toFixed(4)}, seam station ${seamStep.toFixed(4)} m and ` +
+          `${seamSpanDev.toFixed(4)} m off the median spacing. Under the kart: ride height median ` +
+          `${medianRide === null ? '-' : medianRide.toFixed(3)} m, minimum ` +
+          `${minRide === null ? '-' : minRide.toFixed(3)} m.`,
+      )
+    }
+  }
+
+  // =========================================================================
+  // lap-seam — the wrap at the finish line, crossed on purpose and graded
+  // =========================================================================
+  /*
+   * THE ONLY CHECK ON THIS PAGE WHOSE FIRST JOB IS TO REFUSE.
+   *
+   * The player's report names the last part before the finish line, and the lap
+   * wraps there. A window that stops at the line, or one whose boundary lands on
+   * it, cannot see a defect that straddles it — and would print a pass. So the
+   * seam window is anchored to straddle t = 0 by construction, and this check
+   * asserts that the recorded `t` was OBSERVED wrapping before it grades
+   * anything at all. If it did not, PENDING: it measured nothing.
+   */
+  {
+    const w = sweep.seamWindow
+    const inSeam = (r, i) => {
+      const d = Math.min(r.t[i], 1 - r.t[i]) * L
+      return r.usable[i] && d <= CFG.seamHalfWindowM
+    }
+    lapSeam.metrics = {
+      halfWindowM: CFG.seamHalfWindowM,
+      anchorT: w ? w.anchorT : null,
+      leadM: sweep.seamLeadM ?? null,
+      trailM: sweep.seamTrailM ?? null,
+      crossedSeam: w ? w.crossedSeam : null,
+      windowDistanceM: w ? w.distanceM : null,
+      windowSeconds: w ? w.seconds : null,
+    }
+    if (!sweep.ran || !w) {
+      pend(lapSeam, sweepPend)
+    } else if (!w.crossedSeam) {
+      pend(
+        lapSeam,
+        `the seam window was anchored at t=${w.anchorT.toFixed(4)} to straddle the finish line — ` +
+          `${(sweep.seamLeadM || 0).toFixed(0)} m before it and ${(sweep.seamTrailM || 0).toFixed(0)} m after — and ` +
+          `the recorded t NEVER WRAPPED. It covered ${w.distanceM.toFixed(0)} m in ${w.seconds.toFixed(1)} s and ` +
+          `stopped short. So this check MEASURED NOTHING about the one place the player's report names, and it will ` +
+          `not print a pass for it: a check that never crosses the seam cannot see a seam defect. Look at 'driving' ` +
+          `for what stopped the kart.`,
+      )
+    } else {
+      let samples = 0
+      let groundSum = 0
+      let air = 0
+      const v = newVertical()
+      collectVertical(w.rec, (i) => inSeam(w.rec, i), v)
+      for (let i = 0; i < w.rec.tick.length; i++) {
+        if (!inSeam(w.rec, i) || w.rec.grounded[i] === null) continue
+        samples++
+        groundSum += w.rec.grounded[i]
+        if (w.rec.grounded[i] === 0) air++
+      }
+      // The rest of the lap, computed the same way, so "worse at the seam" is a
+      // comparison and not an impression.
+      const rest = newVertical()
+      let restSamples = 0
+      let restGround = 0
+      let restAir = 0
+      for (const x of sweep.windows) {
+        if (x.blocked) continue
+        collectVertical(x.rec, (i) => x.rec.usable[i] && !inSeam(x.rec, i), rest)
+        for (let i = 0; i < x.rec.tick.length; i++) {
+          if (!x.rec.usable[i] || inSeam(x.rec, i) || x.rec.grounded[i] === null) continue
+          restSamples++
+          restGround += x.rec.grounded[i]
+          if (x.rec.grounded[i] === 0) restAir++
+        }
+      }
+      const seamAccelG = v.bodyAy.length ? quantile(sorted(v.bodyAy.map(Math.abs)), 0.99) / CFG.gravity : null
+      const restAccelG = rest.bodyAy.length ? quantile(sorted(rest.bodyAy.map(Math.abs)), 0.99) / CFG.gravity : null
+      const seamMedianRide = v.height.length ? quantile(sorted(v.height), 0.5) : null
+      const restMedianRide = rest.height.length ? quantile(sorted(rest.height), 0.5) : null
+      const seamMinRide = v.height.length ? minOf(v.height) : null
+      lapSeam.metrics = {
+        ...lapSeam.metrics,
+        seamSamples: samples,
+        seamSeconds: samples * CFG.stride * CFG.simStep,
+        seamMeanGrounded: samples ? groundSum / samples : null,
+        seamAirborneFrac: samples ? air / samples : null,
+        restMeanGrounded: restSamples ? restGround / restSamples : null,
+        restAirborneFrac: restSamples ? restAir / restSamples : null,
+        seamBodyAccelP99G: seamAccelG,
+        restBodyAccelP99G: restAccelG,
+        seamRideHeightSdM: sd(v.height),
+        restRideHeightSdM: sd(rest.height),
+        seamMedianRideHeightM: seamMedianRide,
+        restMedianRideHeightM: restMedianRide,
+        seamMinRideHeightM: seamMinRide,
+        seamMaxRoadRateMs: absMax(v.roadRate),
+        excessMultiple: CFG.seamExcessMultiple,
+      }
+      if (samples * CFG.stride < CFG.minBinTicks) {
+        pend(
+          lapSeam,
+          `the seam window crossed the line but left only ${samples * CFG.stride} usable ticks inside ` +
+            `±${CFG.seamHalfWindowM} m of it (floor ${CFG.minBinTicks}). The exclusions under 'driving' say which ones ` +
+            `went; this check graded NOTHING.`,
+        )
+      } else {
+        const why =
+          `Measured over ${(samples * CFG.stride * CFG.simStep).toFixed(1)} s inside ±${CFG.seamHalfWindowM} m of the ` +
+          `finish line, in a window anchored to straddle it and CONFIRMED to have wrapped, against the same ` +
+          `statistics over the rest of the lap.`
+        if (!(lapSeam.metrics.seamAirborneFrac <= CFG.maxAirborneFracCorner)) {
+          fail(
+            lapSeam,
+            `at the finish line the kart was fully airborne for ` +
+              `${(lapSeam.metrics.seamAirborneFrac * 100).toFixed(1)}% of the window (limit ` +
+              `${(CFG.maxAirborneFracCorner * 100).toFixed(0)}%), against ` +
+              `${((lapSeam.metrics.restAirborneFrac || 0) * 100).toFixed(1)}% over the rest of the lap, with ` +
+              `${lapSeam.metrics.seamMeanGrounded.toFixed(2)} of 4 wheels down against ` +
+              `${(lapSeam.metrics.restMeanGrounded || 0).toFixed(2)} elsewhere. ${why}`,
+          )
+        }
+        if (seamAccelG !== null && restAccelG !== null && seamAccelG > restAccelG * CFG.seamExcessMultiple && seamAccelG > CFG.bodyVertAccelMaxG) {
+          fail(
+            lapSeam,
+            `the body's p99 vertical acceleration is ${seamAccelG.toFixed(2)} g inside ±${CFG.seamHalfWindowM} m of ` +
+              `the finish line against ${restAccelG.toFixed(2)} g over the rest of the lap — ` +
+              `${(seamAccelG / restAccelG).toFixed(1)}x, past the ${CFG.seamExcessMultiple}x this check calls a SEAM ` +
+              `defect rather than a lap-wide one, and past 1 g in absolute terms, at which point the springs are ` +
+              `carrying nothing. ${why}`,
+          )
+        }
+        if (seamMinRide !== null && restMedianRide !== null && !(seamMinRide >= restMedianRide * CFG.minRideHeightFrac)) {
+          fail(
+            lapSeam,
+            `at the finish line the chassis dropped to ${seamMinRide.toFixed(3)} m above the road plane, against a ` +
+              `settled median of ${restMedianRide.toFixed(3)} m over the rest of the lap (floor ` +
+              `${(restMedianRide * CFG.minRideHeightFrac).toFixed(3)} m). The kart is going INTO the road at the ` +
+              `finish line — which is the player's "in the last part before the finish line you can go through the ` +
+              `map", localised to the sixty metres either side of it. ${why}`,
+          )
+        }
+        lapSeam.notes.push(
+          `the window WRAPPED: ${(sweep.seamLeadM || 0).toFixed(0)} m before the line and ` +
+            `${(sweep.seamTrailM || 0).toFixed(0)} m after, ${(samples * CFG.stride * CFG.simStep).toFixed(1)} s of ` +
+            `usable samples inside ±${CFG.seamHalfWindowM} m. Seam vs rest of lap: ` +
+            `${lapSeam.metrics.seamMeanGrounded.toFixed(2)} vs ${(lapSeam.metrics.restMeanGrounded || 0).toFixed(2)} ` +
+            `wheels down, ${seamAccelG === null ? '-' : seamAccelG.toFixed(2)} vs ` +
+            `${restAccelG === null ? '-' : restAccelG.toFixed(2)} g of body acceleration, ` +
+            `${seamMinRide === null ? '-' : seamMinRide.toFixed(3)} m minimum ride height.`,
+        )
+      }
+    }
+  }
+
   /*
    * COMMAND-PATH OUTRANKS EVERYTHING. If this file could not observe its own
    * commands arriving, no slip number below is attributable to them, and each
@@ -2165,7 +3780,7 @@ async function battery(CFG) {
    * whoever was driving.
    */
   if (!commandsReached) {
-    for (const c of [slipStraight, slipCorner, laneDrift, wheelContact, straightHold]) {
+    for (const c of [slipStraight, slipCorner, laneDrift, wheelContact, straightHold, demandHeadroom, lapContact, rideQuality, roadContinuity, lapSeam]) {
       pend(
         c,
         `command-path did not confirm that this file's commands reached the kart, so whatever was measured here is ` +
@@ -2267,6 +3882,36 @@ function installReferenceWorld(sabotage, CFG) {
   const wrap01 = (x) => x - Math.floor(x)
 
   /*
+   * ELEVATION, and the reference has it for one reason: `road-continuity` asks
+   * whether the ground is where the geometry says it is, and a perfectly flat
+   * road answers that question with zero on both sides. A gate that only ever
+   * subtracts nought from nought has not been shown to work.
+   *
+   * Two harmonics, both periodic in `t`, so the profile CLOSES ACROSS THE SEAM
+   * by construction — which is the property the `road-step` sabotage then breaks
+   * on purpose somewhere else, and which the seam leg of the scan is checking
+   * for on the real circuit. Peak gradient works out at 8.7%, the same order as
+   * §1's authored "never over 8% up or 11% down".
+   */
+  function roadY(u) {
+    const t = u / LENGTH
+    let y = 6 * Math.sin(2 * Math.PI * t) + 3 * Math.sin(4 * Math.PI * t + 0.7)
+    /*
+     * `road-step` raises 6 m of road by 18 cm and drops it again. The KART
+     * follows it exactly — its own height is measured from this surface — so
+     * nothing about the kart's ride changes and `ride-quality` and `lap-contact`
+     * must both stay quiet. Only the GROUND moved, which is a different defect
+     * with a different owner, and separating the two is the whole point of
+     * measuring the road with no kart in the measurement.
+     */
+    if (S === 'road-step') {
+      const uu = ((u % LENGTH) + LENGTH) % LENGTH
+      if (uu > 0.62 * LENGTH && uu < 0.62 * LENGTH + 6) y += 0.18
+    }
+    return y
+  }
+
+  /*
    * right = (-tangent.z, 0, tangent.x). That is tangent x normal with normal =
    * +Y, and it is the driver's right under the contract's axes: facing -Z the
    * right is +X, facing +X the right is +Z. Both fall out of it.
@@ -2301,7 +3946,7 @@ function installReferenceWorld(sabotage, CFG) {
       tz = Math.cos(a)
       k = 1 / RADIUS
     }
-    out.position.set(px, 0, pz)
+    out.position.set(px, roadY(u), pz)
     out.tangent.set(tx, 0, tz)
     out.normal.set(0, 1, 0)
     out.right.set(-tz, 0, tx)
@@ -2429,12 +4074,54 @@ function installReferenceWorld(sabotage, CFG) {
   const TOP_SPEED = 30
   const ACCEL_K = 0.02
   const BRAKE_A = 12
+  /*
+   * A SATURATING TYRE, which the linear model above does not have.
+   *
+   * `demand-headroom` measures the chassis' lateral limit by holding full lock
+   * and watching what comes out. A purely linear single-track model has no limit
+   * at all — neutral steer gives a_lat = v²δ/wheelbase, which is 163 m/s² at
+   * 20 m/s — so the check would pass against the clean reference by measuring a
+   * number that is not a limit, and would have been shown to work on nothing.
+   * 8.5 m/s² is the same order as a real kart's 7.85, and it is above everything
+   * the cruise demands (`latAccelBudget` is 6), so it changes no other result.
+   *
+   * `grip-margin-gone` lowers it to 7.0: still above every demand the cruise
+   * makes, so nothing else on the page notices — and yet the budget of 6 no
+   * longer has the 20% margin it claims. That is EXACTLY the defect this file
+   * was carrying, reproduced, so the fix can be watched to catch it.
+   */
+  const LAT_CAP = S === 'grip-margin-gone' ? 7.0 : 8.5
+
+  /*
+   * THE VERTICAL AXIS. A one-degree-of-freedom sprung mass, and it is modelled
+   * rather than faked for the same reason the tyres are: `ride-quality` grades a
+   * ride height against a suspension, and a reference where either is a constant
+   * would only ever prove that zero is less than the gate.
+   *
+   * Everything here mirrors `src/kart/kart.ts` deliberately, including the two
+   * details that are the whole subject:
+   *   - the bump is a function of DISTANCE, `sin(s * 5.7)`, a 1.10 m wavelength;
+   *   - the SPRING feels the bump and the DAMPER does not. Feeding the damper a
+   *     ray length containing the bump yields a damper velocity proportional to
+   *     SPEED, which is the mechanism that once pumped the real kart to full
+   *     droop and put all four wheels in the air half of every tick.
+   * At 3.1 Hz against a 12.7 Hz input the body sees ~6% of the bump, so the
+   * wheels move and the body does not — which is what a working suspension looks
+   * like as a pair of numbers.
+   */
+  const RIDE_REST = 0.565
+  const TRAVEL = 0.09
+  const FULL_EXT = RIDE_REST + TRAVEL * 0.5
+  const WN = 2 * Math.PI * 3.1
+  const ZETA = 0.35
+  const BUMP_K = 5.7
+  const BUMP_A = 0.02 * 0.42
 
   const idleFrame = { steer: 0, throttle: 0, brake: 0, drift: false, useItem: false, look: 0 }
   const NKARTS = 3
   const karts = []
   for (let i = 0; i < NKARTS; i++) {
-    karts.push({ id: i, x: 0, y: 0, z: 0, yaw: 0, vLong: 0, vLat: 0, r: 0, steerRad: 0, mode: 'idle', frame: { ...idleFrame }, respawns: 0 })
+    karts.push({ id: i, x: 0, y: 0, z: 0, yaw: 0, vLong: 0, vLat: 0, r: 0, steerRad: 0, mode: 'idle', frame: { ...idleFrame }, respawns: 0, ride: RIDE_REST, rideV: 0, s: 0 })
   }
   const PLAYER = 0
   let injected = { ...idleFrame }
@@ -2447,12 +4134,48 @@ function installReferenceWorld(sabotage, CFG) {
     const s = mkSample()
     frameAt(wrap01(t) * LENGTH, s)
     k.x = s.position.x + s.right.x * lateral
-    k.y = 0
     k.z = s.position.z + s.right.z * lateral
     k.yaw = Math.atan2(-s.tangent.x, -s.tangent.z)
     k.vLong = speed === undefined ? 0 : speed
     k.vLat = 0
     k.r = 0
+    // Placed at rest ON the surface, not at a fixed world height: the road has
+    // elevation now, and a kart teleported to y = 0 would be underneath it.
+    k.s = wrap01(t) * LENGTH
+    k.ride = RIDE_REST
+    k.rideV = 0
+    k.y = s.position.y + k.ride
+  }
+
+  /**
+   * The sprung mass, one tick. `u` is the kart's distance along the lap, which
+   * is what the bump profile is a function of — the same as `kart.ts`, and the
+   * reason a damper fed the bumped ray produces a velocity proportional to
+   * speed rather than to anything about the road.
+   */
+  function stepRide(k, u) {
+    const bump = Math.sin(u * BUMP_K) * BUMP_A
+    if (S === 'body-pumping') {
+      /*
+       * THE BODY FOLLOWS THE ROAD AND THE WHEELS DO NOT MOVE AT ALL.
+       *
+       * This is the distinction `ride-quality` exists to make, built as a world:
+       * something drives the chassis vertically at the road's own input
+       * frequency with 3.6x the bump's amplitude, while `compression` sits at a
+       * constant — so anything that only asked "is the suspension moving" sees a
+       * calm answer, and anything that only asked "did something move
+       * vertically" sees the same answer a working suspension gives. Only the
+       * PAIR separates them, and `lap-contact` must stay quiet throughout
+       * because every wheel is still on the ground.
+       */
+      k.ride = RIDE_REST + 0.03 * Math.sin(u * BUMP_K)
+      k.rideV = 0
+      return bump
+    }
+    const acc = -WN * WN * (k.ride - bump - RIDE_REST) - 2 * ZETA * WN * k.rideV
+    k.rideV += acc * SIM_STEP
+    k.ride += k.rideV * SIM_STEP
+    return bump
   }
 
   /** The extra lateral velocity a sabotage injects. Nothing else touches it. */
@@ -2512,6 +4235,17 @@ function installReferenceWorld(sabotage, CFG) {
     k.vLong += (target - k.vLong) * ACCEL_K
     if (frame.brake > 0) k.vLong -= frame.brake * BRAKE_A * SIM_STEP
     if (k.vLong < 0.05) k.vLong = 0.05
+    /*
+     * `seam-blocked` stops the kart dead in the 60 m before the finish line, and
+     * it is owned by `lap-seam` with an expected status of PEND rather than
+     * FAIL. That distinction IS the sabotage: a seam window that never reaches
+     * the seam has MEASURED NOTHING about it, and a check printing a pass in
+     * that state is the failure mode this whole repo is built against. The rest
+     * of the lap is untouched, so every other window still grades normally —
+     * which is what makes the PENDING attributable to the seam rather than to a
+     * broken run.
+     */
+    if (S === 'seam-blocked' && k.s > LENGTH - 60) k.vLong = 0.05
 
     // Lateral: linear-tyre single-track model. The denominator is floored, as
     // every real single-track model floors it: the slip-angle definition has a
@@ -2519,12 +4253,39 @@ function installReferenceWorld(sabotage, CFG) {
     const vRef = Math.max(0.5, k.vLong)
     const af = delta - (k.vLat + A_LEN * k.r) / vRef
     const ar = -(k.vLat - B_LEN * k.r) / vRef
-    const fyf = CF * af
-    const fyr = CR * ar
-    k.vLat += ((fyf + fyr) / M - k.r * k.vLong) * SIM_STEP
+    let fyf = CF * af
+    let fyr = CR * ar
+    /*
+     * Saturating, not linear, and the saturation is applied TO THE FORCES rather
+     * than to the resulting acceleration — which matters, and cost a round of
+     * this file to notice. Capping only the translational equation while the yaw
+     * equation kept the uncapped moment leaves a model that is not a vehicle:
+     * the kart spins up to 10 rad/s and its velocity vector rotates at
+     * v·r = 200 m/s², which the limit probe faithfully measured and reported as
+     * a 20 g chassis. Scaling both forces by one factor keeps the moment and the
+     * force consistent, which is what a tyre running out of grip actually does.
+     */
+    const cap = LAT_CAP * M
+    const tot = Math.abs(fyf + fyr)
+    if (tot > cap) {
+      const scale = cap / tot
+      fyf *= scale
+      fyr *= scale
+    }
+    /*
+     * ONE TICK'S WORTH OF r, USED CONSISTENTLY. The lateral equation, the yaw
+     * integration and the pose all advance on the SAME r; using the updated one
+     * for the pose while the lateral equation used the old one leaves the two
+     * out of step by ṙ·dt·vLong, which at 27 rad/s² and 20 m/s is 4.5 m/s² of
+     * pure integration error. It reads as the chassis producing more lateral
+     * acceleration than its own tyre cap allows — the limit probe measured 10.25
+     * against a cap of 8.5 — and it is a fault in this model, not a finding.
+     */
+    const rNow = k.r
+    k.vLat += ((fyf + fyr) / M - rNow * k.vLong) * SIM_STEP
     k.r += ((A_LEN * fyf - B_LEN * fyr) / IZ) * SIM_STEP
 
-    k.yaw -= k.r * SIM_STEP
+    k.yaw -= rNow * SIM_STEP
     const fx = -Math.sin(k.yaw)
     const fz = -Math.cos(k.yaw)
     const rx = Math.cos(k.yaw)
@@ -2532,6 +4293,41 @@ function installReferenceWorld(sabotage, CFG) {
     const vLatTotal = k.vLat + slideOffset()
     k.x += (fx * k.vLong + rx * vLatTotal) * SIM_STEP
     k.z += (fz * k.vLong + rz * vLatTotal) * SIM_STEP
+
+    /*
+     * The vertical axis, integrated LAST and against the road the kart has just
+     * arrived on. `s` is taken from `locate` rather than accumulated from speed:
+     * an accumulated distance drifts out of step with the located `t` over a
+     * long run, and the kart's ride height would then be measured from a
+     * different piece of road than the one under it — which is a bug this
+     * harness would report, in its own reference world, as a real one.
+     */
+    rideP.set(k.x, 0, k.z)
+    locate(rideP, rideLoc)
+    k.s = rideLoc.t * LENGTH
+    k.bump = stepRide(k, k.s)
+    /*
+     * "In the last part before the finish line you can go through the map."
+     * `seam-sink` lowers the chassis INTO the road within 25 m of the line and
+     * brings it back out, with every wheel still reporting contact and the road
+     * geometry untouched — so `lap-contact` sees nothing and the kart-free lap
+     * scan sees nothing. Only a check that asks where the kart is RELATIVE TO
+     * the surface can find it, and only one anchored to straddle the seam can
+     * say that is where it happens.
+     *
+     * Applied as an offset on the reported pose, NOT by moving `k.ride`: the
+     * sprung mass is stateful and shoving its position would have the spring
+     * fight back at several g, which every gate on the page would catch for the
+     * wrong reason.
+     */
+    k.sink = 0
+    if (S === 'seam-sink') {
+      const d = Math.min(k.s, LENGTH - k.s)
+      // Ramped over 25 m, so it is a kart sinking rather than a vertical
+      // impulse. At 22 m/s that is 1.1 s, well under 0.1 g of body acceleration.
+      if (d < 25) k.sink = 0.45 * (1 - (d / 25) * (d / 25))
+    }
+    k.y = roadY(k.s) + k.ride - k.sink
   }
 
   function stepOne() {
@@ -2546,6 +4342,8 @@ function installReferenceWorld(sabotage, CFG) {
 
   const snapLoc = { t: 0, lateral: 0, height: 0, onTrack: true, checkpointIndex: 0 }
   const snapP = vec()
+  const rideLoc = { t: 0, lateral: 0, height: 0, onTrack: true, checkpointIndex: 0 }
+  const rideP = vec()
 
   function snapshot(k) {
     const vLatTotal = k.vLat + slideOffset()
@@ -2568,9 +4366,30 @@ function installReferenceWorld(sabotage, CFG) {
      * must stay QUIET and wheel-contact must go red, which is the evidence that
      * a slip-angle gate does not subsume a grip one.
      */
-    const airborne = S === 'hovering' && k.vLong > 15
+    /*
+     * `corner-hop` lifts the wheels IN THE BENDS ONLY, above 12 m/s, and leaves
+     * every straight clean. That is the exact shape of the hole this file was
+     * extended to fill: `wheel-contact` grades the straight bin and must stay
+     * QUIET through it, while `lap-contact` — which grades every bin separately
+     * over the whole lap — must go red. A per-bin gate and a pooled one give
+     * opposite answers here, and only one of them is right.
+     */
+    const cornering = Math.abs(locScratch.curvature) > 1e-6
+    const airborne =
+      (S === 'hovering' && k.vLong > 15) || (S === 'corner-hop' && cornering && k.vLong > 12)
+    /*
+     * Compression is the BUMP being felt: the ray length is the ride height less
+     * the bump, so the spring sees the road's short-wavelength input at full
+     * amplitude while the body sees ~6% of it. On the clean reference this
+     * produces an SD near 0.066 of travel against a body SD near 0.0002 m —
+     * the same shape as the 0.070 / 0.0005-0.0014 the fixed game measures.
+     */
+    const rayLength = k.ride - (k.bump || 0)
+    let compression = Math.max(0, Math.min(1, (FULL_EXT - rayLength) / TRAVEL))
+    // `body-pumping` holds the wheels rigid while the body moves. See stepRide.
+    if (S === 'body-pumping') compression = 0.5
     const wheel = (sa) => ({
-      compression: airborne ? 0.02 : 0.5,
+      compression: airborne ? 0.02 : compression,
       steerAngle: sa,
       spin: 0,
       grounded: !airborne,
@@ -2756,14 +4575,14 @@ const SABOTAGES = [
     name: 'stuck',
     owner: 'driving',
     expect: 'FAIL',
-    pend: ['slip-straight'],
+    pend: ['slip-straight', 'lap-contact', 'ride-quality', 'lap-seam'],
     what: 'the kart never moves. driving must go red and slip-straight must PEND, not print a green gate over nothing',
   },
   {
     name: 'commands-ignored',
     owner: 'command-path',
     expect: 'FAIL',
-    pend: ['slip-straight', 'slip-corner', 'wheel-contact'],
+    pend: ['slip-straight', 'slip-corner', 'wheel-contact', 'lap-contact', 'ride-quality', 'lap-seam'],
     what: "the physics runs on the idle frame while lastInput still echoes ours — a phase gate in driverFrame, exactly",
   },
   {
@@ -2772,6 +4591,48 @@ const SABOTAGES = [
     expect: 'FAIL',
     quiet: ['slip-straight', 'slip-corner', 'slip-agreement'],
     what: 'the kart flies above 15 m/s with the tyre model untouched. THE proof that a slip gate does not subsume a grip one',
+  },
+  {
+    name: 'corner-hop',
+    owner: 'lap-contact',
+    expect: 'FAIL',
+    quiet: ['wheel-contact', 'slip-straight', 'ride-quality', 'road-continuity'],
+    what: 'the wheels leave the ground IN THE BENDS ONLY. wheel-contact grades the straight bin and must stay QUIET',
+  },
+  {
+    name: 'body-pumping',
+    owner: 'ride-quality',
+    expect: 'FAIL',
+    quiet: ['lap-contact', 'wheel-contact', 'slip-straight', 'road-continuity'],
+    what: 'the body follows the road at the bump frequency while compression sits at a constant — moving is not working',
+  },
+  {
+    name: 'road-step',
+    owner: 'road-continuity',
+    expect: 'FAIL',
+    quiet: ['ride-quality', 'lap-contact', 'wheel-contact', 'slip-straight'],
+    what: 'an 18 cm riser in the ROAD, which the kart follows perfectly. The ground moved; nothing about the ride did',
+  },
+  {
+    name: 'seam-sink',
+    owner: 'lap-seam',
+    expect: 'FAIL',
+    quiet: ['lap-contact', 'wheel-contact', 'slip-straight'],
+    what: 'the chassis goes THROUGH the road within 25 m of the finish line, wheels still reporting contact',
+  },
+  {
+    name: 'seam-blocked',
+    owner: 'lap-seam',
+    expect: 'PEND',
+    quiet: ['road-continuity', 'ride-quality'],
+    what: 'the kart stops 60 m short of the line. A window that never crosses the seam measured NOTHING: PEND, not PASS',
+  },
+  {
+    name: 'grip-margin-gone',
+    owner: 'demand-headroom',
+    expect: 'FAIL',
+    quiet: ['driving', 'slip-straight', 'slip-corner', 'lane-drift', 'wheel-contact', 'lap-contact'],
+    what: "the lateral limit drops to 7.0 m/s² — above every demand the cruise makes, so ONLY the premise notices",
   },
   {
     name: 'soft-tyres',
@@ -2797,6 +4658,11 @@ const CHECK_ORDER = [
   'slip-agreement',
   'wheel-contact',
   'straight-hold',
+  'demand-headroom',
+  'lap-contact',
+  'ride-quality',
+  'road-continuity',
+  'lap-seam',
 ]
 
 function fmt(n, digits = 3) {
@@ -2838,6 +4704,54 @@ function summarise(c) {
       return `p95 |diff| ${fmt(m.p95DiffDeg, 2)} deg (gate ${fmt(m.gateDeg, 1)})   max ${fmt(m.maxDiffDeg, 2)}   reported-all-zero ${m.reportedAllZero === undefined ? '-' : m.reportedAllZero}`
     case 'straight-hold':
       return `${fmt(m.longestStraightM, 0)} m straight, ${fmt(m.holdSeconds, 2)} s open loop: max ${fmt(m.maxSlipDeg, 2)} deg (gate ${fmt(m.gateDeg, 2)})   moved ${fmt(m.lateralTravelM, 2)} m`
+    case 'demand-headroom': {
+      return (
+        `budget ${fmt(m.commandedBudgetMs2, 2)} m/s² vs measured limit ${fmt(m.measuredLimitMs2, 2)} ` +
+        `(${fmt(m.measuredLimitG, 2)} g, worst tick ${fmt(m.measuredLimitMaxTickMs2, 2)}) -> allowed ` +
+        `${fmt(m.allowedBudgetMs2, 2)} at ${pct(m.marginFrac)}   cruise achieved ` +
+        `${fmt(m.cruiseP99AchievedMs2, 2)} p99, demanded ${fmt(m.cruisePeakDemandedMs2, 2)}`
+      )
+    }
+    case 'lap-contact': {
+      const b = m.bins || {}
+      const row = (k) =>
+        `${k[0]}:${fmt(b[k] && b[k].meanGrounded, 2)}/4 air ${pct(b[k] && b[k].airborneFrac)}`
+      return (
+        `${pct(m.coverageOfLap)} of the lap in ${m.windows ?? '-'} windows   ` +
+        `${row('straight')}  ${row('corner')}  ${row('transition')}   ` +
+        `worst second ${pct(m.worstSecond && m.worstSecond.frac)} at t=${fmt(m.worstSecond && m.worstSecond.t, 4)}   ` +
+        `peak ${fmt(m.maxSpeedReached, 1)} m/s`
+      )
+    }
+    case 'ride-quality': {
+      const s = (m.bins && m.bins.straight) || {}
+      const c = (m.bins && m.bins.corner) || {}
+      return (
+        `straight: body SD ${fmt(s.rideHeightSdM, 5)} m (gate ${fmt(m.rideHeightSdGateM, 4)}) vs wheel SD ` +
+        `${fmt(s.compressionSd, 4)} of travel   body accel p99 ${fmt(s.bodyVertAccelP99G, 2)} g   ` +
+        `corner: ${fmt(c.bodyVertAccelP99G, 2)} g, wheel SD ${fmt(c.compressionSd, 4)}`
+      )
+    }
+    case 'road-continuity': {
+      const s = m.lapScan || {}
+      const u = m.underKart || {}
+      return (
+        `scan ${s.stations ?? '-'}x${fmt(s.stationM, 2)} m: worst step ${fmt(s.worstStepM, 4)} m ` +
+        `(gate ${fmt(s.stepGateM, 4)}) at t=${fmt(s.worstStepT, 4)}, seam ${fmt(s.seamStepM, 4)} m / span dev ` +
+        `${fmt(s.seamSpanDeviationM, 4)} m, gradient ${pct(s.maxGradientCentreline)}/${pct(s.maxGradientAnyLane)}   ` +
+        `under kart: rate excess ` +
+        `${fmt(u.worstRateExcess, 2)}x, ride ${fmt(u.minRideHeightM, 3)}..${fmt(u.medianRideHeightM, 3)} m, ` +
+        `height gap p95 ${fmt(u.heightGapP95M, 4)} m`
+      )
+    }
+    case 'lap-seam':
+      return (
+        `crossed ${m.crossedSeam === null ? '-' : m.crossedSeam}   ±${fmt(m.halfWindowM, 0)} m of the line: ` +
+        `${fmt(m.seamMeanGrounded, 2)}/4 grounded vs ${fmt(m.restMeanGrounded, 2)} elsewhere, air ` +
+        `${pct(m.seamAirborneFrac)} vs ${pct(m.restAirborneFrac)}, body accel ${fmt(m.seamBodyAccelP99G, 2)} g vs ` +
+        `${fmt(m.restBodyAccelP99G, 2)}, min ride ${fmt(m.seamMinRideHeightM, 3)} m vs median ` +
+        `${fmt(m.restMedianRideHeightM, 3)}`
+      )
     default:
       return ''
   }
@@ -2898,6 +4812,45 @@ function printBins(result) {
   }
 }
 
+/** WHERE THE RUN WENT. Coverage is a claim, and a claim wants a table under it:
+ *  a sweep that quietly covered a third of the lap prints the same green as one
+ *  that covered all of it. */
+function printSweep(result) {
+  const s = result.info && result.info.sweep
+  if (!s) return
+  console.log('')
+  console.log('THE LAP SWEEP — where the run actually went, at racing speed')
+  if (!s.ran) {
+    console.log(`  DID NOT RUN: ${s.why}`)
+    console.log(
+      '  Every lap-scale check above therefore reports PENDING. The 40 s cruise starts on the grid and does not\n' +
+        '  reach the far side of the circuit, so nothing here says anything about it.',
+    )
+    return
+  }
+  console.log(
+    `  lap ${fmt(s.lapLengthM, 0)} m, field of ${s.fieldSize} — seek scatters it at t + k/n, so ${fmt(s.clearAfterSeekM, 0)} m ` +
+      `of clear road per window.\n` +
+      `  ${s.windows} windows of ${fmt(s.windowDriveM, 0)} m at ${fmt(s.windowSpacingM, 0)} m spacing (they overlap on ` +
+      `purpose: a blind spot at a FIXED place on the lap is invisible on every run forever).\n` +
+      `  covered ${fmt(s.coveredM, 0)} m = ${pct(s.coverageOfLap)} of the lap. ` +
+      `${s.blockedWindows} blocked, ${s.shortWindows} short. seam crossed: ${s.seamCrossed}`,
+  )
+  console.log('  window   anchor t      entry m/s   covered m   seconds   hit cap   crossed seam')
+  for (const w of s.perWindow) {
+    console.log(
+      `  ${String(w.j).padStart(6)}   ${fmt(w.anchorT, 4).padStart(8)}   ${fmt(w.entrySpeed, 1).padStart(9)}   ` +
+        `${fmt(w.distanceM, 0).padStart(9)}   ${fmt(w.seconds, 1).padStart(7)}   ${String(w.hitCap).padStart(7)}   ` +
+        `${String(w.crossedSeam).padStart(12)}` +
+        (w.blocked ? `   BLOCKED: ${w.blocked}` : ''),
+    )
+  }
+  console.log(
+    '  Window 0 is anchored to STRADDLE t = 0 and the rest are spaced off it, so the finish line can never land on a\n' +
+      '  window boundary — the one place a window cannot see, and the exact place the player is pointing at.',
+  )
+}
+
 // ---------------------------------------------------------------------------
 // The contract surface this file would like and does not have
 // ---------------------------------------------------------------------------
@@ -2917,13 +4870,28 @@ const CONTRACT_NOTES = `
     differences quaternions across a tick only for its teleport detector, and
     does not claim a yaw rate from it.
 
-  · ANYTHING ABOVE ITS OWN SPEED CEILING. The cruise picks its speed from a
-    lateral-acceleration budget and never exceeds CFG.speedMax. Suspension and
-    tyre-load faults are often a function of SPEED, not of elapsed time, so every
-    green on this page is green up to the peak speed wheel-contact prints and
-    no further. This is the widest hole in the file and it is a design choice,
-    not an oversight: driving faster than the budget means asking the tyres for
-    the limit, and then a slide is no longer evidence of anything.
+  · ANYTHING ABOVE ITS OWN SPEED CEILING — narrowed, not closed. CFG.speedMax is
+    now 28 m/s, just above the drivetrain's own ~27.8 terminal, so on straight
+    road the KART is the limit rather than this file and the run reaches the top
+    of the range the game actually produces. What is still uncovered is anything
+    a BOOST reaches: nothing here fires a boost pad, banks a drift tier or uses
+    an item, so speeds above terminal are outside every green on this page.
+    Corner speed is still capped by latAccelBudget and always will be — driving a
+    corner at the limit means a slide is no longer evidence of anything.
+
+  · ONE LINE ROUND THE LAP. The sweep covers the whole circuit — 106% of it,
+    since the windows overlap on purpose — but it drives the CENTRELINE, once,
+    at the speed the lateral budget allows. A defect that needs the racing line,
+    a different lateral offset, a different speed or a second lap to appear is
+    outside it. The per-window table prints the distance each window actually
+    covered so a short one cannot hide inside the total.
+
+  · WHETHER A SEAM DEFECT IS THE SEAM'S FAULT. lap-seam localises: it says the
+    sixty metres either side of the finish line are worse than the rest of the
+    lap, by how much, in which quantity. It cannot say whether the cause is the
+    spline's closure, the elevation table's wrap, a surface region boundary or a
+    kart that arrives there in a particular state — and a gate shaped around one
+    of those could not falsify it.
 
   · WHY the kart slid. This is an instrument, not a diagnosis. It reports that
     the slip is there, where on the lap, on what surface, at what demand, and
@@ -2981,10 +4949,13 @@ async function main() {
       const { page, consoleErrors } = await openGame(browser, server.url, { seed: CFG.seed, quality: 'low' })
       const out = await runIn(page, CFG)
 
-      console.log('slip-check — does the kart stay pointed where it is going, over a long run?')
       console.log(
-        `             ${CFG.runSeconds} s of simulated driving, sampled every ${CFG.stride === 1 ? 'tick' : `${CFG.stride} ticks`} ` +
-          `(${CFG.simStep.toFixed(5)} s), scripted commands only`,
+        'slip-check — does the kart stay pointed where it is going, and on a road that stays put, over a whole lap?',
+      )
+      console.log(
+        `             ${CFG.runSeconds} s of cruise from the grid plus a seek-anchored sweep of the whole lap at ` +
+          `racing speed,\n             sampled every ${CFG.stride === 1 ? 'tick' : `${CFG.stride} ticks`} ` +
+          `(${CFG.simStep.toFixed(5)} s), scripted commands only. --windows=0 skips the sweep.`,
       )
       console.log('')
 
@@ -2997,6 +4968,7 @@ async function main() {
 
       const { failed, pending } = printReport(out)
       printBins(out)
+      printSweep(out)
       writeFileSync(path.join(OUT, 'slip-check.json'), JSON.stringify(out, null, 2))
       console.log('')
       if (out.missing.length) {
@@ -3025,7 +4997,9 @@ async function main() {
       } else {
         console.log(
           `PASS — over ${CFG.runSeconds} s of scripted driving the kart's heading and its velocity stayed together on ` +
-            `straight road, and its corner slip is reported rather than assumed.`,
+            `straight road, its corner slip is reported rather than assumed, and over a whole lap at racing speed — ` +
+            `the seam at the finish line included, and confirmed crossed — the wheels stayed on a road that stayed ` +
+            `where its own geometry says it is.`,
         )
       }
     } finally {
@@ -3059,6 +5033,7 @@ async function main() {
     console.log('reference (unsabotaged)')
     const { failed, pending } = printReport(clean)
     printBins(clean)
+    printSweep(clean)
     console.log('')
 
     if (failed.length) {
