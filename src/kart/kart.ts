@@ -120,6 +120,55 @@ const STATIC_RAY_LENGTH = REST_LENGTH - STATIC_SAG
 const RIDE_HEIGHT = WHEEL_RADIUS + STATIC_RAY_LENGTH
 
 /*
+ * The bump the ROAD asks for, bounded by the travel the KART actually has.
+ *
+ * DERIVED, and the derivation is the point — in the same way `RACING_MARGIN` in
+ * `world/track.ts` is. Two correct numbers in two files that had never been
+ * compared: `SUSPENSION_TRAVEL` here, `roughness` there.
+ *
+ * A wheel at its static ray length has `STATIC_RAY_LENGTH - BOTTOM_LENGTH` =
+ * 19.5 mm of compression left before the spring stops being a spring. The
+ * roughness profile in the wheel loop asks for `roughness * ROUGHNESS_TO_BUMP`
+ * of it, and FOUR of the eight surfaces ask for more than exists:
+ *
+ *   surface         bump amplitude   x available travel   bottomed per 1.10 m
+ *   DustyAsphalt          8.4 mm           0.43                    0%
+ *   Kerb                 25.2 mm           1.29                   22%
+ *   SandDrift            29.4 mm           1.51                   27%
+ *   Gravel               37.8 mm           1.94                   33%
+ *   OffTrack             50.4 mm           2.59                   37%
+ *
+ * So any wheel on a kerb, a sand edge, the legal 1.5 m shoulder or off the road
+ * bottomed out several times a second. That is the trigger a PLAYER actually
+ * meets — the two bank ramps (ess-2 at -11.10 m/s^2, wall-arc at -10.05) are
+ * the only geometry on the lap that exceeds 1 g on its own — and it is what put
+ * a wheel into the constant-force region that `BUMP_STOP_RATE` below exists to
+ * end.
+ *
+ * The fix is NOT to lower `roughness` in `SURFACE_PROPS`. Those values are
+ * shared with `fx/` and the camera, the sand ones were raised on purpose, and
+ * `src/types.ts` is the contract — see the note in the wheel loop, which said
+ * so before this bound existed and still says so. The visible and felt
+ * roughness of gravel is unchanged; only what the SPRING is asked to swallow is
+ * bounded, and it is bounded by the spring's own geometry, so the two can no
+ * longer drift apart. Widen `SUSPENSION_TRAVEL` and this follows.
+ *
+ * `MAX_BUMP_MARGIN` is not zero because the body moves too. A profile whose
+ * peak exactly equalled the travel would sit ON the stop at every crest with
+ * nothing left for the chassis' own vertical motion — the same
+ * boundary-case-by-round-off mistake `LINE_SAND_CLEARANCE` exists to avoid.
+ *
+ * Asphalt, DustyAsphalt, Metal and BoostPad are all BELOW the cap and are
+ * therefore bit-identical to before it existed. That matters: the reference for
+ * "the suspension is still felt" — wheel compression SD 0.070 of travel — is
+ * measured on DustyAsphalt, a surface this does not touch.
+ */
+const ROUGHNESS_TO_BUMP = 0.42
+const BUMP_TRAVEL = STATIC_RAY_LENGTH - BOTTOM_LENGTH
+const MAX_BUMP_MARGIN = 0.15
+const MAX_BUMP_AMPLITUDE = BUMP_TRAVEL * (1 - MAX_BUMP_MARGIN)
+
+/*
  * 2200 N, and the number to read next to it is 1122: two rear wheels times
  * 637.65 N of static load times 0.88 grip is the ENTIRE longitudinal budget the
  * rear axle has. Anything the engine asks for beyond that is not thrust, it is
@@ -234,6 +283,58 @@ const MAX_TYRE_LOAD = MASS * GRAVITY * 0.75
  * below keeps doing its own separate job.
  */
 const MAX_SUSPENSION_FORCE = MASS * GRAVITY * 2
+
+/*
+ * The bump stop, and the reason the cap directly above was UNREACHABLE without
+ * one.
+ *
+ * `springRayLength` is clamped to `BOTTOM_LENGTH`, so past bottom-out the
+ * spring term freezes at SPRING_RATE * (REST_LENGTH - BOTTOM_LENGTH) = 1125 N —
+ * 22% of the 5101 N cap. The only term that could still have reached that cap
+ * was the damper, and the damper was clamped to the same `BOTTOM_LENGTH` on
+ * consecutive ticks, so `compressionSpeed` was EXACTLY zero exactly where it
+ * mattered most. Past the stop the suspension was a constant force with no
+ * damping, and `position` is pure force integration with no contact constraint
+ * anywhere in this file. Net restoring acceleration while buried:
+ * (4 * 1125 - 260 * 9.81) / 260 = 7.50 m/s^2, undamped. A near-lossless
+ * parabolic bounce THROUGH the road, which a human reported as "the kart
+ * bounces".
+ *
+ * Measured on the build before this, 22 m/s on the centreline: The Wall ran a
+ * 3.527 m chassis height range with a minimum 1.823 m BELOW the road plane,
+ * 13.8% of ticks fully airborne and 33.5% with a bottomed spring, against
+ * 0.003 m and 0% through the final corner. A full-lock excursion at plan 1010
+ * put the chassis 4.767 m below the road with all four wheels still reporting
+ * `grounded` and `compression = 1`; across the 118 ticks of that burial the
+ * height fitted a parabola of 6.35 m/s^2 with 0.156 m of residual over a 4.8 m
+ * excursion. A parabola is what a constant force with no damping looks like,
+ * and it is the whole diagnosis in one number.
+ *
+ * Both halves of the rate are DERIVED rather than dialled:
+ *
+ *  - the LINEAR term is `SPRING_RATE` itself, so the force curve has no kink at
+ *    the stop. The main spring arrives at `BOTTOM_LENGTH` still making
+ *    25 kN/m, and a bump stop starting from zero rate would make the stiffest
+ *    point of the travel momentarily the softest one.
+ *  - the QUADRATIC term is whatever closes the remaining gap to
+ *    `MAX_SUSPENSION_FORCE` at exactly one full `SUSPENSION_TRAVEL` past the
+ *    stop. That is the statement "9 cm past the stop is as far as the chassis
+ *    may be pushed", and 5101 N on four wheels is the 8 g the note above
+ *    already promises but could not deliver.
+ *
+ * So the cap binds only past 0.09 m, and inside it the response is a damped
+ * progressive spring rather than a wall: 253 kN/m of combined rate at the
+ * design point against 9 kN.s/m of combined damping is a ratio of 0.55, and
+ * 5.0 Hz against a 120 Hz tick. Do NOT make it rigid. An infinitely stiff stop
+ * returns the same lossless bounce with a shorter wavelength, and it would also
+ * hand the tyre model a load step it has already been burned by once — see the
+ * `MAX_TYRE_LOAD` clamp in the wheel loop, which is what keeps this off the
+ * brush model's input.
+ */
+const BUMP_STOP_DEPTH = SUSPENSION_TRAVEL
+const BUMP_STOP_HEADROOM = MAX_SUSPENSION_FORCE - SPRING_RATE * (REST_LENGTH - BOTTOM_LENGTH)
+const BUMP_STOP_RATE =
+  (BUMP_STOP_HEADROOM - SPRING_RATE * BUMP_STOP_DEPTH) / (BUMP_STOP_DEPTH * BUMP_STOP_DEPTH)
 
 const DRIFT_MIN_STEER = 0.18
 const DRIFT_MIN_SPEED = 7
@@ -568,7 +669,14 @@ export const createKart: KartFactory = (
         // injected a permanent yaw moment even on the harness' perfectly flat
         // straight, which then made the saturated tyre response chaotic.
         const bumpPhase = location.t * track.length * 5.7 + (i >> 1) * 1.91 + identity.id * 0.73
-        const bump = Math.sin(bumpPhase) * props.roughness * 0.42
+        // Bounded by the travel that exists, not by the road's opinion of
+        // itself — see MAX_BUMP_AMPLITUDE, which is derived from this
+        // suspension's own geometry.  Four of the eight surfaces asked for more
+        // bump than the spring has room for, which put a wheel on the stop
+        // several times a second wherever a player leaves the centre of the
+        // road.
+        const bump =
+          Math.sin(bumpPhase) * Math.min(props.roughness * ROUGHNESS_TO_BUMP, MAX_BUMP_AMPLITUDE)
         /*
          * TWO ray lengths, and the difference between them is the entire reason
          * the kart used to hover and then slide.
@@ -600,7 +708,10 @@ export const createKart: KartFactory = (
          * Do NOT "fix" a recurrence of this by lowering `roughness` in
          * SURFACE_PROPS. Those values are shared with fx/ and the camera, the
          * sand ones were raised on purpose, and lowering them only moves the
-         * onset speed instead of removing the mechanism.
+         * onset speed instead of removing the mechanism. The separate bound at
+         * `MAX_BUMP_AMPLITUDE` is not that: it leaves `SURFACE_PROPS` alone and
+         * limits only what this spring is asked to swallow, against this
+         * spring's own travel.
          */
         const smoothRayLength =
           (mount.x - sample.position.x) * sample.normal.x +
@@ -615,9 +726,22 @@ export const createKart: KartFactory = (
         // FULL_EXTENSION whenever a wheel lifted meant the re-contact tick
         // differenced a length the wheel had never been at: up to
         // (0.25 - 0.16) / step = 10.8 m/s, a ~24 kN spike earned by hopping two
-        // millimetres over a bump crest.  Tracking the real (clamped) smooth
-        // ray makes that tick report the body's actual approach speed.
-        const damperRayLength = clamp(smoothRayLength, BOTTOM_LENGTH, FULL_EXTENSION)
+        // millimetres over a bump crest.  Tracking the real smooth ray every
+        // tick makes that tick report the body's actual approach speed.
+        //
+        // THE LOWER CLAMP IS GONE AND THE UPPER ONE STAYS, and they were never
+        // the same guard.  Clamping the BOTTOM meant that once a wheel was past
+        // `BOTTOM_LENGTH` this value was `BOTTOM_LENGTH` on every consecutive
+        // tick, so `compressionSpeed` was exactly zero for as long as the wheel
+        // stayed bottomed — the suspension lost its damping precisely where it
+        // was needed, and the result was the lossless bounce documented at
+        // `BUMP_STOP_RATE`.  Clamping the TOP does a different job: an airborne
+        // wheel's mount can `locate` onto a different part of the road, and an
+        // unbounded history would then difference metres in one tick and hand
+        // the chassis a capped 5101 N per wheel for a contact that never
+        // happened.  Above `FULL_EXTENSION` the wheel is not grounded and no
+        // spring force is produced anyway, so the upper bound costs nothing.
+        const damperRayLength = Math.min(smoothRayLength, FULL_EXTENSION)
         // A pose assignment has no previous contact sample.  Treat its first
         // ray as history rather than manufacturing a damper velocity from the
         // old pose; the next fixed tick then has a real finite difference.
@@ -640,13 +764,26 @@ export const createKart: KartFactory = (
         normalY += sample.normal.y
         normalZ += sample.normal.z
         const springRayLength = clamp(rayLength, BOTTOM_LENGTH, FULL_EXTENSION)
+        // `compression` stays in [0, 1] because it is published state: fx/, the
+        // camera and the HUD read it as a fraction of travel, and travel is
+        // what it is.  How hard a bottomed wheel pushes is a separate quantity
+        // and lives below.
         wheel.compression = clamp((FULL_EXTENSION - springRayLength) / SUSPENSION_TRAVEL, 0, 1)
+        // Past `BOTTOM_LENGTH` the clamped spring term above is frozen, so this
+        // is the only thing that still grows with penetration.  It is zero at
+        // and above the stop, so nothing about the ride on the other 99% of the
+        // road changes — see BUMP_STOP_RATE for the derivation and for what the
+        // absence of this term measured.
+        const overTravel = Math.max(0, BOTTOM_LENGTH - rayLength)
+        const bumpStopForce = overTravel * (SPRING_RATE + BUMP_STOP_RATE * overTravel)
         // Capped for the chassis, not just for the tyre — see MAX_SUSPENSION_FORCE.
         const springForce = Math.min(
           MAX_SUSPENSION_FORCE,
           Math.max(
             0,
-            SPRING_RATE * (REST_LENGTH - springRayLength) + DAMPER_RATE * compressionSpeed,
+            SPRING_RATE * (REST_LENGTH - springRayLength) +
+              bumpStopForce +
+              DAMPER_RATE * compressionSpeed,
           ),
         )
         totalForceX += sample.normal.x * springForce
