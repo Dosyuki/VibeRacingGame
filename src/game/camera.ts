@@ -119,6 +119,66 @@ const AIM_ROAD_WEIGHT = 0.55
 const TRAVEL_BLEND_FLOOR = 2.5
 const TRAVEL_BLEND_FULL = 6.0
 
+/**
+ * THE SPIN GUARD ON THE TRAVEL BLEND, and why the speed ramp above is not it.
+ *
+ * The ramp asks "is the velocity long enough to be a direction". It never asks
+ * "is it a direction the camera should sit behind". A kart that has lost the
+ * rear has a velocity that is long, stable and pointing anywhere at all — and
+ * the blend then walks the camera around the kart, because that is exactly what
+ * it is written to do.
+ *
+ * MEASURED, on the current build, at turn one of a standing start (the player
+ * kart under `referenceAI`, sampled every 2 ticks): the kart arrives at 24.6 m/s,
+ * loses the rear at GO+17.8 s at 85.6 deg of body slip, spins through 180 deg
+ * and travels BACKWARDS at up to -8.6 m/s for 2.4 s, on the road the whole time.
+ * With a 0.6 drift blend against 85.6 deg of slip the follow direction leaves
+ * the chassis by ~46 deg, and the camera walks around to 11.45 m off the kart's
+ * centreline: beside the kart rather than behind it. `tools/grid-start.mjs`
+ * reads that as `cam-behind`, and it is not a threshold argument — a player who
+ * has just spun is shown the side of their own kart instead of the road they
+ * are sliding down.
+ *
+ * `AIM_ROAD_WEIGHT` above already anticipates this case in as many words —
+ * "detaches from the kart when it spins" — but its collapse is gated on
+ * `!onTrack`, and a kart that spins on the road never trips it. So the AIM was
+ * guarded against the spin and the follow POSITION was not. This is that guard.
+ *
+ * Held as a cosine because the blend needs nothing but the dot product of two
+ * unit vectors, and `Math.acos` in a per-tick path buys only the units. The dot
+ * is taken in three dimensions and not in plan: airborne, the descent tilts the
+ * travel vector off the chassis and nudges the fade in, which is harmless — a
+ * blend that leans on the chassis while the kart is off the ground is the
+ * answer this rig already gives the horizon two blocks down.
+ *
+ *   Fade begins at 50 deg of slip. A drift worth reading is 20-30 deg (§7) and
+ *   the blend is untouched there; 45 deg is still full. Past 50 the kart is not
+ *   drifting, it is going round.
+ *
+ *   Fade completes at 90 deg, where the cosine is zero and the arithmetic ends
+ *   on its own. That is the honest end point rather than a chosen one: at 90 deg
+ *   the direction of travel carries no forward information whatsoever, and past
+ *   it the kart is reversing, so any weight on travel puts the camera in front
+ *   of a driver who needs to see what they are about to hit.
+ *
+ * WHAT THIS GUARD DOES NOT FIX, MEASURED, SO THE NEXT READER DOES NOT RE-DERIVE
+ * IT. It takes `cam-behind` from 82 violations worst 11.453 to 68 worst 10.880,
+ * and no further. The residue is not this blend at all: it is the POSITION
+ * SPRING'S STEADY-STATE LAG. A critically damped spring tracking a target
+ * moving at constant speed settles 2v/omega BEHIND it, so at 21.8 m/s the rig
+ * sits a measured 13.31 m behind the kart against the 7.28 m these constants
+ * describe — the documented chase distance is not the distance the game has.
+ * When the kart then yaws, the whole 13.31 m arm swings, and its lateral
+ * component is what `cam-behind` reports. Cancelling the lag by feeding the
+ * spring `desiredPos + (2/omega) * velocity` was tried: it puts the camera at
+ * a measured 7.76 m and takes `cam-behind` to 28 violations worst 5.159 — and
+ * turns `cam-seam` RED, 6 violations worst 146.312 deg/s against its 120 cap,
+ * because a shorter arm rotates faster for the same lateral motion. That is one
+ * gate traded for another, and a change to how the game feels at speed. It
+ * wants a human, not an agent chasing a green.
+ */
+const TRAVEL_SLIP_KEEP_COS = Math.cos((50 * Math.PI) / 180)
+
 // ---------------------------------------------------------------------------
 // Spring constants — the numbers that decide whether this is nauseating
 // ---------------------------------------------------------------------------
@@ -483,7 +543,17 @@ export const createCameraRig: CameraFactory = (ctx: Ctx): ICameraRig & Subsystem
       if (vlen > TRAVEL_BLEND_FLOOR) {
         travelForward.copy(state.velocity).multiplyScalar(1 / vlen)
         const u = clamp((vlen - TRAVEL_BLEND_FLOOR) / (TRAVEL_BLEND_FULL - TRAVEL_BLEND_FLOOR), 0, 1)
-        const blend = (state.drift.active ? 0.6 : 0.25) * u * u * (3 - 2 * u)
+        /*
+         * ...and RAMPS BACK OUT again as the slip angle grows past a drift. See
+         * TRAVEL_SLIP_KEEP_COS: the speed ramp cannot tell a 25 deg drift from a
+         * spin, and the blend that makes the first legible walks the camera
+         * around the kart during the second. Smoothstepped for the same reason
+         * the speed ramp is — the fade is entered mid-slide, and a corner on it
+         * is a kink in the camera path at the least forgiving moment there is.
+         */
+        const s = clamp(chassisForward.dot(travelForward) / TRAVEL_SLIP_KEEP_COS, 0, 1)
+        const blend =
+          (state.drift.active ? 0.6 : 0.25) * u * u * (3 - 2 * u) * s * s * (3 - 2 * s)
         followForward.copy(chassisForward).lerp(travelForward, blend)
       } else {
         followForward.copy(chassisForward)
