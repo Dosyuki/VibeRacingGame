@@ -648,6 +648,116 @@ converted it into a projectile.**
 
 ---
 
+## 7. Two symptoms in one sentence, and the harness that was green about both
+
+**Round 11 → 12. Found by:** playing the last section before the finish line.
+
+> In the last part before the finish line you can go through the map, and the
+> kart bounces.
+
+Two defects, independent, in different subsystems. They co-locate only because
+leaving the road triggers both.
+
+### The bounce: past bottom-out the suspension had no damping and no floor
+
+`kart.ts` clamped the damper's ray length and the spring's ray length at the
+**same** `BOTTOM_LENGTH`. Once a wheel bottomed, `compressionSpeed` became
+**exactly 0** — the damper differenced the same clamped value on consecutive
+ticks — and the spring froze at 1125 N per wheel, **22% of the
+`MAX_SUSPENSION_FORCE` cap whose own comment claims four wheels can arrest 8 g.**
+That cap was unreachable past bottom-out, because the only term that could reach
+it is the damper. And nothing bounded how far the chassis could go below the
+plane.
+
+Net restoring acceleration while buried: **7.50 m/s², undamped.** Measured 7.6.
+
+**The mechanism was proven, not inferred.** Chassis height over the 118
+consecutive ticks — 0.98 s — of one burial fits a **parabola at 6.35 m/s² with
+0.156 m of residual across a 4.767 m excursion.** A parabola is what a constant
+force with no damping looks like; a damped or progressive spring cannot fit one.
+During it the rays reached −5.337 m against a `BOTTOM_LENGTH` of 0.16 — 33
+travel-lengths past the clamp — with all four wheels reporting `compression 1`
+and `grounded true`.
+
+**Four of the eight surfaces do not fit in the suspension.** Available bump
+travel is 19.5 mm; `roughness × 0.42` gives 25.2 / 29.4 / 37.8 / 50.4 mm for
+Kerb / SandDrift / Gravel / OffTrack. Any wheel on a kerb, a sand edge or the
+legal 1.5 m shoulder bottomed several times a second — **that is the trigger a
+player actually meets.**
+
+The Wall, 22 m/s: chassis height range **3.527 → 0.140 m**, minimum
+**−1.823 → +0.454 m**, airborne **13.8% → 0%**, below the road **22.6% → 0%**.
+
+### The fall-through: there is still no collision, and it is not local
+
+The kart's only ground is the road plane through the centreline **extrapolated
+infinitely sideways**. Driving the player's mistake — flat out from mid-arch, no
+braking — puts the kart at lateral **−18.9 m against a 13.9 m half-width**, 1.4–
+1.9 m inside solid rock, with `height` steady at 0.529–0.535 m and **all four
+wheels grounded on every tick.** A full-lock probe reached **lateral −51.5 m.**
+
+The canyon wall starts 2.2–3.5 m past the road edge, so there is roughly **1 m of
+gap between the legal shoulder and the inside of a mountain**, everywhere.
+
+**Why the player noticed it here** is a design fact, not a bug: `track.ts` gives
+the arch 118 m of clean asphalt at R = 188 m with no kerbs and no sand, and
+states plainly *"the exit aperture is hidden until you are inside it."* It exits
+at terminal speed into `final-corner` — R = 68.9 m, third-slowest on the lap,
+descending at −8.5%, road at its narrowest, **2.6 m of run-off.** A blind
+flat-out approach to a tight descending corner is where a human runs out of road,
+and running out of road produces both symptoms at once.
+
+### Why the gates missed it
+
+- **`slip-check`'s `wheel-contact` looked like it covered this.** It gates only
+  on the **straight** curvature bin, its cruise capped at 24 m/s against a 27.8
+  terminal and lifted off for corners, and its 40 s run never completed a lap —
+  so it had **never crossed the seam that the finish line is.**
+- **`track-check` check 10** asserts `surfaceAt` returns `OffTrack` past the
+  margin. It asserts the *label*, never that anything stops you.
+- **Nothing in `tools/` compares the kart's collision surface against the built
+  world mesh.** The only tool that walks world triangles asks the opposite
+  question — "is anything *inside* the corridor" — and both answers are "no",
+  but only one of them is good news.
+- The seam itself was **innocent and measured so**: elevation closure
+  −1.9e-12 m, heading closure 0.000000000°, bank step 0, grade 0 on both sides,
+  road geometry continuous to 9.7e-13 m. Three plausible leads died on numbers.
+
+### Acted on
+
+`slip-check` goes 12 → 17 checks and now drives **106% of a lap in 10
+seek-anchored windows**, with window 0 straddling `t = 0` so the finish line can
+never land on a window boundary. New sabotages exist to **demonstrate the hole
+rather than assert it**: `corner-hop` lifts the wheels *in the bends only* and
+`lap-contact` fails at 0.00/4 while **`wheel-contact` stays quiet.**
+
+`latAccelBudget` was 8, justified in its own comment as "0.82 g on a 0.88-grip
+road". **0.88 is a tyre-force multiplier, not a g figure** — the comment compared
+m/s² against a dimensionless coefficient and the margin did not exist. Now 6, and
+the premise is a *check* rather than a comment: `demand-headroom` measures the
+limit (8.77 m/s², 0.89 g) and gates the budget against it.
+
+### Recorded against ourselves
+
+- **The new harness does not reproduce the player's report**, and says so rather
+  than reading as a clean bill of health. Its cruise holds the centreline inside
+  a lateral budget, so it never reaches the kerbs, sand edges, shoulder or
+  0.85×halfWidth on a bank ramp where the bounce lives. A green here is not
+  evidence about this bug in either direction.
+- **A barrier would not have fixed the bounce.** 11.4% of ticks still bottom on
+  the ess-2 ramp and 9.1% on the wall arc — **on-road geometry inside the racing
+  width.** The off-road roughness was the most frequent path to the failure, not
+  the failure.
+- One anomaly is printed and not gated: the cruise's own p99 achieved lateral
+  acceleration is **10.65 m/s², above the measured 8.77.** It survived the
+  suspension fix unchanged, so bottoming is not the explanation. Still open.
+- Two bugs in the harness's own reference world were found while building the
+  sabotages — a yaw integration one tick out of step, and an
+  achieved-acceleration difference that had to be **centred**, because a forward
+  difference leaks ~130 m/s² of pure arithmetic when the frame is rotating.
+
+---
+
 ## Standing gaps — what nobody has done yet
 
 These are not findings. They are the honest shape of what this file does *not*
