@@ -359,6 +359,26 @@ const DRIFT_ARM_STEER = 0.3
 /** Ticks allowed for the kart to report `drift.active` before retrying. */
 const DRIFT_ARM_TICKS = 5
 const DRIFT_COOLDOWN: Seconds = 0.2
+/**
+ * COOLDOWN AFTER AN ATTEMPT THAT STARVED, as distinct from one that released.
+ *
+ * A release is a decision: the corner ended, or tier 3 was banked, and the next
+ * corner is a fresh question. A STARVE is a failure — the kart asked for a slip
+ * angle for `SLIP_STARVED_LIMIT` and did not get one — and `DRIFT_COOLDOWN`
+ * (0.2 s) is short enough that the driver re-arms into the SAME corner, at the
+ * same speed, on the same line, and fails it again. Measured before this
+ * existed: 960 attempts over two races, 724 of them cashed at tier 0, and the
+ * field completed 0 of 8 races because The Wall alone consumed the whole tick
+ * budget in a re-arm loop.
+ *
+ * The timer alone is not the guard, and it cannot be — The Wall is 8 s of
+ * corner, so any cooldown short enough to be a cooldown is short enough to
+ * re-arm inside it. `starvedSign` below is the real test: no second attempt at
+ * a corner until the driver has actually LEFT the one that starved. The timer
+ * is only there so the esses, where leaving one corner means entering the next
+ * on the very next tick, still get a beat between attempts.
+ */
+const DRIFT_STARVED_COOLDOWN: Seconds = 0.8
 
 /**
  * Target slip angle while holding, in radians.
@@ -373,6 +393,44 @@ const SLIP_TARGET = 0.21
 const K_SLIP = 2.3
 /** Seconds of starved slip tolerated before the attempt is abandoned. */
 const SLIP_STARVED_LIMIT: Seconds = 0.45
+
+/**
+ * HOW FAR THE SLIP-CHASE MAY PULL THE COMMAND OFF THE PURSUIT'S, in lock.
+ *
+ * The slip chase is a CORRECTION to the path, not a second path. Its old bound
+ * was ±0.5/0.55 of lock, which is not a correction — it is most of the wheel.
+ * The arithmetic that made it fatal: at zero slip the term is
+ * `K_SLIP · SLIP_TARGET` = 0.483, and it points the same way as a pursuit
+ * command that is already ~0.5 into the corner, so `steer` saturated at exactly
+ * 1.000 and stayed there for as long as the slip refused to develop. Traced per
+ * tick entering The Wall at t ≈ 0.552: full lock, then airborne over the crest
+ * still at full lock, then a landing 7 m off line, then `slipStarved` abandons
+ * an attempt that never had a chance.
+ *
+ * The saturation is the part that matters, not the size. A term that can reach
+ * the clamp has taken the steering away from pure pursuit entirely, and pure
+ * pursuit is the only thing in this file that knows where the road goes. 0.3
+ * leaves the pursuit command visible in the sum at every slip angle the kart can
+ * report, and hands the "slip will not develop" case to `slipStarved`, which is
+ * the part built to decide it.
+ *
+ * It is a bound, not a gain: shrinking it makes the drift lazier to rotate,
+ * never wider.
+ */
+const DRIFT_STEER_AUTHORITY = 0.3
+/**
+ * Lock ceiling while a drift is held.
+ *
+ * Separate from the authority bound because the two failures are different: the
+ * bound stops the CHASE from owning the wheel, this stops the SUM from reaching
+ * the stop. A kart at full lock has no reserve for the pursuit's next
+ * correction, so every metre it drifts off line is a metre it cannot ask to come
+ * back — the command is already saturated. Leaving 15% of the lock unspent
+ * keeps the cross-track term's authority alive through the whole drift. A drift
+ * that genuinely needs the last 15% of the wheel is a corner this driver should
+ * not have armed.
+ */
+const DRIFT_STEER_CEILING = 0.85
 
 /**
  * A long corner is re-armed after tier 3 is banked rather than held to the
@@ -534,6 +592,14 @@ export function createAIDriver(
   let holdTime: Seconds = 0
   let slipStarved: Seconds = 0
   let driftAttempts = 0
+  /**
+   * The turn direction of the corner an attempt STARVED in, or 0 for none.
+   *
+   * Held until the driver has demonstrably left that corner — see the arm gate
+   * below. This is the memory `cooldownLeft` cannot be: a cooldown is a
+   * duration, and "the corner I just failed" is not a duration, it is a place.
+   */
+  let starvedSign: 1 | -1 | 0 = 0
 
   let scanCountdown = 0
   /** Metres until the next drift-worthy corner. `Infinity` when there is none. */
@@ -722,6 +788,7 @@ export function createAIDriver(
     cooldownLeft = 0
     holdTime = 0
     slipStarved = 0
+    starvedSign = 0
     driftAttempts = 0
     scanCountdown = 0
     cornerDist = Infinity
@@ -888,6 +955,15 @@ export function createAIDriver(
       }
       steer = clamp(steer, -1, 1)
 
+      /*
+       * THE PATH COMMAND, KEPT. Everything below this line that touches `steer`
+       * is a drift correction on top of the path, and a correction has to be
+       * measurable against the thing it corrects. Reading it back out of `steer`
+       * after the fact cannot distinguish "the pursuit wants full lock" from
+       * "the chase drove it to full lock", and those are opposite situations.
+       */
+      const pursuitSteer = steer
+
       // --- entry speed ------------------------------------------------------
       const gripHere = SURFACE_PROPS[state.surface].grip
       const brakeAccel = Math.max(1.5, gripHere * G * BRAKE_UTIL)
@@ -943,9 +1019,25 @@ export function createAIDriver(
         if (phase === 'idle') {
           const committed = cornerDist <= DRIFT_COMMIT_DISTANCE
           const arcSeconds = cornerArc / Math.max(speed, 6)
+          /*
+           * THE LOCKOUT CLEARS BY PLACE, NOT BY TIME. `cornerDist` is measured
+           * from the kart, so it reads 0 for every tick spent inside a corner
+           * and only rises once the scan's entry walk stops finding curvature at
+           * the kart's own station — which is exactly "I have left it". The sign
+           * test is the esses: ess-1 becoming ess-2 with no straight between
+           * them is a genuinely different corner and must not inherit ess-1's
+           * failure, and `cornerDist` alone cannot see the handover.
+           */
+          if (
+            starvedSign !== 0 &&
+            (cornerDist > DRIFT_COMMIT_DISTANCE + 2 || cornerSign !== starvedSign)
+          ) {
+            starvedSign = 0
+          }
           if (
             committed &&
             cornerArc > 0 &&
+            starvedSign === 0 &&
             speed >= Math.max(DRIFT_ARM_SPEED, KART_DRIFT_MIN_SPEED + 1) &&
             arcSeconds >= DRIFT_MIN_ARC_SECONDS &&
             state.grounded
@@ -998,11 +1090,40 @@ export function createAIDriver(
            * drift is doing what it is supposed to.
            */
           const slipInto = -state.drift.slipAngle * dir
-          // Not counted during the first quarter second: the slip angle has not
-          // physically had time to develop yet, and starving the attempt for
-          // that would abandon every drift before it began.
-          slipStarved = holdTime > 0.25 && slipInto < KART_DRIFT_SLIP_GATE ? slipStarved + step : 0
-          steer = clamp(steer + dir * clamp(K_SLIP * (SLIP_TARGET - slipInto), -0.5, 0.55), -1, 1)
+
+          /*
+           * NOTHING ABOUT SLIP MEANS ANYTHING WITH THE WHEELS OFF THE GROUND,
+           * and both halves of that matter.
+           *
+           * Chasing it: slip angle is heading against velocity, and it is a
+           * number airborne as much as it is on the road — but no tyre is
+           * touching anything, so no amount of lock changes it. The chase term
+           * therefore does not converge, it INTEGRATES: it winds to its bound
+           * and stays there for the whole flight, and the kart lands at that
+           * lock. This is the second half of the 7 m landing at The Wall; the
+           * first half is the saturation the bound above fixes.
+           *
+           * Starving on it: the attempt is not failing, it is waiting. Counting
+           * flight time against `SLIP_STARVED_LIMIT` abandons every drift over
+           * every crest on the circuit, which is most of the drift-worthy
+           * corners here. The timer FREEZES rather than resetting — a drift that
+           * was starving before the crest is still starving after it, and
+           * clearing it would let a bumpy corner extend an attempt for ever.
+           */
+          if (state.grounded) {
+            // Not counted during the first quarter second: the slip angle has
+            // not physically had time to develop yet, and starving the attempt
+            // for that would abandon every drift before it began.
+            slipStarved = holdTime > 0.25 && slipInto < KART_DRIFT_SLIP_GATE ? slipStarved + step : 0
+            const chase = clamp(
+              K_SLIP * (SLIP_TARGET - slipInto),
+              -DRIFT_STEER_AUTHORITY,
+              DRIFT_STEER_AUTHORITY,
+            )
+            steer = clamp(pursuitSteer + dir * chase, -DRIFT_STEER_CEILING, DRIFT_STEER_CEILING)
+          } else {
+            steer = clamp(pursuitSteer, -DRIFT_STEER_CEILING, DRIFT_STEER_CEILING)
+          }
 
           // Power keeps the rear loose: longitudinal force competes with lateral
           // inside the same friction budget, which is what sustains the slip.
@@ -1026,16 +1147,29 @@ export function createAIDriver(
            * where ess-1 becomes ess-2 with no straight in between.
            */
           const stillOnCorner = cornerDist <= DRIFT_COMMIT_DISTANCE + 2 && cornerSign === dir
+          const starved = slipStarved > SLIP_STARVED_LIMIT
           const release =
             !state.drift.active ||
             !loc.onTrack ||
             !stillOnCorner ||
-            slipStarved > SLIP_STARVED_LIMIT ||
+            starved ||
             cornerArc <= releaseDistance ||
             (banked3 && cornerArc >= DRIFT_REARM_ARC)
           if (release) {
             drift = false
-            endAttempt(DRIFT_COOLDOWN)
+            /*
+             * A starve is the one exit that says something about the CORNER
+             * rather than about the attempt, so it is the one that leaves a
+             * mark. Every other reason here — the corner ended, tier 3 banked,
+             * the kart left the road — is either a success or somebody else's
+             * problem, and re-arming immediately after them is correct.
+             */
+            if (starved) {
+              starvedSign = dir
+              endAttempt(DRIFT_STARVED_COOLDOWN)
+            } else {
+              endAttempt(DRIFT_COOLDOWN)
+            }
           }
         }
       } else if (phase !== 'idle' && phase !== 'cooldown') {
