@@ -1601,12 +1601,45 @@ function diagnostics(runs, cfg, checkpoints) {
   let hits = 0
   let kartLaps = 0
   let respawns = 0
+  /*
+   * THE POOLED RATE IS NOT ONE POPULATION, and the first run that ever produced
+   * a non-zero number here proved it: 118 hits over 76 kart-laps = 1.55 per
+   * kart per lap, printed beside a sentence about whether the FIELD is driving
+   * a corridor. Underneath that single figure:
+   *
+   *   clean       0 hits over 24 kart-laps   0.00   never touches anything
+   *   seek       59 hits over 26 kart-laps   2.27
+   *   seekRepeat 59 hits over 26 kart-laps   2.27   (identical, as it must be)
+   *
+   * and inside the seek arm, two karts that never finished contributed 39 of
+   * the 59 while parked against rock. So the pooled 1.55 is the average of an
+   * arm that never touches a wall and two karts that live on one, and it is the
+   * one value in the range that describes NEITHER. The modes are different
+   * experiments — `drift-pays` is a paired within-mode comparison for exactly
+   * this reason — and finished karts and stuck karts are different populations.
+   * All three splits are computed; the printer shows them; the pooled figure
+   * stays, because removing it would break every reader that already has it.
+   */
+  const byMode = new Map()
+  let hitsUnfinished = 0
+  let lapsUnfinished = 0
+  let unfinishedKarts = 0
   for (const race of races) {
+    const m = byMode.get(race.mode) || { mode: race.mode, hits: 0, kartLaps: 0, respawns: 0 }
     for (const k of race.karts) {
       hits += k.wallHits || 0
       respawns += k.respawns || 0
       kartLaps += k.completedLaps || 0
+      m.hits += k.wallHits || 0
+      m.respawns += k.respawns || 0
+      m.kartLaps += k.completedLaps || 0
+      if (!k.finished) {
+        hitsUnfinished += k.wallHits || 0
+        lapsUnfinished += k.completedLaps || 0
+        unfinishedKarts++
+      }
     }
+    byMode.set(race.mode, m)
   }
   const wallDead = counterIsDead(cfg, 'wallHits')
   const respawnDead = counterIsDead(cfg, 'respawns')
@@ -1618,6 +1651,18 @@ function diagnostics(runs, cfg, checkpoints) {
     respawnsUnmeasurable: respawnDead,
     kartLaps,
     perKartLap: wallDead || !kartLaps ? null : hits / kartLaps,
+    byMode: [...byMode.values()].map((m) => ({
+      ...m,
+      perKartLap: wallDead || !m.kartLaps ? null : m.hits / m.kartLaps,
+    })),
+    unfinished: {
+      karts: unfinishedKarts,
+      hits: wallDead ? null : hitsUnfinished,
+      kartLaps: lapsUnfinished,
+      /** What fraction of every wall contact in the run came from a kart that
+       *  did not finish. High means the rate is a stuck-kart statistic. */
+      shareOfHits: wallDead || !hits ? null : hitsUnfinished / hits,
+    },
   }
 
   // -- where time is lost ---------------------------------------------------
@@ -1833,6 +1878,28 @@ function printDiagnostics(d, cfg) {
           `${w.respawnsUnmeasurable ? 'respawns unmeasurable' : `${w.respawns} respawn(s)`}. Reported because a field ` +
           `that never touches a wall is driving a corridor and a field that always does is not driving.`,
       )
+      /*
+       * ...but that sentence has to be applied to a population, and the pooled
+       * figure above is not one. See the analysis for the run that made this
+       * necessary: a 0.00 arm and a 2.27 arm averaging to a 1.55 that describes
+       * neither. The modes are separate experiments and stuck karts are a
+       * separate population; read the split, not the total.
+       */
+      if (w.byMode && w.byMode.length > 1) {
+        console.log(
+          `                 by mode: ${w.byMode
+            .map((m) => `${m.mode} ${m.hits}/${m.kartLaps} = ${fmt(m.perKartLap, 2)}`)
+            .join('   ')}`,
+        )
+      }
+      if (w.unfinished && w.unfinished.karts > 0 && w.unfinished.hits > 0) {
+        console.log(
+          `                 ${w.unfinished.hits} of those ${w.hits} contacts (${fmt(w.unfinished.shareOfHits * 100, 0)}%) came from the ` +
+            `${w.unfinished.karts} kart-race(s) that did NOT finish. A rate dominated by karts parked against rock is a\n` +
+            `                 stuck-kart statistic, not a measure of how the field races a corridor — grade the finishers' ` +
+            `rate and read this one as evidence for the completes gate above.`,
+        )
+      }
     }
   }
   if (d.timeLoss && d.timeLoss.worst.length) {

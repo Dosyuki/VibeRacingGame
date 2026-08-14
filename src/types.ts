@@ -1081,6 +1081,22 @@ export interface HarnessAPI {
    *  preserves checkpoint progress unless `resetProgress` is true. */
   seek(options: {
     t: number
+    /**
+     * RELATIVE TO THE RACING LINE, not the centreline. The composition root
+     * resolves it as `racingLine(t) + lateral`, so `lateral: 0` places the kart
+     * ON the line — which on this circuit can be 13.46 m from centre.
+     *
+     * Stated here because its absence has now cost four separate measurement
+     * runs. `steer-test.mjs` added `racingLine(t)` a second time and placed a
+     * kart 22.6 m across a 14.0 m half-width road, then spent a round reporting
+     * an inverted AI that did not exist. A wall probe placed a kart 5 m PAST
+     * the barrier and reported a flawless 0.06 degree graze at tick 0. Both
+     * read as plausible results.
+     *
+     * Contrast `IKart.placeAt`, whose offset is centreline-relative and says
+     * so. The two are different and nothing but this comment says which is
+     * which.
+     */
     lateral?: Metres
     speed?: number
     resetProgress?: boolean
