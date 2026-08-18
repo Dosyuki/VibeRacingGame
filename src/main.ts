@@ -1112,6 +1112,35 @@ const harness: HarnessAPI = {
 
   startRace(): void {
     race.start()
+    /*
+     * ZERO THE COUNTERS, because `race.start()` PLACES THE FIELD.
+     *
+     * It gained that job this session: without it the reference AI, which
+     * drives from page load, carried momentum across the lights and the field
+     * had already covered 2.6 m at GO — an amount that depended on how long the
+     * machine took to boot the page, which is wall clock reaching the
+     * simulation through the one door the fixed-timestep rule does not cover.
+     *
+     * That placement necessarily goes through `IKart.respawn`, because
+     * `types.ts` bans `placeAt` outside `kart/` and `game/` has no other route.
+     * `kart:respawn` is therefore emitted once per kart per start, and
+     * `Counters.respawns` counted it — so every kart began each race one
+     * respawn in debt. `autoplay.mjs` gates on respawns per lap and was
+     * grading a field of eight against a baseline of eight rescues that never
+     * happened, and its clean arm reported "1 respawn" for karts that finished
+     * three laps without incident.
+     *
+     * `resetRace` already does exactly this, in the same order and for the
+     * same reason — it just was not the only entry point any more.
+     *
+     * Zeroing HERE rather than suppressing the event: `game/camera.ts` wants
+     * `kart:respawn` and snaps the rig to the gridded kart instead of
+     * whip-panning to it, and `fx/` may want it later. The event is correct.
+     * What was wrong is a counter of RESCUES counting a PLACEMENT, and the
+     * composition root owns that counter.
+     */
+    for (let i = 0; i < karts.length; i++) counters[i] = newCounters()
+    telemetrySinceTick = loop.clock.tick
   },
 
   setDriver(kartId: number, mode: DriverMode): void {
