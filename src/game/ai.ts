@@ -345,6 +345,33 @@ const DRIFT_CURVATURE = 1 / 160
 /** Metres before the corner at which the drift is committed. */
 const DRIFT_COMMIT_DISTANCE: Metres = 5
 const DRIFT_ARM_SPEED = 12
+
+/*
+ * METRES OF OPEN ROAD AFTER THE CORNER, BELOW WHICH A DRIFT IS A LOSS.
+ *
+ * DERIVED, and derived from a measurement rather than from taste. A drift
+ * boost is not thrust: it raises `topSpeed`, which raises the drive-force
+ * headroom term in `kart.ts`. That is worth a great deal on an exit that is
+ * POWER-limited and nothing at all on one that is still LATERAL-limited —
+ * measured at 0.507 s returned by `final-corner`, which exits onto the only
+ * real straight on this circuit, against 0.003 s returned by `wall-arc`,
+ * which is longer, faster and wider and is at its lateral limit the whole
+ * way. Drift value tracks the exit, not the radius. See ART_DIRECTION §10c
+ * criterion 1 for the full table and `rearDriftScale` in `kart.ts` for why
+ * the hold costs what it does.
+ *
+ * The number is the distance a tier-3 boost can actually be spent over:
+ * TIER_THREE boost is 2.05 s and a corner of this class exits at 23-25 m/s,
+ * so 2.05 * 23 = 47 m of boosted running. Below that the boost expires while
+ * the kart is still turning and the 39% rear-grip cut has been paid for
+ * nothing. Rounded to 50 rather than 47 for the same reason CORRIDOR_CLEARANCE
+ * is rounded: the derivation has a speed in it and speeds vary.
+ *
+ * This is deliberately NOT a list of corner names. A list would be right for
+ * this circuit and silently wrong for the next one, and the whole point of
+ * the measurement is that the property belongs to where the STRAIGHTS are.
+ */
+const DRIFT_MIN_RUNWAY: Metres = 50
 /**
  * Minimum predicted seconds of corner before an attempt is started.
  *
@@ -645,6 +672,8 @@ export function createAIDriver(
   /** Metres of that corner still to come, measured from `cornerDist`. */
   let cornerArc: Metres = 0
   let cornerSign: 1 | -1 = 1
+  /** Metres of road after this corner ends before the next one begins. */
+  let cornerRunway: Metres = 0
 
   let stallTime: Seconds = 0
   let itemTimer: Seconds = ITEM_MIN_INTERVAL
@@ -663,6 +692,7 @@ export function createAIDriver(
     const t0 = loc.t
     cornerDist = Infinity
     cornerArc = 0
+    cornerRunway = 0
 
     let entry = -1
     for (let s = 0; s <= SCAN_ENTRY_MAX; s += SCAN_STEP) {
@@ -689,6 +719,23 @@ export function createAIDriver(
       if (Math.abs(k) < DRIFT_CURVATURE * 0.55) break
       if ((k > 0 ? 1 : -1) !== cornerSign) break
       cornerArc = s - entry + SCAN_STEP
+    }
+
+    /*
+     * THIRD WALK: the runway. From where this corner ends, how far until the
+     * next one starts — that is the road the boost has to be spent on, and
+     * `DRIFT_MIN_RUNWAY` explains why it decides whether to arm at all.
+     *
+     * Capped at `DRIFT_MIN_RUNWAY` because nothing above the threshold
+     * changes the decision, and walking a whole lap of samples every tick to
+     * learn "more than enough" would put `scanCorner` on the wrong side of
+     * the per-tick budget.
+     */
+    const exit = entry + cornerArc
+    for (let s = exit; s <= exit + DRIFT_MIN_RUNWAY; s += SCAN_STEP) {
+      track.sample(t0 + s / length, probe)
+      if (Math.abs(probe.curvature) >= DRIFT_CURVATURE) break
+      cornerRunway = s - exit + SCAN_STEP
     }
   }
 
@@ -831,6 +878,7 @@ export function createAIDriver(
     scanCountdown = 0
     cornerDist = Infinity
     cornerArc = 0
+    cornerRunway = 0
     stallTime = 0
     itemTimer = ITEM_MIN_INTERVAL
   }
@@ -1078,6 +1126,7 @@ export function createAIDriver(
             starvedSign === 0 &&
             speed >= Math.max(DRIFT_ARM_SPEED, KART_DRIFT_MIN_SPEED + 1) &&
             arcSeconds >= DRIFT_MIN_ARC_SECONDS &&
+            cornerRunway >= DRIFT_MIN_RUNWAY &&
             state.grounded
           ) {
             phase = 'arming'
