@@ -932,6 +932,42 @@ export const createKart: KartFactory = (
         // A drift is still the same saturated tyre model.  Reducing rear peak
         // and corner stiffness moves the equilibrium to a visible slip angle;
         // there is no sideways position injection or scripted heading change.
+        /*
+         * THIS CONSTANT IS WHY DRIFTING IS SLOWER THAN NOT DRIFTING, and the
+         * measurement is in ART_DIRECTION §10c under criterion 1.
+         *
+         * It cuts rear peak force by 39% and widens rear cornering stiffness
+         * (TYRE_SLIP_ANGLE / 0.61 = 0.115 -> 0.189 rad) FOR AS LONG AS THE
+         * BUTTON IS HELD — keyed on `drift.active`, not on slip. So the cost is
+         * paid across the whole hold while the tier boost repays for 0.72 to
+         * 2.05 s of it.
+         *
+         * Measured with a scripted controller, entry speed identical across
+         * arms by construction, split only on the drift button: drifting is a
+         * LOSS at six of the eight drift-eligible corners on this circuit, by
+         * +6.50 s at grid-ease, +5.83 s at ess-2 and more than +16 s at ess-1.
+         * Drifting only where it pays is worth 0.54 s on a 62.76 s lap against
+         * a gate that wants 6.48 s.
+         *
+         * It is the BUTTON and not the technique: arms driving the identical
+         * pure-pursuit steer command with no flick and no brake reproduce the
+         * entire loss. And it is not entry speed — entry is identical by
+         * construction and where a drift survives its EXIT speed rises by
+         * 1.1 to 1.3 m/s. The loss is mid-corner grip, for the whole hold.
+         *
+         * Do not fix this in `game/ai.ts`. Two attempts have, and both
+         * regressed — see the comment above `SLIP_STARVED_LIMIT` there. A
+         * policy can choose not to drift; it cannot make a drift pay.
+         *
+         * If it is changed, the candidates the measurement points at are:
+         * scale the rear cut with SLIP rather than with the button, so a
+         * committed drift costs what it is actually doing; or make the boost
+         * thrust rather than a `topSpeed` raise, since a `topSpeed` raise
+         * returns almost nothing on a corner that is already at its lateral
+         * limit (wall-arc returns 0.003 s from a tier-2 boost, final-corner
+         * returns 0.507 s, and the difference is that one of them exits onto a
+         * straight).
+         */
         const rearDriftScale = drift.active && i >= 2 ? 0.61 : 1
         // Damper force is allowed to arrest a landing, but it is not a usable
         // tyre load without limit.  Feeding an impact spike straight into the

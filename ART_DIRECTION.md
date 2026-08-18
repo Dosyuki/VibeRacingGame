@@ -743,6 +743,51 @@ section; it has no access to the evidence.
    frames excluded.
 8. **It survives a phone.** No context loss, no memory kill, over a full race.
 
+**Criterion 1 is currently unreachable, and the measurement says why.** Recorded
+here rather than argued about, because two attempts to fix it in `game/ai.ts`
+regressed and the target was never the AI's to hit.
+
+A scripted controller, entry speed identical by construction across arms, split
+only on the drift button, measured over corner + 150 m at every drift-eligible
+corner on the lap:
+
+| corner | R | Δ vs clean | | corner | R | Δ vs clean |
+|---|---|---|---|---|---|---|
+| grid-ease | 83 | **+6.50 s** | | wall-arc | 74, 20° | −0.00 s |
+| dune-sweep | 118 | +0.05 s | | wash | 148 | −0.03 s |
+| ess-1 | 72 | **> +16 s** | | final-corner | 69 | **−0.51 s** |
+| ess-2 | 48, 10° | **+5.83 s** | | ess-3 | 98 | cannot charge |
+
+Drifting only where it pays is worth **0.54 s** on a 62.76 s lap. The gate wants
+4 × the 1.62 s noise floor, i.e. **6.48 s**. Short by a factor of twelve, with a
+perfect policy, after a search over slip target, chase gain, flick length and
+release timing.
+
+**The mechanism is the button, not the technique.** Arms with `kSlip = 0` — the
+same pure-pursuit command the clean arm uses, no flick, no brake — reproduce the
+whole loss. `rearDriftScale = 0.61` cuts rear peak force 39% for as long as
+`drift.active`, keyed on the button rather than on slip, and that is paid for the
+entire hold while the boost repays for 0.72–2.05 s. Entry speed is never the
+loss; where a drift survives, exit speed actually *rises* 1.1–1.3 m/s.
+
+**A drift boost has nothing to push against on a big corner.** The boost raises
+`topSpeed`, which raises the drive-force headroom term — at 28 m/s a 1.22×
+boost is +144% of drive force. But `wall-arc` at 28 m/s is at its LATERAL limit
+and cannot spend longitudinal force, so the longest fastest corner on the lap
+returns 0.003 s, while the short `final-corner`, the only one exiting onto real
+straight, returns 0.507 s. **Drift value tracks how power-limited the exit is,
+not corner radius** — which means it is a property of where the straights are,
+and a circuit with one real straight can only ever have one paying corner.
+
+Criteria 1 and 2 are also in tension on this chassis: 2 wants most attempts
+banked, 1 wants drifting to be fast, and drifting is a loss at six of eight
+eligible corners. Meeting 2 by drifting everywhere costs at least 12 s/lap.
+
+Closing this needs the drift MODEL to change — `rearDriftScale`, or a boost that
+is thrust rather than a `topSpeed` raise, or a rear cut that scales with slip
+instead of with the button — or it needs the criterion restated. Both are design
+decisions and neither belongs to a harness or an AI.
+
 ---
 
 ## 11. Vantage Points
