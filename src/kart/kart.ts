@@ -357,6 +357,161 @@ const DRIFT_MIN_STEER = 0.18
 const DRIFT_MIN_SPEED = 7
 const DRIFT_SLIP_GATE = 0.095
 const DRIFT_CARRY_SECONDS = 0.34
+
+/*
+ * WHAT A DRIFT COSTS IS A FUNCTION OF SLIP, NOT OF THE BUTTON — and the two
+ * halves of what used to be one constant are now two, because they were never
+ * the same statement.
+ *
+ * Before this there was a single `rearDriftScale = 0.61` in the wheel loop,
+ * applied to rear peak force AND to the cornering-stiffness denominator, for as
+ * long as `drift.active`. Keyed on the button, not on slip. That is why
+ * drifting was slower than not drifting. Measured with a scripted controller,
+ * entry speed identical across arms by construction, split only on the drift
+ * button, over corner + 150 m at every drift-eligible corner on the lap:
+ *
+ *   grid-ease   R 83   +6.50 s  |  wall-arc      R 74, 20 deg  -0.00 s
+ *   dune-sweep  R118   +0.05 s  |  wash          R148          -0.03 s
+ *   ess-1       R 72  >+16   s  |  final-corner  R 69          -0.51 s
+ *   ess-2       R 48   +5.83 s  |  ess-3         R 98    cannot charge
+ *
+ * It was the BUTTON and not the technique: arms driving the identical
+ * pure-pursuit steer command with no flick and no brake reproduced the whole
+ * loss. And it was never entry speed — entry is identical by construction, and
+ * where a drift survived its EXIT speed rose 1.1 to 1.3 m/s. The loss was
+ * mid-corner grip, paid for the whole hold, against a boost that repays for
+ * 0.72 to 2.05 s of it.
+ *
+ * WHY THE SPLIT, AND WHY ONLY ONE HALF SCALES
+ *
+ * `peakForce` is not only lateral grip. It is the radius of the friction
+ * circle, so it also bounds LONGITUDINAL force, and `i >= 2` is the DRIVEN
+ * axle. A flat 39% cut was therefore also a flat 39% cut in traction, charged
+ * on every metre of every corner exit, which is most of what the table above is
+ * measuring. That is the cost, and cost is the thing that should scale with
+ * what the kart is actually doing.
+ *
+ * The stiffness widening is not a cost, it is the drift. Dividing
+ * TYRE_SLIP_ANGLE by 0.61 moves saturation from 0.115 to 0.189 rad, which is
+ * what lets the rear sit at a visible slip angle instead of snapping straight,
+ * and it is what carries the kart across `DRIFT_SLIP_GATE` so the ladder can
+ * charge at all. Fading it out at low slip would be a drift that cannot start,
+ * and the §10c 2 ladder passing at all is a first for this project — see the
+ * table below for what removing the low-slip PEAK cut already cost it. So the
+ * widening stays keyed on the button, at exactly its old value.
+ *
+ * Note what this leaves at a committed drift. At |body slip| >= 0.32 rad both
+ * numbers are 0.61 again, so a committed drift costs exactly what it cost
+ * before this change, by construction. Only the cheap end moved.
+ *
+ * THE SHAPE, AND WHY IT IS NOT THE TRAP IN `game/ai.ts`
+ *
+ * 1 -> 0.61 as |body slip| goes 0 -> DRIFT_PEAK_CUT_SLIP, smoothstep, then
+ * flat. Smoothstep rather than a lerp because its derivative is zero at both
+ * ends, so there is no kink at either knee for the chassis to catch on. It is
+ * monotone, stateless, has no threshold and no hysteresis, and it is evaluated
+ * on the same body-slip angle the charge gate reads — so the kart pays for
+ * precisely the quantity it is being paid for.
+ *
+ * Continuity is the load-bearing property here, not the curve. The failure
+ * recorded above `SLIP_STARVED_LIMIT` in `src/game/ai.ts` was grip handed BACK
+ * in one tick while the kart was sideways, which snapped it into the outside
+ * wall: wall contacts went 2.44 -> 65.50 per kart-lap, twice, single-variable.
+ * A slip-keyed cut could rebuild that trap with a different trigger, and this
+ * one does not: as slip falls the peak returns at the rate slip falls and no
+ * faster, bounded by a function with no step in it anywhere. The one step that
+ * does remain is at RELEASE, where the scale goes to 1 — and that step is
+ * unchanged at commit and strictly SMALLER than before everywhere below it,
+ * because the scale being restored from is nearer to 1.
+ *
+ * WHAT THIS MEASURED, AND THE TWO SHAPES THAT MEASURED WORSE
+ *
+ * `autoplay.mjs`, three races, one seed, everything else held:
+ *
+ *   shape                              drift-pays   tier1+   tier3   worst stall
+ *   flat 0.61 on the button (before)     -7.5995 s   82.4%   32.4%    798 ticks
+ *   1 -> 0.61 over 0 -> 0.32 (this)      -5.7615 s   65.3%   33.3%      2 ticks
+ *   0.86 -> 0.61 over 0 -> 0.32          -7.6479 s   66.7%   33.3%     23 ticks
+ *   1 -> 0.61 over 0 -> 0.22             -9.1401 s   65.3%   33.3%     13 ticks
+ *
+ * Read the last two rows before touching either constant, because both are the
+ * obvious tuning move and both are worse than doing nothing.
+ *
+ * The stall column is not this change's target and is reported because it moved
+ * anyway: `completes` was failing on six of eight karts sitting for ~790 ticks,
+ * and it now passes. A kart that departs to 1.5 rad of slip and beaches itself
+ * is the same failure as the +6.50 s at grid-ease, seen by a different gate. Do
+ * not read the 2 ticks as a fix for whatever else that gate is watching.
+ *
+ * A FLOOR AT ZERO SLIP DOES NOT BUY THE LADDER BACK. Holding a residual 14% cut
+ * at |slip| = 0 to keep the old initiation kick cost 1.89 s of drift-pays —
+ * putting it BEHIND the flat 0.61 it replaced — and returned 1.4 points of
+ * tier1+. The cut at low slip is where the whole hold is spent, so a floor is
+ * very nearly the flat cut again, at the flat cut's price.
+ *
+ * NARROWING THE RAMP DOES NOT EITHER. Reaching full depth at 0.22 rad instead
+ * of 0.32 cost 3.38 s and returned NOTHING: 65.3% / 33.3% and the release
+ * histogram 50/46/0/48, identical to this shape in every count. What the ladder
+ * responds to is the scale at the moment of the press, which is the value near
+ * zero slip, and that is 1 in both. Everything past the press is priced, not
+ * gated — so deepening the ramp later buys lap time cost and no attempts.
+ *
+ * THE SCRIPTED PER-CORNER TABLE BARELY MOVES, AND THAT IS EXPECTED. Re-running
+ * all 132 arms of it after the change:
+ *
+ *   corner        Δ before   Δ after  |  corner        Δ before   Δ after
+ *   grid-ease      +6.502    +6.294   |  wall-arc       -0.003    +0.005
+ *   dune-sweep     +0.053    +0.101   |  wash           -0.026    -0.062
+ *   ess-1        no arm survived      |  final-corner   -0.507    -0.632
+ *   ess-2          +5.825    +6.063   |  ess-3      none -> +7.745
+ *
+ *   drift only where it pays: -0.536 -> -0.694 s/lap
+ *
+ * Do not read that as the change not working. Those arms exist to force a NAMED
+ * TIER, so they chase a slip target until they get it, and they arrive at
+ * maxSlip 1.55 — past 0.32, where this model is deliberately identical to the
+ * old one. A drift that has already departed is not rescued here and was never
+ * meant to be. The corners whose best arm stays INSIDE the band are the ones
+ * that improve: final-corner -0.507 -> -0.632 at maxSlip 0.296, wash -0.026 ->
+ * -0.062 at 0.289.
+ *
+ * The gain is in the RACE, where the reference AI's drifts are mostly light
+ * ones: -7.5995 -> -5.7615 s, respawns 13 -> 5, mean lap 72.099 -> 71.109, and
+ * the field spread 9.34 -> 6.33 s. Wall contacts went the other way, 13 -> 24
+ * over 24 kart-laps, which is 1.0 per kart-lap against the 65.50 that the
+ * `SLIP_STARVED_LIMIT` trap produced — karts now carry speed through corners
+ * they used to depart from, and some of that speed reaches the wall.
+ *
+ * So the 17 points of tier1+ are the price of the change and not a tuning
+ * failure: they are marginal attempts that used to be forced past
+ * DRIFT_SLIP_GATE by a cut they had not earned. Note what did NOT move — tier 3
+ * is 48 releases in every row above, the same 48, because a drift committed
+ * enough to reach 1.52 s of charge reaches the flat part of the ramp and pays
+ * the old price anyway. The ladder gate wants >= 60% and >= 25%; this is 65.3%
+ * and 33.3%, and the thin one is tier1+.
+ *
+ * DRIFT_PEAK_CUT_SLIP is measured, not chosen. The usable band is
+ * DRIFT_SLIP_GATE (0.095) to about 0.32 rad; 0.35 to 0.55 is a cliff edge, and
+ * above ~0.6 every run went to 0.89-1.56 rad and lost 10-15 m/s, with nothing
+ * ever observed in steady state between 0.6 and 0.8. A committed tier-2 drift
+ * sits at 0.30-0.38 rad. So 0.32 is the top of the band a drift can actually
+ * hold, and the full cut lands exactly where a drift becomes committed.
+ *
+ * The other two things the button does — `frontSteer * 1.12` and the yaw damper
+ * at 0.75 instead of 1.65 — are deliberately NOT slip-scaled and were not
+ * touched. They are initiation and feel, not cost, and moving three things at
+ * once produces a lap time nobody can attribute.
+ *
+ * INERT WHEN NOT DRIFTING, and that is a measurement requirement before it is a
+ * physics one. `drift.active` false computes nothing at all and leaves both
+ * scales at exactly 1, and `x * 1` and `TYRE_SLIP_ANGLE / 1` are bit-identical
+ * to `x` and `TYRE_SLIP_ANGLE`. Verified rather than asserted: autoplay's CLEAN
+ * control arm races with drift disabled, and its 24 lap times across 8 karts
+ * are identical to the last digit before and after this change.
+ */
+const DRIFT_STIFFNESS_SCALE = 0.61
+const DRIFT_PEAK_SCALE_MIN = 0.61
+const DRIFT_PEAK_CUT_SLIP = 0.32
 const TIER_ONE_SECONDS = 0.42
 const TIER_TWO_SECONDS = 0.94
 const TIER_THREE_SECONDS = 1.52
@@ -767,6 +922,41 @@ export const createKart: KartFactory = (
       }
       previousDriftButton = input.drift
 
+      /*
+       * The rear peak-force cut for this tick, per CHASSIS — see the block at
+       * DRIFT_PEAK_CUT_SLIP for why it scales with slip and the stiffness does
+       * not.
+       *
+       * PER CHASSIS AND NOT PER WHEEL, deliberately. The per-wheel `slipAngle`
+       * computed below differs across the rear axle, so scaling on it would
+       * hand the inside and outside rear different peaks and inject a yaw
+       * moment that has never existed here. This chassis has already paid once
+       * for an accidental yaw moment — see the bump phase above, and the
+       * friction-circle note below it — and a drift is not the place to find
+       * out about the next one.
+       *
+       * Recomputed here rather than read from `drift.slipAngle`, which is the
+       * identical formula one line under the wheel loop, for one reason:
+       * `clearDrift` zeroes that field, so an immediate re-press would read 0
+       * and take a full tick of no cut at all. This reads velocity directly and
+       * cannot.
+       *
+       * The value is last tick's motion against this tick's forces, and that
+       * lag is wanted. Grip that falls with slip is a positive feedback loop;
+       * making it an explicit one-tick lag at 120 Hz rather than an algebraic
+       * same-tick solve is what keeps it a damped loop instead of a stiff one.
+       *
+       * `drift.active` false writes nothing and computes nothing — not a zero,
+       * not a multiply by one — so every non-drift number in this project stays
+       * bit-identical to the build before this block.
+       */
+      let driftPeakScale = 1
+      if (drift.active) {
+        const bodySlip = Math.abs(Math.atan2(velocity.dot(right), Math.abs(speedForward) + 0.2))
+        const u = clamp(bodySlip / DRIFT_PEAK_CUT_SLIP, 0, 1)
+        driftPeakScale = 1 - (1 - DRIFT_PEAK_SCALE_MIN) * u * u * (3 - 2 * u)
+      }
+
       for (let i = 0; i < 4; i++) {
         const wheel = wheels[i]!
         const leverRight = WHEEL_RIGHT[i]!
@@ -933,42 +1123,32 @@ export const createKart: KartFactory = (
         // and corner stiffness moves the equilibrium to a visible slip angle;
         // there is no sideways position injection or scripted heading change.
         /*
-         * THIS CONSTANT IS WHY DRIFTING IS SLOWER THAN NOT DRIFTING, and the
-         * measurement is in ART_DIRECTION §10c under criterion 1.
+         * TWO SCALES, NOT ONE, AND ONLY ONE OF THEM MOVES WITH SLIP. The
+         * derivation, the per-corner measurement it came from and the
+         * continuity argument are all at DRIFT_PEAK_CUT_SLIP; this is only the
+         * point of use.
          *
-         * It cuts rear peak force by 39% and widens rear cornering stiffness
-         * (TYRE_SLIP_ANGLE / 0.61 = 0.115 -> 0.189 rad) FOR AS LONG AS THE
-         * BUTTON IS HELD — keyed on `drift.active`, not on slip. So the cost is
-         * paid across the whole hold while the tier boost repays for 0.72 to
-         * 2.05 s of it.
+         * Do not collapse these back into one number because they happen to
+         * hold the same value at a committed drift. They are the same value at
+         * |body slip| >= 0.32 rad ON PURPOSE — that is what makes a committed
+         * drift cost exactly what it cost before the split — and they are
+         * different everywhere below it, which is the entire change.
          *
-         * Measured with a scripted controller, entry speed identical across
-         * arms by construction, split only on the drift button: drifting is a
-         * LOSS at six of the eight drift-eligible corners on this circuit, by
-         * +6.50 s at grid-ease, +5.83 s at ess-2 and more than +16 s at ess-1.
-         * Drifting only where it pays is worth 0.54 s on a 62.76 s lap against
-         * a gate that wants 6.48 s.
+         * Do not fix drift lap time in `game/ai.ts` either. Two attempts have,
+         * and both regressed — see the comment above `SLIP_STARVED_LIMIT`
+         * there. A policy can choose not to drift; it cannot make a drift pay.
          *
-         * It is the BUTTON and not the technique: arms driving the identical
-         * pure-pursuit steer command with no flick and no brake reproduce the
-         * entire loss. And it is not entry speed — entry is identical by
-         * construction and where a drift survives its EXIT speed rises by
-         * 1.1 to 1.3 m/s. The loss is mid-corner grip, for the whole hold.
-         *
-         * Do not fix this in `game/ai.ts`. Two attempts have, and both
-         * regressed — see the comment above `SLIP_STARVED_LIMIT` there. A
-         * policy can choose not to drift; it cannot make a drift pay.
-         *
-         * If it is changed, the candidates the measurement points at are:
-         * scale the rear cut with SLIP rather than with the button, so a
-         * committed drift costs what it is actually doing; or make the boost
-         * thrust rather than a `topSpeed` raise, since a `topSpeed` raise
-         * returns almost nothing on a corner that is already at its lateral
-         * limit (wall-arc returns 0.003 s from a tier-2 boost, final-corner
-         * returns 0.507 s, and the difference is that one of them exits onto a
-         * straight).
+         * The other half of criterion 1 that the measurement points at is still
+         * open and is NOT this: the boost raises `topSpeed`, and a `topSpeed`
+         * raise returns almost nothing on a corner already at its lateral limit
+         * (wall-arc returns 0.003 s from a tier-2 boost, final-corner returns
+         * 0.507 s, and the difference is that one of them exits onto a
+         * straight). Making the boost thrust is a separate change with its own
+         * measurement.
          */
-        const rearDriftScale = drift.active && i >= 2 ? 0.61 : 1
+        const rearDrifting = drift.active && i >= 2
+        const rearStiffnessScale = rearDrifting ? DRIFT_STIFFNESS_SCALE : 1
+        const rearPeakScale = rearDrifting ? driftPeakScale : 1
         // Damper force is allowed to arrest a landing, but it is not a usable
         // tyre load without limit.  Feeding an impact spike straight into the
         // brush model produced forces large enough to reverse the kart through
@@ -977,8 +1157,9 @@ export const createKart: KartFactory = (
         // the chassis feels, this bounds what the tyre may grip with — so it is
         // not redundant with the clamp applied to `springForce` above.
         const tyreLoad = Math.min(springForce, MAX_TYRE_LOAD)
-        const peakForce = Math.max(120, tyreLoad * props.grip * rearDriftScale)
-        let lateralForce = -Math.tanh(slipAngle / (TYRE_SLIP_ANGLE / rearDriftScale)) * peakForce
+        const peakForce = Math.max(120, tyreLoad * props.grip * rearPeakScale)
+        let lateralForce =
+          -Math.tanh(slipAngle / (TYRE_SLIP_ANGLE / rearStiffnessScale)) * peakForce
         let longitudinalForce = Math.tanh(slipRatio / TYRE_SLIP_RATIO) * peakForce
 
         /*
