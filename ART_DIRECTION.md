@@ -300,10 +300,20 @@ sun angle and distance. Kerbs are never red.
 
 ### 3b. Why the road is dark
 
-Sunlit sand computes to luma 0.65. Clean tarmac computes to 0.27. That **2.4:1
-ratio is the racing line**, and it is why this circuit is readable in a wide shot
-without a single HUD element. Any change that lightens the road or darkens the
-sand is a gameplay change, not an art change, and must be argued as one.
+Sunlit sand computes to luma **≈ 0.43** horizontal, 0.748 sun-facing. Clean tarmac
+computes to **0.085** horizontal, 0.197 sun-facing. That **5.0:1 ratio is the
+racing line**, and it is why this circuit is readable in a wide shot without a
+single HUD element. Any change that lightens the road or darkens the sand is a
+gameplay change, not an art change, and must be argued as one.
+
+*Corrected.* This paragraph read "sunlit sand 0.65, clean tarmac 0.27, a 2.4:1
+ratio" for as long as the desert theme has existed, and **0.27 is the shadowed
+sand row of §9a's palette table, not tarmac**. It was picked up from the old
+neutral-value, normal-incidence table that §9a has now replaced; the recomputed
+per-channel figures are above. The gameplay contrast is not damaged by the
+correction — it is twice what was claimed — but the number was wrong and the
+inflated tarmac value is the kind of thing that gets used to argue the road is
+already dark enough.
 
 ---
 
@@ -558,41 +568,162 @@ horizontal illuminance and **open-ground shadows are only 1.5–2 stops down, no
 3–4.** A low sun is a low-contrast light on horizontal surfaces and a
 high-contrast light between wall faces.
 
-At exposure 0.88, which puts an 18% grey card at display 0.461:
+**The first version of this table was neutral-value and normal-incidence, and
+both of those were wrong here.** It is superseded. It computed a single
+achromatic value per surface and applied it to a palette whose green channel runs
+4–9× under its red — and Rec. 709 weights green at 0.7152, so "sunlit sandstone
+0.86" was really the red channel of `#c9764a` reported as its luma, when the
+surface measures rgb(196,123,95) and lands at 0.55 in frame. It then applied
+normal-incidence numbers to frames that are mostly *ground*, at `sin(12°) = 0.208`
+grazing incidence. Those two errors compound in the same direction and inflated
+every row.
 
-| Surface | Display luma |
+**Recomputed per channel** through the exact three.js ACES fit at exposure 0.88,
+with one free parameter fitted to a measured sunlit-sand pixel. The model then
+reproduces, independently, the measured sky (0.675 computed against 0.65
+measured) and the measured brightest wall. Display luma, **sun-facing vertical —
+the brightest state each surface can ever reach**:
+
+| Surface | Display luma, sun-facing vertical |
 |---|---|
-| Near-sun haze band | 0.97 |
-| Sky, mid elevation | 0.88 |
-| Sunlit vertical sandstone | 0.86 |
-| Sunlit horizontal sand | 0.65 |
-| 18% grey, sunlit | 0.46 |
+| Kerb stripe B, bone `#f2ead6` | **0.822** |
+| Sand, sunlit `#e3c893` | **0.748** |
+| Rock — gypsum seam `#d8bfa0` | **0.731** |
+| Rock — caprock `#c9764a` | **0.490** |
+| 18% grey card | 0.444 |
+| Rock — upper strata `#b5623f` | **0.407** |
+| Rock — mid strata `#a0553a` | **0.348** |
+| Rock — lower strata `#8f4a33` | **0.297** |
+| Rock — basal shale `#6b3c30` | **0.215** |
+| Road, clean tarmac `#4b4340` | **0.197** |
+| Sky, mid elevation | 0.675 (measured 0.65) |
 | Shadowed sand (sky fill only) | 0.27 |
 | Shaded rock face | 0.17 |
 | Deep overhang niche | 0.070 |
 | ACES clip point | 1.00 |
 
-**Two consequences that reset the whole gate table.** The darkest legitimate
-surface in the scene computes to **luma 0.070 — above the 0.05 dark threshold**,
-so a correct daylight frame contains essentially nothing below 0.05 and the
-night-tier `minDark ≥ 30%` gate inverts into a *maximum*. And luma 0.5 is only
-1.19× sunlit sand, so sand, rock and sky all sit above it: `brightFraction` in a
-correct frame is 60–80%, not 2–5%, and the "emissive area" gate has no analogue
-at that threshold. It moves one stop up.
+**A horizontal surface lands at roughly 0.43–0.57× its sun-facing figure**, the
+ratio rising with level because of where the tone curve compresses. Anchored
+points: the 18% grey card at **0.241**, clean tarmac at **0.085**, sunlit sand at
+**≈ 0.43**. Read the column above as a ceiling, not as what a frame full of
+ground will show — that misreading is half of what was wrong with the version
+this table replaces.
+
+The near-sun haze band is the one row not re-derived; treat its old 0.97 as
+suspect in exactly the same way until someone computes it per channel.
+
+**Three consequences, and the third one resets the whole gate table.**
+
+- The darkest legitimate surface in the scene computes to **luma 0.070 — above
+  the 0.05 dark threshold**, so a correct daylight frame contains essentially
+  nothing below 0.05 and the night-tier `minDark ≥ 30%` gate inverts into a
+  *maximum*. Unchanged, and still derived.
+- **Not one of the six mandated rock strata bands reaches 0.5**, even sun-facing.
+  Neither does tarmac, at any orientation. The old "bright pixels ≥ 0.5" row was
+  therefore unreachable by most of the palette, and what it actually measured was
+  **how much sky a vantage framed**. Measured frames are bimodal — a mass at
+  0.10–0.20 and a second at 0.60–0.70, and the second one is the sky. `grid`
+  (passing) put 41.3% of frame in that upper mass; `arch-interior` put 3.0%.
+- Consequently `strata-wall`, whose §11 job is "all six rock bands legible", was
+  being required to put 28% of its frame above a threshold its subject cannot
+  physically reach. **The threshold moves, not the area.** See the three bands
+  below. Twelve sun azimuths were swept at 12° before concluding this: four of
+  the five failing vantages failed at all twelve, because at 12° a 34 m wall
+  throws 160 m across a 24 m corridor and no azimuth changes that.
+
+#### The three bands
+
+This section has always required three bands and only ever had one. The
+recalibration procedure at the end of §9a says it in plain words — *"bucket them
+into frontlit, backlit and deep-shade and set three bands, not one; at this
+elevation they are three distributions and a single band spanning all of them
+gates nothing"* — and a single band is exactly what shipped.
+
+**The buckets are named for enclosure, not for the camera's relation to the
+sun.** §2 runs the key *down* the canyon axis rather than across it, which makes
+the photographic names useless as a sort key here: `arch-exit` looks straight
+into the 12° sun and is backlit by any definition, and its histogram sits with
+the open vantages; `strata-wall` is backlit by the same definition and sits 0.13
+of mean luma below it. Sorting on the photographic name would have put two
+entirely different distributions in one band, which is the failure the three-band
+instruction exists to prevent. The count is three, as required. Deep-shade is
+`interior` unchanged.
+
+Rows that are **identical in all three bands** — every derived row, plus the
+std-dev floor. None of them depends on composition, so bucketing by composition
+is not a licence to move them:
 
 | Metric | Budget | Status |
 |---|---|---|
-| Mean frame luma | **0.30 – 0.75** | guess — see the revision note below |
-| Frame luma std-dev | **≥ 0.15** | guess on the value, derived on the direction (must rise from 0.10) |
+| Frame luma std-dev | **≥ 0.15** | guess on the value, derived on the direction (must rise from 0.10). **Does not move, in any band.** |
 | Dark pixels (luma < 0.05) | **≤ 6%** | **derived** — deepest legitimate surface is 0.070 |
-| Bright pixels (luma ≥ 0.5) | **28% – 85%** | guess — a shape check, not a budget |
 | Highlight pixels (luma ≥ 0.95) | **≤ 2%**, ≤ 6% with the sun in frame | **derived threshold**, guessed area |
 | Clipped (luma ≥ 0.99), sun out of frame | **≤ 0.05%** | **derived** — clipping needs +5.4 stops over sunlit sand |
 | Clipped, sun in frame | **≤ 0.25%** | **derived** — the sun disc is 0.0029% of a 1080p frame at 65° FOV; this allows ~85× that |
 | Shadowed ground pixels | **≥ 22%** | design requirement (Trap 1) |
 | Hue mass outside 8°–43° | **≥ 28%** | design requirement (Trap 1) |
 
-**The derived/guess split in that last column is not decoration.** The guesses
+Rows that **differ by band**, because they and only they depend on how much sky,
+wall and floor a vantage frames:
+
+| Metric | open | corridor | interior | Status |
+|---|---|---|---|---|
+| Mean frame luma, floor | **0.34** | **0.22** | **0.18** | **derived** from each band's composition, below |
+| Mean frame luma, ceiling | **0.75** | **0.55** | **0.45** | guess (open, unchanged); **derived on the direction** for the other two — a corridor as bright as an open vantage is one whose wall shadow is not being cast, and §11 calls `arch-interior` the darkest frame in the game |
+| Sun-struck pixels (luma ≥ **0.30**), floor | **50%** | **25%** | **12%** | **derived** from each band's composition, below |
+| Sun-struck pixels, ceiling | **85%** | **70%** | **55%** | guess on the value, derived on the direction |
+
+**The sun-struck threshold is 0.30 and it is derived**, off the recomputed table
+above and nothing else. It sits *above* the brightest shadowed surface in the
+palette — shadowed sand at 0.27 — and *below* sunlit horizontal sand at ≈ 0.43 and
+below four of the six sun-facing strata bands. A pixel above it is one the sun
+reached; a pixel below it is one the sun did not. That is the question the row
+was always asking, and at 0.5 it could not ask it. **The 28% area was not
+loosened to compensate**: each band's floor is computed from that band's own
+composition and lands where it lands.
+
+Compositions, stated so the arithmetic is checkable without running anything:
+
+| Band | Composition | Mean | Above 0.30 |
+|---|---|---|---|
+| **open** — sun on broad ground, open sky above | sky 25%, sunlit sand 30%, road ribbon 28% (§3b — all of it under 0.30), shaded wall 15%, kart 2% | .25(.65)+.30(.43)+.15(.15)+.28(.10) = **0.342** | sky 25 + sunlit sand 30 = **55%** |
+| **corridor** — a wall between the sun and the framed ground; at 12° a 34 m wall throws 160 m across a 24 m corridor (§9c), so the floor is inside that shadow for all of it | sky strip 10%, sunlit caprock/upper strata 15%, shaded wall 30%, shadowed floor + road 45% | .10(.65)+.15(.45)+.30(.10)+.45(.15) = **0.229** | sky 10 + lit wall top 15 = **25%** |
+| **interior** — no direct sun on any framed surface except what §11 explicitly grants; §2 makes the cliff bounce dominant here and says so | sky strip 7%, sun shafts 5%, bounce-lit wall 48%, shadowed floor 40% | .07(.65)+.05(.55)+.48(.18)+.40(.15) = **0.219** | sky strip 7 + shafts 5 = **12%** |
+
+The interior sun-struck floor **is** the §11 requirement written as a number:
+§11 grants `slot-narrows` a 9° sky strip and `arch-interior` three sun shafts,
+those are the only above-0.30 content the band is entitled to, and if either goes
+away the row fires.
+
+#### Which vantage is in which band
+
+Assigned from **what §11 says the vantage is**, never from whether it currently
+passes. Two assignments go against the measurement on purpose.
+
+| Vantage | Band | The §11 sentence it is read off |
+|---|---|---|
+| `grid` | open | "contact shadow on tarmac" — which requires direct sun on the tarmac |
+| `dune-sweep` | open | "4.70× raking shadows across the road" — the sun reaches the road — over open sand |
+| `strata-wall` | corridor | "all six rock bands legible … unsmeared on the overhang": a wall subject under an overhang, whose brightest band tops out at 0.490 |
+| `slot-narrows` | interior | "lit by cliff bounce alone … 9° sky strip" — bounce-only by its own definition |
+| `mesa-crest` | open | "longest sightline, aerial perspective, ≥ 5 depth layers" — nothing encloses it |
+| `banked-wall` | corridor | "the 20° bank read … kerb value contrast at 6.4:1" is graded against a wall; the bank is the inside of a corridor, not open ground. **Against the measurement:** it clears the open band's floors today and is still graded as a corridor |
+| `wash-descent` | open | "dust plume against **bright sand**" — §11 itself calls the sand bright |
+| `arch-interior` | interior | "three sun shafts, bounce-only lighting, the darkest frame in the game" |
+| `arch-exit` | open | "bloom control firing into a 12° sun" — the disc is in frame. **Against the measurement:** photographically backlit, but it is the brightest reachable state in the game and is graded against the brightest band, not relaxed |
+| `drift-tier3` | corridor | sparks set "against warm rock and sand" — a rock-enclosed corner, and the §4 proof needs the reserved band to sit against unlit rock |
+
+`arch-exit` and `drift-tier3` also carry the relaxed worst-case **clip and
+highlight** limits. That is orthogonal to the band and must stay orthogonal:
+folding one into the other would hand `drift-tier3` the open band's floors, which
+its composition cannot meet.
+
+`current-view` is **unbucketed**. It is not a §11 vantage and nothing states what
+it frames, so there is no composition to derive a floor from and assigning it a
+band would be inventing one. Its composition-dependent limits are the union of
+the three bands; every shared row above still applies to it unchanged.
+
+**The derived/guess split in those columns is not decoration.** The guesses
 depend on how much sky, wall and floor a given vantage frames, and that
 composition is invented until it is measured. Shipping a guess styled as a
 derivation is the exact mistake §9a already paid for once.
@@ -608,6 +739,36 @@ against sand's 0.35, and §3b makes exactly that contrast the racing line. Rough
 30% of frame at luma 0.27 pulls the mean down about 0.08, which is the size of
 the discrepancy seen. The derived rows did not move, and neither floor has
 graduated out of the guess column.
+
+**Second revision on record — one band became three, and the reasoning is held
+to the same standard.** Five of eleven vantages failed: `strata-wall`,
+`slot-narrows`, `banked-wall`, `arch-interior`, `drift-tier3`. Two separate
+investigations, neither of which changed any code, established that the gate was
+wrong rather than the frame, and the evidence is on the record above: the
+recomputed palette puts every rock stratum under the 0.5 threshold the gate
+required 28% of frame to clear; twelve sun azimuths at 12° fail four of the five
+at all twelve; and the old composition model was an *open* vantage — sky 20% /
+wall 25% / sand 30% — while half the §11 set is enclosed by §1's own design and
+§11 itself calls one of them "the darkest frame in the game". Both rows that
+failed were already flagged **guess**, and both had already been revised once for
+the same class of reason.
+
+What moved: the sun-struck threshold, from a wrong number to a derived one, and
+the mean and area floors, per band, each recomputed from that band's composition.
+What did not move, and must not: **`minStdDev` in any band** — `arch-interior`
+measures 0.152 against the 0.15 floor and clears it on merit, after an arch roof
+was built to earn that margin — and `maxDark`, `maxHighlight` and `clipped`, all
+of which measure 0.00% and all of which are derived. The area was not widened to
+compensate for the threshold move.
+
+**And every band was watched failing.** A relaxed floor nobody has seen fire is
+not a floor. `tools/energy-check.mjs --broken` now runs three sabotages, not one,
+and demands that each fire in *every* band: `white` (a quarter of the frame
+cleared to white, the original), `dim` (every pixel halved in display space —
+the direction the corridor and interior floors relax in), and `flat` (every pixel
+pulled 80% of the way to one mid grey, which preserves the mean and cuts the
+std-dev to a fifth). Under `flat` the corridor and interior bands fail on
+`minStdDev` **alone**, which is the demonstration that mattered.
 
 Three consequences worth stating plainly:
 
@@ -629,6 +790,15 @@ deep-shade and set three bands, not one; at this elevation they are three
 distributions and a single band spanning all of them gates nothing. Then re-derive
 exposure by solving the ACES fit for where the references put sunlit high-albedo
 ground, which turns exposure from taste into a fitted parameter.
+
+**This procedure has now been run once**, and the three bands above are its
+output — bucketed by enclosure rather than by the photographic names, for the
+reason given there. The exposure re-derivation was done the same way: the ACES
+fit was solved per channel with one free parameter against a measured sunlit-sand
+pixel, and the fitted model then predicted the sky and the brightest wall without
+being told either. Anyone re-running it should expect the bucket *names* to be
+arguable and the bucket *count* not to be: the ten §11 vantages are three
+distributions and no fewer.
 
 ### 9b. No perfectly uniform region — anywhere
 
