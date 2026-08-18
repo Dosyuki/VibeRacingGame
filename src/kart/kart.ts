@@ -121,6 +121,48 @@ const WALL_EVENT_MIN_SPEED = 1.0
 const FRONT_AXLE = 0.68
 const REAR_AXLE = -0.72
 
+/*
+ * KART-TO-KART CONTACT. Until this existed there was none at all: eight karts
+ * drove through each other for the whole project, and `tools/grid-start.mjs`
+ * measured 191 violations of 5045 sampled pairs through turn one with a worst
+ * centre-to-centre separation of 1.051 m — karts halfway inside each other, on
+ * camera, in the first corner of every race.
+ *
+ * THE SHAPE IS TWO CIRCLES IN PLAN, and the radius is not a new number. It is
+ * the circumscribing radius of the wheel footprint, which is exactly what the
+ * gate measures against (`grid-start.mjs:272`, `TOL.kartRadius = 0.963`). Taking
+ * `Math.max(FRONT_AXLE, -REAR_AXLE)` rather than `FRONT_AXLE` is deliberate: the
+ * harness' comment derives 0.963 from "FRONT_AXLE" but substitutes 0.72, which
+ * is the REAR lever — the two were swapped when the mass centre moved forward
+ * (see the block above) and the comment did not follow. The farthest corner of
+ * the footprint is what a circle has to contain, so this takes whichever lever
+ * is longer and stays equal to the instrument through the next axle change.
+ *
+ * A circle is generous side-by-side: two karts abreast cannot get closer than
+ * 1.93 m of centre spacing where their wheels would touch at 1.28 m. That is the
+ * standing cost of the model and it is paid deliberately — a capsule or an OBB
+ * pair is 28 pairs of a much more expensive test per tick, `step` is on the MUST
+ * NOT ALLOCATE list, and the gate that found the defect grades the circle.
+ *
+ * RESTITUTION IS LOW ON PURPOSE. A racing game wants karts to rub and be pushed;
+ * 0.15 removes the closing speed and returns a sixth of it, so a pair that
+ * touches separates and stays separated without the billiard-ball rebound that
+ * would make every corner a scattering event. It is deliberately below
+ * `WALL_RESTITUTION`: rock pushes back harder than another kart's sidepod.
+ *
+ * THE HEIGHT GATE is not a third dimension of collision, it is a refusal to
+ * pretend. Two karts more than this far apart vertically are not touching in any
+ * sense a plan circle can describe — one is airborne over the other — and
+ * shoving a kart sideways in mid-air off a contact it does not have looks far
+ * worse than passing through. 1.4 m clears the largest legitimate height
+ * difference on the circuit: The Wall's 20 degree bank puts two karts 1.93 m
+ * apart laterally at 0.66 m of height difference.
+ */
+const KART_RADIUS = Math.hypot(Math.max(FRONT_AXLE, -REAR_AXLE), HALF_TRACK)
+const KART_CONTACT_DIAMETER = KART_RADIUS * 2
+const KART_RESTITUTION = 0.15
+const KART_CONTACT_HEIGHT = 1.4
+
 // Section 6 fixes total travel at 0.09 m.  REST_LENGTH sits inside that range;
 // the remaining constants merely name its hard endpoints.
 const SUSPENSION_TRAVEL = 0.09
@@ -561,6 +603,31 @@ interface MutableKartState {
   stunTime: Seconds
 }
 
+/**
+ * The mutable half of a kart, reachable by ONE other kart during contact
+ * resolution and by nothing else.
+ *
+ * `IKart.state` is a `Readonly<KartState>`, and resolving a contact symmetrically
+ * means writing the OTHER kart's position and velocity. Reaching through the
+ * readonly view to do it would type-check — `Vector3` is mutable whatever the
+ * property says — and would be exactly the silent contract erosion the readonly
+ * exists to prevent. This registry is the explicit version of that write: it is
+ * private to `src/kart/`, it names what may be written, and an `IKart` from some
+ * other implementation is simply absent from it and is skipped rather than
+ * corrupted.
+ *
+ * It is a WeakMap and not a module-level array for the reason stated on the
+ * factory's scratch storage: a module-level list of live karts is state that
+ * outlives `dispose` and that two worlds in one page would share.
+ */
+interface ContactBody {
+  readonly position: Vector3
+  readonly velocity: Vector3
+  /** Re-point the attachment roots after ANOTHER kart has displaced this one. */
+  sync(): void
+}
+const CONTACT_BODIES = new WeakMap<IKart, ContactBody>()
+
 function clamp(value: number, lo: number, hi: number): number {
   return value < lo ? lo : value > hi ? hi : value
 }
@@ -650,6 +717,15 @@ export const createKart: KartFactory = (
   }
 
   let track: GameServices['track'] | null = null
+  /*
+   * THE FIELD, taken from `GameServices` and from nowhere else.
+   *
+   * CLAUDE.md's table puts continuous per-tick state — and another kart's
+   * position is exactly that — on `GameServices`. `src/types.ts` already
+   * publishes `karts: readonly IKart[]` and `IKart.state`, so kart-to-kart
+   * contact needs no widening of the contract and got none.
+   */
+  let field: GameServices['karts'] | null = null
   let previousDriftButton = false
   let driftCarry = 0
   let yawRate = 0
@@ -727,6 +803,7 @@ export const createKart: KartFactory = (
 
     link(services: GameServices): void {
       track = services.track
+      field = services.karts
       // Resolve the real centre surface only after services exist.  The slot's
       // `t` alone cannot tell us the grid's lateral surface.
       services.track.locate(position, centreLocation)
@@ -748,6 +825,127 @@ export const createKart: KartFactory = (
       forward.set(0, 0, -1).applyQuaternion(quaternion).normalize()
       right.set(1, 0, 0).applyQuaternion(quaternion).normalize()
       up.set(0, 1, 0).applyQuaternion(quaternion).normalize()
+
+      /*
+       * KART-TO-KART CONTACT. Constants, model and the measurement that forced
+       * it are at KART_RADIUS; this is the resolution.
+       *
+       * EACH PAIR IS RESOLVED EXACTLY ONCE, BY THE LOWER `identity.id`, AND THAT
+       * IS A CORRECTNESS RULE RATHER THAN A SAVING. Resolving a pair from both
+       * ends applies the separation twice and the impulse twice — a touch would
+       * push the karts 2x the overlap apart and hand each of them 2x the momentum
+       * exchange, which is a bounce nobody asked for and which grows with how
+       * many karts are in the group.
+       *
+       * IT ALSO BUYS A CONSISTENT SNAPSHOT, WHICH IS THE PART THAT IS EASY TO
+       * LOSE. `main.ts` steps karts in ascending array order and this block sits
+       * at the TOP of `step`, before integration. So when kart i owns pair (i,j)
+       * with j > i, kart i has not yet integrated this tick and kart j has not
+       * yet been stepped at all: BOTH are at their end-of-last-tick state, for
+       * every pair, however many karts are in the field. Resolve pairs from the
+       * higher id instead and half of them see one kart a full tick ahead of the
+       * other, which is an asymmetry keyed on kart number — the player is id 0.
+       *
+       * If that step order ever changes, this stays correct and stays
+       * deterministic — each pair is still resolved exactly once and ownership
+       * still follows nothing but kart index — it only loses the pre-integration
+       * symmetry. DETERMINISM ITSELF depends on `services.karts` being a stable
+       * array, which it is: `main.ts` builds it once and never reorders it.
+       *
+       * IT IS INERT WHEN NOTHING IS TOUCHING, in the same sense and for the same
+       * reason as the barrier below: a pair further apart than
+       * KART_CONTACT_DIAMETER writes nothing at all — not a zero, not a multiply
+       * by one — so every single-kart measurement in this project stays
+       * bit-identical to the build before it, and `slip-check`'s exact-zero
+       * determinism gate still holds.
+       *
+       * WHAT IT DOES NOT DO IS EMIT. There is no kart-to-kart event in the
+       * contract and `src/types.ts` is closed, so nothing is emitted rather than
+       * something wrong being emitted. `'kart:hit'` was the candidate and it is
+       * the wrong channel twice over: `HitKind` is what an ITEM does — every kind
+       * stuns for 0.28 to 1.05 s and scales velocity — so routing a corner rub
+       * through it would stun both drivers for every touch and tell `fx/`, `ui/`
+       * and `audio/` that the player had been shelled. The precedent to follow is
+       * the one at types.ts:362, which is that wall contact is telemetry plus FX
+       * and deliberately NOT a `HitKind`, because "one collision must not fire
+       * two effect paths" — and this collision is already fully resolved here.
+       * A `'kart:kart'` event of the same shape as `'kart:wall'` is what this
+       * wants, and that is an announced widening of the contract and its own
+       * commit.
+       */
+      if (field !== null) {
+        for (let k = 0; k < field.length; k++) {
+          const other = field[k]!
+          if (other.identity.id <= identity.id) continue
+          const body = CONTACT_BODIES.get(other)
+          // A kart from another implementation is not in the registry. Skipping
+          // is the honest answer: this cannot displace something it has no
+          // sanctioned write to, and pretending otherwise is how a harness that
+          // hand-rolls an `IKart` gets a silent NaN.
+          if (body === undefined) continue
+          const op = body.position
+          if (Math.abs(op.y - position.y) >= KART_CONTACT_HEIGHT) continue
+          let nx = op.x - position.x
+          let nz = op.z - position.z
+          const distSq = nx * nx + nz * nz
+          if (distSq >= KART_CONTACT_DIAMETER * KART_CONTACT_DIAMETER) continue
+          let dist = Math.sqrt(distSq)
+          if (dist < 1e-6) {
+            /*
+             * Coincident centres have no contact normal, and this is reachable:
+             * `HarnessAPI.resetRace` respawns every kart onto the RACING LINE at
+             * its grid slot's `t`, and the grid is two abreast, so slots 0/1,
+             * 2/3, 4/5 and 6/7 land on the same point until `startRace` puts the
+             * field back on the grid.
+             *
+             * World +X is a fixed direction and not a random one, which is what
+             * keeps it deterministic — `ctx.rngFor` would be legal here and would
+             * still be wrong, because it would make the separation depend on how
+             * many times anything else in this namespace had drawn.
+             */
+            nx = 1
+            nz = 0
+            dist = 0
+          } else {
+            nx /= dist
+            nz /= dist
+          }
+          /*
+           * SEPARATION IS SYMMETRIC AND FULL. Equal mass, so each kart gives up
+           * half the overlap; full rather than relaxed because a fraction leaves
+           * residual interpenetration for the next tick to inherit, and the
+           * defect being fixed is visible overlap. Y is untouched: the suspension
+           * owns the vertical axis and a positional correction there would fight
+           * four springs that are about to run.
+           */
+          const half = (KART_CONTACT_DIAMETER - dist) * 0.5
+          position.x -= nx * half
+          position.z -= nz * half
+          op.x += nx * half
+          op.z += nz * half
+          /*
+           * The impulse acts on the CLOSING component only, so a kart being
+           * overtaken alongside loses none of its forward speed to a rub — the
+           * pair slides past each other. `closing <= 0` is a pair already moving
+           * apart, which needs the separation above and nothing else; hitting it
+           * with an impulse anyway is how a resting contact starts vibrating.
+           */
+          const ov = body.velocity
+          const closing = (velocity.x - ov.x) * nx + (velocity.z - ov.z) * nz
+          if (closing > 0) {
+            const exchange = closing * (1 + KART_RESTITUTION) * 0.5
+            velocity.x -= nx * exchange
+            velocity.z -= nz * exchange
+            ov.x += nx * exchange
+            ov.z += nz * exchange
+          }
+          // The other kart's own `step` will sync its roots later this tick, but
+          // only if it is stepped after this one. Doing it here costs a handful
+          // of copies on a tick where two karts actually touched and removes the
+          // dependency.
+          body.sync()
+        }
+      }
 
       track.locate(position, centreLocation)
       track.sample(centreLocation.t, centreSample)
@@ -1531,8 +1729,17 @@ export const createKart: KartFactory = (
       audioRoot.removeFromParent()
       built = false
       track = null
+      // A disposed kart is not on the circuit, so it must stop being something
+      // the rest of the field can collide with. `field` is dropped for the same
+      // reason in the other direction.
+      field = null
+      CONTACT_BODIES.delete(kart)
     },
   }
+
+  // The one sanctioned write path into this kart from another kart — see
+  // ContactBody. Registered after `kart` exists, and torn down by `dispose`.
+  CONTACT_BODIES.set(kart, { position, velocity, sync: syncRoots })
 
   return kart
 }
