@@ -59,6 +59,15 @@
  *                     in front of it, not parked at the world origin.
  *   cam-tangent       The camera's forward axis agrees with the track tangent at
  *                     the player's position. THIS is the shipped bug's check.
+ *                     Graded only while the KART is pointing down the road —
+ *                     see the three-way split below.
+ *   cam-subject       The player's own kart is inside the camera's frame, gated
+ *                     on the camera's live half-FOV. Graded on EVERY row,
+ *                     spinning or not; it is what makes cam-tangent's exemption
+ *                     safe rather than a hole.
+ *   kart-tangent      The KART is pointing down the road. A driving check, in
+ *                     the file's camera section only because that is where the
+ *                     evidence for it turns up.
  *   cam-follows       Over the run the camera travels a distance comparable to
  *                     the kart's. A detached camera scores zero here and no
  *                     threshold argument is needed to see it.
@@ -99,6 +108,50 @@
  *   corner-onroad     Through the first real corner nobody leaves the road.
  *   corner-clearance  Through the first real corner nobody interpenetrates.
  *   corner-flow       Through the first real corner nobody stops.
+ *
+ * ONE RED USED TO NAME THE WRONG SUBSYSTEM — THE THREE-WAY SPLIT
+ * -------------------------------------------------------------
+ * `cam-tangent` asserted that the camera's yaw is within 35 deg of the road
+ * tangent, and it was red for the life of the project. IT WAS NOT MEASURING THE
+ * CAMERA. Replaying exactly what this harness does, all 335 of 335 violating
+ * rows had the KART more than 35 deg off the tangent — worst kart 130.5 deg,
+ * worst camera 99.1 deg — with `onTrack` true throughout: the player kart is
+ * handed to the reference AI at GO+8 s, enters turn one at 24.6 m/s, loses the
+ * rear at 85.6 deg of body slip and travels BACKWARDS at up to -8.63 m/s for
+ * 2.4 s. The rig aims at a blend of the road ahead and the kart's nose, so the
+ * camera sat ~30 deg CLOSER to the road than the kart did — the best any chase
+ * camera behind that kart could do, and still 64 deg outside a gate that assumed
+ * a kart driving down a road. The tolerance's own derivation says as much, and
+ * the check already carried an exemption for `!onTrack` and none for a kart that
+ * spins ON the road.
+ *
+ * The answer is NOT to relax it. A kart that spins at turn one is a real defect
+ * and it must stay caught. What was wrong is that a CAMERA check was catching
+ * it, which sends every reader to `game/camera.ts` to fix something in
+ * `kart/kart.ts`. So the one question is now three, and each red names one
+ * owner:
+ *
+ *   cam-tangent   does the VIEW agree with the road?   — graded only on rows
+ *                 where the kart itself agrees with the road, because on the
+ *                 rest of them the rig cannot satisfy it and the answer would be
+ *                 about the kart.
+ *   kart-tangent  does the KART agree with the road?   — the same rows, the
+ *                 opposite population, the same constant. Red is a driving bug.
+ *   cam-subject   is the kart in the SHOT?             — every row, including
+ *                 every row cam-tangent declines. This is the camera's honest
+ *                 question when the kart is sideways: not "are you pointing down
+ *                 the road" but "can the player still see their kart".
+ *
+ * THE FAILURE MODE TO GUARD AGAINST HERE IS A CHECK THAT PASSES BECAUSE IT NOW
+ * MEASURES LESS, and there are two guards. First, the exemption and the gate are
+ * the same expression (`spun`), so a row `cam-tangent` skips is a row
+ * `kart-tangent` fails — the number of situations that redden this file cannot
+ * go down, only the name on the red can change. Second, `--broken` carries
+ * `camera-loses-kart`: the camera pushed 10 m sideways with its ORIENTATION
+ * untouched, while the kart drives exactly as the build drives it. `cam-tangent`
+ * stays green on that (the view is still parallel to the road) and `cam-subject`
+ * must fire, which is a broken camera on a correctly-driving kart being caught
+ * by the new half of the check rather than by the old one.
  *
  * THE LAP-1 `bestProgress` LATCH — HANDLED THE WAY autoplay.mjs HANDLES IT
  * ------------------------------------------------------------------------
@@ -174,6 +227,21 @@ import { launch } from './lib/browser.mjs'
 const args = process.argv.slice(2)
 const useDev = args.includes('--dev')
 const selfTest = args.includes('--broken')
+
+/*
+ * COORDINATION, NOT MEASUREMENT — no threshold below is derived from it.
+ *
+ * `tools/autoplay.mjs:409` states the argument and this is the same one:
+ * harnesses in this repo run in parallel, `vite-server.mjs` correctly REFUSES to
+ * adopt a listening server, and a file that takes no port is simply unrunnable
+ * while another agent holds 4173. 4199 is clear of the default 4173, of
+ * autoplay's 4179 and of slip-check's 4178.
+ */
+const PORT = (() => {
+  const hit = args.find((a) => a.startsWith('--port='))
+  const n = hit ? Number(hit.slice('--port='.length)) : NaN
+  return Number.isFinite(n) && n > 0 ? n : useDev ? 5199 : 4199
+})()
 
 const OUT = path.join(ROOT, 'tools', 'out')
 mkdirSync(OUT, { recursive: true })
@@ -267,6 +335,45 @@ const TOL = {
    * `main.ts:132-134` looks down -Z. 35 deg catches that with 2.5x of margin.
    */
   camTangentDeg: 35.0,
+  /**
+   * Degrees between the KART's own forward axis and the track tangent under it,
+   * both flat. A DRIVING number, not a camera one, and it does two jobs that
+   * must never come apart:
+   *
+   *   1. it is the gate of `kart-tangent`, and
+   *   2. it is the line above which `cam-tangent` stops grading a row.
+   *
+   * ONE CONSTANT FOR BOTH IS THE POINT. `cam-tangent` was red for the life of
+   * this project and it was not measuring the camera: every violating row had
+   * the KART more than 35 deg off the tangent (worst 130.5 deg against a worst
+   * camera of 99.1 deg), because the rig aims at a blend of road and nose and
+   * therefore sits ~30 deg CLOSER to the road than the kart it is behind. No
+   * camera that stays behind a kart pointing 130 deg off the road can also be
+   * within 35 deg of the road; the two requirements are incompatible, and the
+   * check was sending every reader to the wrong subsystem.
+   *
+   * Splitting the question is only safe if nothing falls between the halves, so
+   * the exemption and the gate READ THE SAME EXPRESSION (`spun`, below). A row
+   * `cam-tangent` declines to grade is a row `kart-tangent` fails, by
+   * construction rather than by agreement between two numbers. The count of
+   * situations that redden this file therefore cannot go down — only the NAME on
+   * the red can change, from the camera to the kart.
+   *
+   * WHY 50 AND NOT 35. Measured on this build (see the aim ledger the run
+   * prints): a correct rig carries 0.55 .. 0.75 of the kart's own tangent error
+   * — 34.6 deg of kart reads 20.3 deg of camera, 33.9 reads 21.5. Extrapolated,
+   * the camera reaches `camTangentDeg` at roughly 50 deg of kart error, and past
+   * that point "the camera is within 35 deg of the road" is a statement about
+   * the kart and not about the rig. Below it, a red really is the camera's.
+   *
+   * It is also 1.4x the hardest heading error this build produces on a healthy
+   * lap (35.15 deg, and that is the player pulling off a grid slot 2.7 m from
+   * the centreline at 8.6 m/s, which is geometry rather than a loss of control),
+   * and a long way under the failing episode's 130.5 deg at 85.6 deg of body
+   * slip travelling BACKWARDS at -8.63 m/s. A kart 50 deg off the road is no
+   * longer going where the road goes.
+   */
+  kartTangentDeg: 50.0,
   /**
    * Degrees per second the view may swing.
    *
@@ -517,14 +624,16 @@ async function battery(opts) {
   }
   const FWD = v(0, 0, -1)
   const RIGHT = v(1, 0, 0)
+  const UP = v(0, 1, 0)
   const forwardOf = (q) => qrot(q, FWD)
   const rightOf = (q) => qrot(q, RIGHT)
+  const upOf = (q) => qrot(q, UP)
 
   // ---- check bookkeeping --------------------------------------------------
   const checks = {}
   const CHECK_IDS = [
     'grid-slots', 'grid-karts',
-    'cam-behind', 'cam-tangent', 'cam-follows', 'cam-seam',
+    'cam-behind', 'cam-tangent', 'cam-subject', 'kart-tangent', 'cam-follows', 'cam-seam',
     'countdown-order', 'countdown-timing', 'countdown-clock', 'countdown-hud',
     'countdown-hold',
     'launch-field', 'launch-player',
@@ -788,6 +897,25 @@ async function battery(opts) {
   let handedOver = false
   let camPathLength = 0
   let camAngleTravel = 0
+  /*
+   * THE AIM LEDGER, and it is reported whether or not anything is red.
+   *
+   * Every on-road sample lands in exactly ONE of `alignedRows` and `spunRows`,
+   * and those two are what `cam-tangent` graded and what it declined. Printing
+   * both, with the worst camera error inside each, is what stops the exemption
+   * being a quiet hole: a reader can see how much of the run each half covered
+   * without taking anyone's word for it.
+   */
+  const aim = {
+    onRoadRows: 0,
+    alignedRows: 0, spunRows: 0,
+    camTangentWorstAligned: 0, camTangentWorstSpun: 0,
+    kartTangentWorst: 0, camKartWorst: 0, camKartWorstAligned: 0, camKartWorstSpun: 0,
+    /** Frame containment, in degrees off the camera's own axes. */
+    frameRows: 0, frameHalfFovH: null, frameHalfFovV: null,
+    frameWorstH: 0, frameWorstV: 0, frameBehindRows: 0,
+    frameBlocked: null,
+  }
   let kartPathLength = 0
   let prevCamPos = null
   let prevPlayerPos = null
@@ -1058,10 +1186,21 @@ async function battery(opts) {
       const behind = -dot(rel, kf)
       const side = dot(rel, kr)
       track.sample(playerRow.t, smp2)
-      const tangentDeg = angDeg(flat(cf), flat(smp2.tangent))
+      const tangentFlat = flat(smp2.tangent)
+      const tangentDeg = angDeg(flat(cf), tangentFlat)
+      /*
+       * THE TWO NUMBERS THAT SEPARATE THE CAMERA'S QUESTION FROM THE KART'S.
+       *
+       * `tangentDeg` above is camera-against-road and it conflates both: it is
+       * large when the RIG is wrong and equally large when the rig is perfect
+       * and the KART is pointing the wrong way. These split it.
+       */
+      const kartTangentDeg = angDeg(flat(kf), tangentFlat)
+      const camKartDeg = angDeg(flat(cf), flat(kf))
 
       row.cam = {
         pos: cp, fwd: cf, behind: behind, side: side, tangentDeg: tangentDeg,
+        kartTangentDeg: kartTangentDeg, camKartDeg: camKartDeg,
         dist: len(rel),
       }
 
@@ -1081,11 +1220,124 @@ async function battery(opts) {
       // it, the rig deliberately collapses the road weight (`camera.ts:541`) and
       // pointing at the road would be the wrong behaviour.
       if (playerRow.onTrack) {
-        saw('cam-tangent')
-        if (tangentDeg > TOL.camTangentDeg) {
-          bump('cam-tangent', tangentDeg,
-            `t+${f((tick - startTick) * STEP, 2)}s: camera looks ${f(tangentDeg, 1)} deg off the track ` +
-            `tangent at the player (t=${f(playerRow.t, 4)}, max ${TOL.camTangentDeg} deg)`)
+        /*
+         * ONE EXPRESSION, TWO USES, AND THAT IS THE WHOLE SAFETY ARGUMENT.
+         *
+         * `spun` decides both which check grades this row and whether
+         * `kart-tangent` fails it. They cannot drift apart into a gap that
+         * swallows rows, because there is nothing for them to drift against:
+         * every row `cam-tangent` declines below is a row `kart-tangent` fails
+         * two lines further down.
+         */
+        const spun = kartTangentDeg > TOL.kartTangentDeg
+        aim.onRoadRows++
+        if (kartTangentDeg > aim.kartTangentWorst) aim.kartTangentWorst = kartTangentDeg
+        if (camKartDeg > aim.camKartWorst) aim.camKartWorst = camKartDeg
+        if (spun) {
+          aim.spunRows++
+          if (tangentDeg > aim.camTangentWorstSpun) aim.camTangentWorstSpun = tangentDeg
+          if (camKartDeg > aim.camKartWorstSpun) aim.camKartWorstSpun = camKartDeg
+        } else {
+          aim.alignedRows++
+          if (tangentDeg > aim.camTangentWorstAligned) aim.camTangentWorstAligned = tangentDeg
+          if (camKartDeg > aim.camKartWorstAligned) aim.camKartWorstAligned = camKartDeg
+        }
+
+        // --- is the KART pointing down the road? A DRIVING question ---------
+        saw('kart-tangent')
+        if (spun) {
+          bump('kart-tangent', kartTangentDeg,
+            `t+${f((tick - startTick) * STEP, 2)}s: the PLAYER KART is ${f(kartTangentDeg, 1)} deg off the ` +
+            `track tangent at t=${f(playerRow.t, 4)}, doing ${f(playerRow.speed, 2)} m/s ON the road ` +
+            `(max ${TOL.kartTangentDeg} deg). This is a DRIVING defect, not a camera one — open ` +
+            `kart/kart.ts or game/ai.ts, not game/camera.ts. The camera behind it was ${f(tangentDeg, 1)} ` +
+            `deg off the road and ${f(camKartDeg, 1)} deg off the kart's own nose, which is the best a ` +
+            `chase camera can do behind a kart pointing there.`)
+        }
+
+        /*
+         * --- does the VIEW agree with the road? A CAMERA question ------------
+         *
+         * Two exemptions now, and both say the same thing: this check is only a
+         * statement about the RIG while the rig can act on it. Off the road the
+         * rig deliberately collapses the road weight (`camera.ts:541`) and
+         * pointing at the road would be the wrong behaviour. On the road behind
+         * a kart that is `kartTangentDeg` off the tangent, the aim blend puts
+         * the camera most of the kart's own error off the road however well it
+         * is working — so a red there would be the kart's, which is exactly the
+         * misattribution this split exists to end. Those rows are counted in
+         * the aim ledger and failed by `kart-tangent` above; they are not
+         * dropped.
+         */
+        if (!spun) {
+          saw('cam-tangent')
+          if (tangentDeg > TOL.camTangentDeg) {
+            bump('cam-tangent', tangentDeg,
+              `t+${f((tick - startTick) * STEP, 2)}s: camera looks ${f(tangentDeg, 1)} deg off the track ` +
+              `tangent at the player (t=${f(playerRow.t, 4)}, max ${TOL.camTangentDeg} deg) while the KART ` +
+              `under it is only ${f(kartTangentDeg, 1)} deg off. The kart is going where the road goes and ` +
+              `the view is not — this one IS the camera.`)
+          }
+        }
+      }
+
+      /*
+       * --- is the kart in the SHOT? ----------------------------------------
+       *
+       * THE CHECK THAT MAKES THE EXEMPTION ABOVE SAFE, and the one the camera
+       * owes a player in every regime including a spin. It asks nothing about
+       * the road and nothing about the rig's internals: it puts the kart's
+       * centre in the camera's own basis and asserts it is inside the frustum
+       * the camera is actually rendering with.
+       *
+       * The gate is the camera's LIVE half-FOV rather than a tolerance —
+       * `camera.ts:70` is 62 deg vertical, which at 16:9 is 46.9 deg of
+       * horizontal half-angle, and a rig that re-tunes its FOV moves the gate
+       * with it honestly. There is nothing to tune: either the player can see
+       * their own kart or they cannot. On the failing episode the kart reached
+       * 41.2 deg off the camera axis against that 46.9 — inside the frame, so
+       * the rig was doing its job while `cam-tangent` was calling it broken.
+       *
+       * Graded on EVERY row, on the road or off it, spun or aligned.
+       */
+      const halfFovV = (typeof cam.fov === 'number' && isFinite(cam.fov)) ? cam.fov / 2 : null
+      const halfFovH = (halfFovV !== null && typeof cam.aspect === 'number' && isFinite(cam.aspect))
+        ? Math.atan(Math.tan(halfFovV * Math.PI / 180) * cam.aspect) * 180 / Math.PI
+        : null
+      if (halfFovH === null || halfFovV === null) {
+        // PENDING, never a silent pass: a camera that will not report its own
+        // frustum cannot be asked whether something is inside it.
+        aim.frameBlocked = `harness.camera reports fov=${String(cam.fov)} aspect=${String(cam.aspect)}`
+      } else {
+        aim.frameHalfFovH = halfFovH
+        aim.frameHalfFovV = halfFovV
+        const toKart = sub(playerRow.pos, cp)
+        const ax = dot(toKart, norm(rightOf(cam.quaternion)))
+        const ay = dot(toKart, norm(upOf(cam.quaternion)))
+        const az = dot(toKart, cf)
+        const hDeg = Math.atan2(ax, az) * 180 / Math.PI
+        const vDeg = Math.atan2(ay, az) * 180 / Math.PI
+        aim.frameRows++
+        if (Math.abs(hDeg) > aim.frameWorstH) aim.frameWorstH = Math.abs(hDeg)
+        if (Math.abs(vDeg) > aim.frameWorstV) aim.frameWorstV = Math.abs(vDeg)
+        row.cam.frameHDeg = hDeg
+        row.cam.frameVDeg = vDeg
+
+        saw('cam-subject', 2)
+        if (az <= 0) {
+          // atan2 wraps behind the camera and would report a small angle for a
+          // kart directly astern, so this is separated rather than folded in.
+          aim.frameBehindRows++
+          bump('cam-subject', 180 - Math.abs(hDeg),
+            `t+${f((tick - startTick) * STEP, 2)}s: the player's own kart is BEHIND the camera ` +
+            `(${f(-az)} m the wrong side of the lens) — it cannot be in the shot at all`)
+        } else if (Math.abs(hDeg) > halfFovH || Math.abs(vDeg) > halfFovV) {
+          bump('cam-subject', Math.max(Math.abs(hDeg) - halfFovH, Math.abs(vDeg) - halfFovV),
+            `t+${f((tick - startTick) * STEP, 2)}s: the player's own kart is OUTSIDE the frame — ` +
+            `${f(hDeg, 1)} deg horizontally (half-FOV ${f(halfFovH, 1)}) and ${f(vDeg, 1)} deg vertically ` +
+            `(half-FOV ${f(halfFovV, 1)}) off the camera axis, ${f(len(toKart), 1)} m away. The kart is ` +
+            `${f(kartTangentDeg, 1)} deg off the road, so this is the CAMERA's failure however the kart ` +
+            `is driving.`)
         }
       }
 
@@ -1561,6 +1813,7 @@ async function battery(opts) {
       seamTick: seamTick,
       camPathLength: camPathLength,
       camAngleTravel: camAngleTravel,
+      aim: aim,
       kartPathLength: kartPathLength,
       preserveDrawingBuffer: preserveDrawingBuffer,
       canvas: canvas ? { w: canvas.width, h: canvas.height } : null,
@@ -1612,6 +1865,10 @@ async function battery(opts) {
         cam: s.cam
           ? { behind: +s.cam.behind.toFixed(2), side: +s.cam.side.toFixed(2),
               tangentDeg: +s.cam.tangentDeg.toFixed(1),
+              kartTangentDeg: +s.cam.kartTangentDeg.toFixed(1),
+              camKartDeg: +s.cam.camKartDeg.toFixed(1),
+              frameHDeg: s.cam.frameHDeg === undefined ? null : +s.cam.frameHDeg.toFixed(1),
+              frameVDeg: s.cam.frameVDeg === undefined ? null : +s.cam.frameVDeg.toFixed(1),
               swing: s.cam.swingDegPerSec === undefined ? null : +s.cam.swingDegPerSec.toFixed(1) }
           : null,
         karts: s.karts.map((r) => ({
@@ -1738,6 +1995,75 @@ function gridStartSabotage(spec) {
         p.position.z + smp.right.z * 8 + smp.tangent.z * 30,
       )
       cam.updateMatrixWorld(true)
+    })
+  } else if (spec.kind === 'camera-loses-kart') {
+    /*
+     * A BROKEN CAMERA ON A CORRECTLY-DRIVING KART, AND THE ONE THAT PROVES THE
+     * SPLIT DID NOT MAKE THIS FILE EASIER TO PASS.
+     *
+     * `cam-tangent` now declines rows where the kart is off the tangent, so the
+     * obvious way for this change to have gone wrong is a camera fault that
+     * nothing catches any more. This is that fault, constructed to be invisible
+     * to the check that used to own it: the camera is pushed 10 m along the
+     * road's `right` with its ORIENTATION UNTOUCHED, so the view is still
+     * exactly parallel to the road and `cam-tangent` stays green — while the
+     * player's own kart sits 10 m off an axis whose horizontal half-FOV is
+     * 46.9 deg, at a chase distance of 6.1 m. atan(10 / 6.1) is 58.6 deg: the
+     * kart is off the side of the screen and `cam-subject` is the only check
+     * looking at it.
+     *
+     * The kart is not touched at all. It drives exactly as this build drives it.
+     */
+    afterEachStep(null, () => {
+      const p = player()
+      if (!p) return
+      h.track.locate(p.position, loc)
+      h.track.sample(loc.t, smp)
+      const cam = h.camera
+      cam.position.set(
+        cam.position.x + smp.right.x * 10,
+        cam.position.y + smp.right.y * 10,
+        cam.position.z + smp.right.z * 10,
+      )
+      cam.updateMatrixWorld(true)
+    })
+  } else if (spec.kind === 'kart-spun') {
+    /*
+     * THE DEFECT `cam-tangent` USED TO CATCH, UNDER THE NAME THAT OWNS IT.
+     *
+     * The real episode is the player kart losing the rear at turn one and
+     * travelling backwards down the road at -8.63 m/s with `onTrack` true. This
+     * file may not edit `src/`, so it reproduces the OUTCOME at the surface a
+     * detector reads: the player kart's heading held 120 deg off the tangent
+     * under it, on the road, while the camera behind it does whatever the rig
+     * does.
+     *
+     * SET rather than accumulated. Premultiplying a rotation each step would let
+     * the physics carry the error around and the heading would cycle through
+     * angles that happen to pass, which is a detector proven against a transient
+     * rather than against a kart that is genuinely pointing the wrong way.
+     *
+     * `cam-tangent` is EXPECTED to report itself unmeasured on this run: every
+     * on-road row is spun, so it declines all of them. That is the exemption
+     * working, visible in the ledger, and it is why `cam-subject` exists.
+     */
+    afterEachStep(null, () => {
+      const k = player()
+      if (!k) return
+      h.track.locate(k.position, loc)
+      h.track.sample(loc.t, smp)
+      const a = 120 * Math.PI / 180
+      const dx = smp.tangent.x * Math.cos(a) + smp.tangent.z * Math.sin(a)
+      const dz = -smp.tangent.x * Math.sin(a) + smp.tangent.z * Math.cos(a)
+      // A camera's -Z is its view axis and a kart's -Z is its nose, so a cloned
+      // camera aimed at a point is a ready-made "face that way" quaternion and
+      // no quaternion algebra has to be written out here by hand.
+      const aimer = h.camera.clone()
+      aimer.position.set(k.position.x, k.position.y, k.position.z)
+      aimer.up.set(0, 1, 0)
+      aimer.lookAt(k.position.x + dx * 30, k.position.y, k.position.z + dz * 30)
+      aimer.updateMatrixWorld(true)
+      k.quaternion.copy(aimer.quaternion)
     })
   } else if (spec.kind === 'camera-frozen') {
     // The camera stops following once the kart is moving. Owns cam-follows.
@@ -2030,6 +2356,13 @@ const SABOTAGES = [
     what: 'THE SHIPPED BUG: harness.camera is a static dolly at the origin looking down -Z' },
   { kind: 'camera-sideways', owner: 'cam-tangent', horizon: 5,
     what: 'the view yawed 90 deg, position and follow untouched' },
+  { kind: 'camera-loses-kart', owner: 'cam-subject', horizon: 5,
+    what: 'the camera pushed 10 m sideways with its ORIENTATION UNTOUCHED, so the view still points ' +
+      'down the road and the kart is off the side of the screen — a broken CAMERA on a kart that ' +
+      'drives exactly as this build drives it' },
+  { kind: 'kart-spun', owner: 'kart-tangent', horizon: 6,
+    what: 'the player kart held 120 deg off the tangent, on the road — the defect cam-tangent used to ' +
+      'catch, under the name that owns it' },
   { kind: 'camera-beside', owner: 'cam-behind', horizon: 5,
     what: 'the camera moved 8 m to the kart\'s right, still looking down the road' },
   { kind: 'camera-frozen', owner: 'cam-follows', horizon: 21,
@@ -2255,6 +2588,42 @@ function printFacts(F) {
     (F.kartPathLength > 0 ? `  (ratio ${fmt(F.camPathLength / F.kartPathLength, 3)})` : '') +
     `; the view rotated ${fmt(F.camAngleTravel, 1)} deg in total`)
   L.push(`seam         player crossed t=0 ${F.seamCrossed ? `at tick ${F.seamTick}` : 'NOT during this run'}`)
+  const A = F.aim
+  if (!A || A.onRoadRows === 0) {
+    L.push('aim          NOT MEASURED — no on-road sample of this run had both a camera and a player row')
+  } else {
+    L.push('')
+    L.push(
+      `aim          THE THREE-WAY SPLIT, REPORTED WHETHER OR NOT ANYTHING IS RED. ${A.onRoadRows} on-road ` +
+      `sample(s):`,
+    )
+    L.push(
+      `  aligned    ${String(A.alignedRows).padStart(4)} row(s) with the kart within ${TOL.kartTangentDeg} deg ` +
+      `of the tangent. cam-tangent GRADED these; worst camera ${fmt(A.camTangentWorstAligned, 1)} deg ` +
+      `(gate ${TOL.camTangentDeg}).`,
+    )
+    L.push(
+      `  spun       ${String(A.spunRows).padStart(4)} row(s) with the kart PAST it. cam-tangent declined these ` +
+      `because behind such a kart the rig cannot satisfy it; worst camera ${fmt(A.camTangentWorstSpun, 1)} deg. ` +
+      `Every one of them is a kart-tangent violation — the exemption and the gate are the same expression, ` +
+      `so nothing falls between them.`,
+    )
+    L.push(
+      `  kart       worst kart heading error ${fmt(A.kartTangentWorst, 1)} deg (gate ${TOL.kartTangentDeg}); ` +
+      `worst camera-to-nose angle ${fmt(A.camKartWorst, 1)} deg, REPORTED not gated — cam-behind already ` +
+      `grades the camera in the kart's frame.`,
+    )
+    if (A.frameBlocked) {
+      L.push(`  frame      PENDING — ${A.frameBlocked}`)
+    } else {
+      L.push(
+        `  frame      ${A.frameRows} row(s) checked against the camera's live half-FOV ` +
+        `${fmt(A.frameHalfFovH, 1)} deg horizontal / ${fmt(A.frameHalfFovV, 1)} deg vertical; the kart ` +
+        `reached ${fmt(A.frameWorstH, 1)} / ${fmt(A.frameWorstV, 1)} deg off the axis` +
+        (A.frameBehindRows ? `, and was BEHIND the lens on ${A.frameBehindRows} row(s)` : '') + '.',
+      )
+    }
+  }
   L.push('')
   L.push('respawns / wall hits in the first ' + TOL.stuckWindowSeconds + ' s (cumulative, graded once)')
   L.push('  ' + F.stall.map((s) => `#${s.id} r${s.respawns} w${s.wallHits}`).join('   '))
@@ -2277,7 +2646,7 @@ function printFacts(F) {
 
 let exitCode = 0
 const pendings = []
-const server = await startServer({ mode: useDev ? 'dev' : 'preview' })
+const server = await startServer({ mode: useDev ? 'dev' : 'preview', port: PORT })
 const browser = await launch({})
 
 try {
@@ -2355,6 +2724,23 @@ try {
         `cam-seam — the camera's orientation moved a total of ${fmt(clean.facts.camAngleTravel, 3)} deg ` +
         'over the whole run, so the angular-rate cap had nothing to cap and cam-seam is reported as ' +
         'unmeasured rather than as a pass. A camera that never rotates passes a swing gate perfectly.',
+      )
+    }
+    const AIM = clean.facts.aim || {}
+    if (AIM.frameBlocked) {
+      pendings.push(
+        `cam-subject — ${AIM.frameBlocked}, so the frustum the camera is actually rendering with is not ` +
+        'knowable and "is the player\'s kart in the shot" could not be asked. It is reported unmeasured ' +
+        'rather than passed: this is the check that makes cam-tangent\'s spun-kart exemption safe, and a ' +
+        'green from it while it is blind would be the worst output in this file.',
+      )
+    }
+    if (AIM.onRoadRows > 0 && AIM.alignedRows === 0) {
+      pendings.push(
+        `cam-tangent — all ${AIM.onRoadRows} on-road sample(s) had the player kart more than ` +
+        `${TOL.kartTangentDeg} deg off the tangent, so cam-tangent declined every one of them and validated ` +
+        'NOTHING about the rig. Every one of those rows is a kart-tangent violation instead. Fix the ' +
+        'driving and this check gets its population back.',
       )
     }
     /*
