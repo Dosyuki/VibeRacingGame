@@ -24,6 +24,18 @@ refuses to adopt a server already serving a *different* working tree. An
 orphaned dev server from another worktree serves stale code into every
 measurement, silently, for as long as it lives.
 
+It refuses a second thing for the same reason. `npm run build` is
+`tsc --noEmit && vite build`, so a type error stops the build **before** vite
+runs and leaves the *previous* bundle in `dist/` — and every preview-mode
+harness then grades code that is not on disk. That has already happened here: a
+run reproduced a rejected variant's numbers to four decimal places while the
+source was the reverted version. `vite build` now stamps `dist/` with a content
+fingerprint of the source it was built from (`tools/build-stamp.mjs`, wired as a
+plugin in `vite.config.ts`), and `startServer({ mode: 'preview' })` hard-exits
+with code 2 unless it matches. Dev mode is deliberately exempt — vite transforms
+each module on request, so no bundle exists to go stale. Self-test:
+`node tools/build-stamp.mjs --broken`.
+
 ## The contract
 
 `src/types.ts` is the interface every subsystem codes against and the only

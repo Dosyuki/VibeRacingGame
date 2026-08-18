@@ -1,4 +1,5 @@
 import { defineConfig } from 'vite'
+import { buildStampPlugin } from './tools/build-stamp.mjs'
 
 // GitHub Pages serves a project site under /<repo>/, so the deployed build needs
 // that prefix on every asset URL. Local dev, `npm run preview` and every harness
@@ -6,6 +7,16 @@ import { defineConfig } from 'vite'
 // keeps harness URLs identical to dev URLs and removes a whole class of
 // "works locally, 404s in prod" confusion from the measurement loop.
 export default defineConfig({
+  /*
+   * Stamps dist/ with a fingerprint of the source it was built from. It lives in
+   * a plugin rather than in an extra step on the `build` npm script for one
+   * reason: a plugin cannot run unless `vite build` ran, so the stamp cannot be
+   * produced without the bundle it vouches for. `tools/vite-server.mjs` refuses
+   * to start a PREVIEW server whose dist/ does not match — see the long note at
+   * the top of `tools/build-stamp.mjs` for what that is defending against.
+   * Build-only; the dev server has no bundle to go stale.
+   */
+  plugins: [buildStampPlugin()],
   base: process.env.PAGES_BASE ?? '/',
   build: {
     target: 'es2022',

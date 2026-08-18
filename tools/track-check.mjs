@@ -5,14 +5,13 @@
  *   node tools/track-check.mjs --reference  # run the battery on the built-in reference
  *   node tools/track-check.mjs --broken     # self-test: prove every detector fires
  *
- * NOT MINE TO FIX, BUT IT BLOCKS THE LIVE MODE TODAY: tools/vite-server.mjs
- * scrapes the served URL out of vite's banner with a regex that ANSI colour
- * codes break — vite prints `localhost:<ESC>[1m4173<ESC>[22m/`, the port never
- * matches, and after 30 s every harness in the repo dies with "vite preview did
- * not report a URL". `FORCE_COLOR=0` does not suppress it; `NO_COLOR=1` does.
- * Until vite-server.mjs strips ANSI (or sets NO_COLOR in the child env), the
- * live mode needs `NO_COLOR=1 node tools/track-check.mjs`. `--broken` and
- * `--reference` need no server and are unaffected.
+ * FIXED — no `NO_COLOR=1` prefix is needed any more, and the note is kept only
+ * so the next person to read a URL-scraping failure knows where to look. The
+ * banner regex in `vite-server.mjs` is broken by ANSI colour codes (vite prints
+ * `localhost:<ESC>[1m4173<ESC>[22m/`, the port never matches, and after 30 s
+ * every harness dies claiming the server never reported a URL). `FORCE_COLOR=0`
+ * does NOT suppress it; `NO_COLOR=1` does, and `vite-server.mjs` now sets both
+ * in the child env with a comment saying why. Do not tidy either of them away.
  *
  * The track is the one subsystem where every serious bug is invisible in a
  * frame. A spline parameterised by knot index instead of arc length renders
