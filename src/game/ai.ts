@@ -394,6 +394,44 @@ const K_SLIP = 2.3
 /** Seconds of starved slip tolerated before the attempt is abandoned. */
 const SLIP_STARVED_LIMIT: Seconds = 0.45
 
+/*
+ * TRIED TWICE, MEASURED WORSE BOTH TIMES, AND KEPT HERE SO IT IS NOT TRIED A
+ * THIRD TIME.
+ *
+ * The diagnosis is solid and still stands: at the `strata-esses` entry ALL
+ * EIGHT karts spin, on every full-speed pass, 23 of 23 in a 257 s race. Slip
+ * climbs 0.24 -> 0.40 -> 0.58 -> 0.86 -> 1.23 -> 1.53 rad (88 degrees) with
+ * `drift` still true — 4.4x the limit this very comment names — while speed
+ * collapses 24.7 -> 0.84 m/s and then goes negative. `slipStarved` abandons an
+ * attempt whose slip is too LOW and nothing abandoned one whose slip ran away.
+ *
+ * The obvious fix is the mirror of `slipStarved`: release when slip exceeds a
+ * spin limit for a grace period. IT MAKES EVERYTHING WORSE.
+ *
+ *              laps    tier1+   tier0 releases   wall contacts /kart/lap
+ *   shipped     6/8    34.7%      428 of 662        2.44
+ *   +overslip   0/8    13.0%      398 of 462       65.50
+ *   +overslip and three other drift changes
+ *               0/8    14.5%      378 of 442       57.67
+ *
+ * Single-variable, `SLIP_SPIN_LIMIT = 0.42`, `SLIP_SPIN_GRACE = 0.12 s`, the
+ * accumulator reset everywhere `slipStarved` is and the exit sharing the
+ * starved lockout. The wall-contact column is the mechanism: releasing a drift
+ * that has already gone too far hands the rear its grip back while the kart is
+ * sideways, and it snaps straight into the outside wall. THE RELEASE IS WHAT
+ * THROWS THE KART AWAY, not what saves it.
+ *
+ * So a runaway drift cannot be exited. Whatever fixes this has to stop the
+ * slip reaching 0.42 in the first place — entry speed, entry line, or the
+ * chase term's authority during the hold — or it has to bring the kart down
+ * from a spin gradually rather than by handing back grip in one tick. The
+ * measurement that would settle it is a single drifted corner against the same
+ * corner clean at the same entry speed, per tier, which nobody has taken.
+ *
+ * Both variants are saved outside the tree: `ai.TRIED-overslip-only.ts` and
+ * `ai.WIP-overslip-scancorner.ts` in the session scratchpad.
+ */
+
 /**
  * HOW FAR THE SLIP-CHASE MAY PULL THE COMMAND OFF THE PURSUIT'S, in lock.
  *
