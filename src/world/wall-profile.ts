@@ -327,11 +327,48 @@ export const SECTIONS: readonly Section[] = [
     bankWall: 0,
     hint: 0,
   },
-  // Arch tunnel. This builds the gorge, not the roof — see terrain.ts' header.
+  /*
+   * Arch tunnel. `terrain.ts` now roofs this section, and the crest height is
+   * what decides whether the roof is a roof or a lid.
+   *
+   * IT WAS 24 m AND THAT NUMBER WAS MEASURED WRONG, twice over.
+   *
+   * §1 states a wall height for the strata esses (34 m) and for The Slot (26 m)
+   * and states none for the arch. 24 m was carried across from The Slot by
+   * analogy, and with a roof in the section it produces a formation nobody
+   * asked for: a rock BRIDGE at 12 m with 12 m of open trench standing on top of
+   * it. Two things measured off that build, not argued:
+   *
+   *   - A skylight in the bridge does not show sky. It shows the trench's far
+   *     wall, in shadow, because a 2.2 m camera looks up through the aperture at
+   *     8-25 degrees and at that angle the trench wall fills it. `arch-interior`
+   *     came back mean 0.236 / sd 0.120 — DARKER and FLATTER than the roofless
+   *     frame it replaced, which is the correct measurement of a hole that opens
+   *     onto more rock.
+   *   - The whole point of §1's three skylights is the shafts, and at a 12°
+   *     sun a shaft lands `4.70 x hole height` downrange. Raising the roof to
+   *     clear the trench puts the aperture at ~22 m and the shaft 103 m back
+   *     down a 118 m tunnel — outside the tunnel for every skylight that is not
+   *     within 15 m of the exit.
+   *
+   * Both dissolve if the crest is at the roof rather than far above it. At 15 m
+   * the roof's own top surface (soffit ~11.6 m + 3.2 m of slab) IS the top of
+   * the formation, an aperture opens straight to sky, and the shaft offset drops
+   * to 54 m — a bit under half the arch, which is what puts two of the three
+   * lit strips on road the `arch-interior` camera is looking at.
+   *
+   * IT DOES NOT MOVE THE BARRIER, and that was checked rather than assumed. The
+   * toe here is `minToe`-clamped at both heights: at 24 m the talus run is
+   * 4.61 m against a face base 14.9 m off centre, and at 15 m it is 2.88 m, and
+   * `base - run` is inside `minToe` either way, so `wallProfileAt` returns the
+   * same clamped toe. `WALL_MIN_HEIGHT` is likewise untouched — the crest noise
+   * bottoms out at 6.4 m here, well clear of 2 m, so the section keeps a
+   * barrier everywhere it had one.
+   */
   {
     name: 'arch-tunnel',
     start: 0.83,
-    height: [24, 24],
+    height: [15, 15],
     setback: [3.2, 3.2],
     topScale: [0.62, 0.62],
     facePower: 1.3,

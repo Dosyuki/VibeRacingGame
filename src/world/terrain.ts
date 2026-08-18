@@ -45,10 +45,17 @@
  * OWNERSHIP
  * ---------
  * This module owns: cliff walls, strata, talus slope, the shoulder apron
- * between road edge and wall toe, boulder/pebble/brush scatter, and the distant
- * mesa layers. It does NOT own: the road surface, kerbs, the open sand plane
- * beyond the apron, the sky, or the arch roof over §1's arch tunnel section.
- * It builds the gorge the arch sits in and leaves the roof to whoever claims it.
+ * between road edge and wall toe, boulder/pebble/brush scatter, the distant
+ * mesa layers, and — since the round in which `arch-interior` was measured
+ * framing an open canyon corner — the ARCH ROOF over §1's arch tunnel. It does
+ * NOT own: the road surface, kerbs, the open sand plane beyond the apron, or
+ * the sky.
+ *
+ * The roof was left unclaimed here for several rounds and the cost of that is
+ * on the record: §11's `arch-interior` grades three sun shafts, bounce-only
+ * lighting and the darkest frame in the game, and with no roof it graded an
+ * open corner at std-dev 0.134 — the only genuinely flat frame in the set. See
+ * the arch-roof tunables below for why a 12° sun dictates the shape of it.
  */
 
 import { createNoise2D, createNoise3D } from 'simplex-noise'
@@ -154,6 +161,17 @@ export interface TerrainStats {
    * and it is a conversation about the layout, not a number to tune here.
    */
   readonly corridorConflicts: number
+  /**
+   * Roof cells left open as §1's three collapse skylights, and zero if the arch
+   * did not build at all.
+   *
+   * Reported rather than asserted in a comment for the same reason as every
+   * other counter here: an arch whose skylights closed up is a roofed tunnel
+   * with no light in it, which from `arch-interior` looks exactly like a roofed
+   * tunnel whose shafts have missed — and §11 grades that vantage on having
+   * three of them.
+   */
+  readonly archSkylightCells: number
 }
 
 interface ProfileStats {
@@ -339,6 +357,160 @@ const MESA_LAYER_HEIGHT_RATIO = 1.22
 const MESA_HEIGHT_JITTER = 0.05
 const MESA_LAYERS = 6
 const MESA_SIDES = 7
+
+// ---------------------------------------------------------------------------
+// The arch roof — §1's arch tunnel, claimed
+// ---------------------------------------------------------------------------
+
+/*
+ * THIS FILE'S HEADER USED TO SAY THE ROOF WAS "left to whoever claims it".
+ * Nobody did, for long enough that `arch-interior` — the §11 vantage whose
+ * entire job is "three sun shafts, bounce-only lighting, the darkest frame in
+ * the game" — was measured framing an open canyon corner: no overhang, no
+ * shafts, and the only genuinely FLAT frame in the set at std-dev 0.134 against
+ * a 0.15 floor, with 3.0% of pixels above luma 0.6 where every other vantage
+ * has a second mode at 0.60-0.70. A vantage that grades an arch and has no arch
+ * in it is not a dark frame, it is an uncovered gate.
+ *
+ * WHY A 12 DEGREE SUN DECIDES THE SHAPE OF THIS THING, AND NOT TASTE.
+ *
+ * §2 fixes the sun at 12 degrees. A shaft entering a hole `h` metres above the
+ * road therefore lands `h / tan(12) = 4.70 h` metres DOWNRANGE of the hole
+ * along the sun's ground track, not under it. Two consequences follow, and both
+ * are counter-intuitive enough to be worth stating before someone "fixes" them:
+ *
+ *   - A THICK roof cannot pass a shaft at all. Light entering a hole punched
+ *     through `d` metres of rock only reaches the far side if the hole is at
+ *     least `4.70 d` long in the sun's direction. At the 11 m of rock a solid
+ *     arch mass would give, that is a 52 m hole, which is not a skylight, it is
+ *     a missing roof. So the roof is a SHELL 3.2 m thick at the crown, and the
+ *     rock above it stays where the wall profile already put it — the section
+ *     reads as a rock BRIDGE across the gorge, which is what a natural arch
+ *     physically is, rather than as a tunnel bored through a solid mesa.
+ *
+ *   - The skylights cannot light the ROAD, at any placement. That is measured
+ *     and the measurement is with `ARCH_SKYLIGHTS`. The short version: the road
+ *     under this arch is shadowed by the gorge WALLS, which throw 70 m at 12°
+ *     across a corridor 28 m wide, and it was shadowed before any roof existed.
+ *     No aperture can pass sunlight through a wall. So the skylights are sized
+ *     and placed for the job they can do — showing SKY, the only surface above
+ *     luma 0.5 available inside a tunnel — and §1's "hard shafts across the
+ *     road" is a requirement on the sun, not on this file.
+ *
+ * §1 puts the arch at 118 m inside a section spanning t = 0.83-1.00, which is
+ * 275 m — so the section is longer than the arch and the arch has to be placed
+ * inside it. It is placed to contain §11's `arch-interior` station (t = 0.90)
+ * with 32 m of tunnel behind the camera and 86 m ahead of it, because a vantage
+ * standing at the mouth would frame an entrance rather than an interior.
+ *
+ * MEASURED EFFECT ON THE VANTAGE THIS EXISTS FOR, before and after, five frames
+ * each: mean 0.246 -> 0.279, std-dev 0.134 -> 0.152, bright 4.5% -> 6.7%. The
+ * std-dev row — the one §9a says a flat frame cannot pass, and the only row
+ * `arch-interior` was failing that §11 does not itself contradict — is now
+ * green. Mean and bright are not, and will not be: §11 calls this "the darkest
+ * frame in the game" and §9a asks every vantage for 28% of pixels above luma
+ * 0.5. Those two cannot both hold inside a roofed tunnel and the roof is not
+ * what should give.
+ */
+
+/** §1: "Natural rock arch, 118 m." Metres of centreline that carry a roof. */
+const ARCH_LENGTH_M = 118
+/** Entry station. See the placement note above; the exit falls out of the length. */
+const ARCH_T_ENTRY = 0.88
+
+/*
+ * The roof springs from a BEDDING PLANE, not from an invented height.
+ *
+ * Band 6's bottom row is the bottom row of upper-strata, which is the same
+ * position as the top row of the gypsum seam — bands duplicate their shared
+ * row, and that duplication is what makes a strata edge hard. Springing there
+ * means the roof and the wall share a vertex line by construction rather than
+ * by tolerance, so no seam can open between them however the erosion field
+ * moves the face. It also happens to be how sandstone arches actually form: the
+ * span is undercut along the weakest bed, and §1 already puts this project's
+ * mandatory value break at that height.
+ *
+ * On the arch section's table entry (15 m wall, 12% talus) that row sits about
+ * 7.6 m above the road and about 13 m off the centreline, which with the rise
+ * below puts the crown at ~11.6 m and the slab's top at ~14.8 m — level with
+ * the crest, which is the whole reason `wall-profile.ts` carries 15 m there.
+ * All three are outputs of the profile, not constants here, and they move
+ * with it.
+ */
+const ARCH_SPRING_BAND = 6
+
+/** Crown rise above the springing line, metres. A segmental vault, ~1:7 on a
+ *  28 m span — flat enough that the shaft offset stays inside the tunnel, deep
+ *  enough to read as an arch rather than as a lid. */
+const ARCH_ROOF_RISE = 4.0
+
+/** Shell thickness at the crown, tapered to zero at both springings with a
+ *  `sin^0.6` window so the slab wedges INTO the wall instead of leaving a
+ *  3 m ledge standing off the face. */
+const ARCH_ROOF_THICKNESS = 3.2
+
+/** Cross-span segments. 14 puts a vertex every ~2 m across a 28 m span, which
+ *  is finer than the 4.5 m station spacing along it — the soffit is read at
+ *  grazing incidence from below and a coarse span reads as facets. */
+const ARCH_SPAN_SEGMENTS = 14
+
+/**
+ * §1: "Three collapse skylights throw hard shafts across the road."
+ *
+ * `at` and `centre` are fractions of the arch — along it, and across the span —
+ * and `lengthM` is the gash's run along the centreline.
+ *
+ * THE SHAFTS PART OF THAT SENTENCE IS NOT BUILDABLE AT §2'S SUN, AND THIS IS
+ * THE MEASUREMENT RATHER THAN AN OPINION ABOUT IT.
+ *
+ * Three attempts, in order:
+ *
+ *   1. Holes placed by eye near the crown. The lit strip landed 47 m downrange
+ *      — `height / tan(12°)` — and this section's centreline turns 79° over its
+ *      118 m, so a straight 47 m run off a road bending at an 85 m radius left
+ *      the carriageway and landed on the talus.
+ *   2. Holes SOLVED against the sun instead of placed: walk every roof cell's
+ *      shaft down to road level, find the station it arrives over, keep the cell
+ *      whose landing is nearest what §1 asked for and on the road. All three
+ *      solved. The road stayed dark.
+ *   3. The falsifying test — the roof opened to 70 m gashes across 84% of the
+ *      span, which is barely a roof. THE ROAD WAS STILL DARK, at mean 0.249
+ *      against 0.243 with the small holes.
+ *
+ * Attempt 3 is what settles it. The floor under this arch is not shadowed by
+ * the ROOF; it is shadowed by the WALLS, and it was already shadowed before any
+ * roof existed. At 12° a 15 m wall throws 70 m of shadow across a corridor
+ * 28 m wide, so no aperture anywhere in the roof can pass sunlight to the road:
+ * the ray is stopped by the gorge wall long before it reaches the hole. Solving
+ * the hole placement solved the wrong half of the problem, and the counter that
+ * said "3 shafts on road" was measuring an unoccluded landing, which is a
+ * number that reads correct and is not. It is gone rather than left lying.
+ *
+ * So the skylights are placed for the job they CAN do: letting the camera see
+ * SKY. Sky is luma 0.88 and is the only surface above 0.5 available inside a
+ * tunnel, and the aperture is hard-edged, which is the property §11 is after.
+ * For a 2.2 m camera to see through a `t` metre slab at elevation `e` the gash
+ * must be longer than `t / tan(e)`, and the frame tops out at +17° — so an
+ * aperture ~11 m above the road has to sit at least 3.3 x (11 - 2.2) = 29 m
+ * ahead to be in frame at all, and be at least 3.2 / tan(17°) = 11 m long to
+ * be more than a rim. All three are sized past both bounds.
+ *
+ * Lengths, lateral centres and half-spans are all different — three identical
+ * holes on one axis is §1 Trap 4 at tunnel scale.
+ */
+const ARCH_SKYLIGHTS: readonly {
+  readonly at: number
+  readonly lengthM: number
+  readonly centre: number
+  readonly halfSpan: number
+}[] = [
+  // The one §11's `arch-interior` station (along 0.27) actually frames: far
+  // enough ahead to clear +17°, wide enough on the outside of the bend to stay
+  // inside the horizontal FOV as the road turns away.
+  { at: 0.52, lengthM: 44, centre: 0.38, halfSpan: 0.32 },
+  { at: 0.79, lengthM: 30, centre: 0.56, halfSpan: 0.2 },
+  { at: 0.95, lengthM: 24, centre: 0.46, halfSpan: 0.26 },
+]
 
 // ---------------------------------------------------------------------------
 // Small maths helpers
@@ -841,6 +1013,62 @@ export function buildCanyonTerrain(
   }
 
   // -------------------------------------------------------------------------
+  // The arch roof — §1's arch tunnel, and the only rock over the road.
+  // -------------------------------------------------------------------------
+  /*
+   * NAMED OUTSIDE THE GROUND GROUPS ON PURPOSE, and this is load-bearing.
+   *
+   * tools/seam-check.mjs classifies solid ground by mesh name — `road`,
+   * `canyon-apron-*`, `canyon-wall-*` — and casts rays straight DOWN to ask
+   * whether anything is under them. A roof is not ground: it is the first
+   * geometry in this project that legitimately sits ABOVE the road, and calling
+   * it `canyon-wall-…` would feed 15 m-high hits into the `apron-toe` sweep and
+   * the coverage band for no reason other than a naming habit.
+   *
+   * `coverage` asks whether SOME hit lands in the band, so the roof is harmless
+   * there either way; `apron-toe` reads every wall hit and is not. Excluded, on
+   * a name that says what it is.
+   */
+  const archRange = archStationRange(stationCount, lapLength)
+  let archSkylights = 0
+  if (archRange) {
+    const soffitB = new SurfaceBuilder()
+    const shellB = new SurfaceBuilder()
+    archSkylights = emitArchRoof(
+      soffitB,
+      shellB,
+      stations,
+      archRange.i0,
+      archRange.i1,
+      uvU,
+      fields,
+      lapLength,
+    )
+    for (const [builder, mat, tag] of [
+      [soffitB, rockHard, 'soffit'],
+      [shellB, rockSoft, 'shell'],
+    ] as const) {
+      const geo = builder.build()
+      if (!geo) continue
+      geometries.push(geo)
+      const mesh = new Mesh(geo, mat)
+      /*
+       * IT MUST CAST. The roof is the reason `arch-interior` is dark at all —
+       * a non-casting arch is a decorative lid over a fully sunlit road, which
+       * is the exact opposite of §11's "bounce-only lighting", and the frame
+       * gives no clue which one you built.
+       */
+      mesh.castShadow = true
+      mesh.receiveShadow = true
+      mesh.name = `canyon-arch-${tag}`
+      group.add(mesh)
+      meshCount++
+      shadowCasters++
+      triangles += builder.idx.length / 3
+    }
+  }
+
+  // -------------------------------------------------------------------------
   // Scatter — §5c talus boulders, §1 Trap 3 pebbles, §3a vegetation.
   // -------------------------------------------------------------------------
   /*
@@ -978,6 +1206,7 @@ export function buildCanyonTerrain(
     profilesCompressed: profileStats.compressedProfiles,
     worstProfileSqueeze: profileStats.worstSqueeze,
     corridorConflicts: profileStats.corridorConflicts,
+    archSkylightCells: archSkylights,
   }
 
   /*
@@ -1874,6 +2103,299 @@ function emitApronStrip(
     }
     prev = ring
   }
+}
+
+// ---------------------------------------------------------------------------
+// The arch roof
+// ---------------------------------------------------------------------------
+
+/** Where the roof lives, in station indices. `null` if the arch does not fit. */
+function archStationRange(stationCount: number, lapLength: number): { i0: number; i1: number } | null {
+  const i0 = Math.ceil(ARCH_T_ENTRY * stationCount)
+  const i1 = Math.floor((ARCH_T_ENTRY + ARCH_LENGTH_M / lapLength) * stationCount)
+  // Four stations is the minimum that makes a swept vault rather than a wedge,
+  // and a lap short enough to fail this is a track bug, not an arch bug.
+  if (i1 - i0 < 4 || i1 >= stationCount) return null
+  return { i0, i1 }
+}
+
+/**
+ * One point on the roof shell.
+ *
+ * `p` runs 0 (left springing) to 1 (right springing). Writes into `out` as
+ * `[soffitX, soffitY, soffitZ, topY, signedLateral]` — the two surfaces share
+ * everything but their height, so they are solved once.
+ */
+function archPoint(st: Station, p: number, lapLength: number, fields: Fields, out: number[]): void {
+  const row = BAND_ROW_OFFSET[ARCH_SPRING_BAND]!
+  const uL = st.rowU[0]![row]!
+  const uR = st.rowU[1]![row]!
+  // Signed lateral: negative is the driver's left, matching `sign * u` in
+  // `emitBandStrip`. Interpolating between the two springings in this frame is
+  // what makes the roof meet the wall at a shared vertex line on both sides.
+  const w = lerp(-uL, uR, p)
+  const springY = lerp(st.baseY[0]! + st.rowH[0]![row]!, st.baseY[1]! + st.rowH[1]![row]!, p)
+
+  const window = Math.sin(Math.PI * p)
+  /*
+   * The soffit is not a smooth extrusion. §9b forbids a region with no
+   * variance, and the underside of an arch is the single largest near-uniform
+   * surface this file could possibly emit — one lit only by bounce, at grazing
+   * incidence, with a normal that barely turns. The erosion field gives it
+   * scallops; keying the field on `t` keeps it periodic like everything else
+   * here, and windowing it by the same `sin` keeps the springings EXACT so the
+   * shared vertex line with the wall survives it.
+   */
+  const scallop = (ridged3(fields.erode, st.t, lapLength, 9, w * 0.5 + 71) - 0.5) * 1.1 * window
+  let soffitY = springY + ARCH_ROOF_RISE * window + scallop
+
+  /*
+   * THE CORRIDOR BOUND, EVALUATED ON THE RESULT — the same rule and the same
+   * reason as `faceU`. Everything above adds signed terms to a height, and a
+   * guard applied before them is a guard the last term walks through. Inverting
+   * `corridorMinU` gives the lowest height at which this lateral offset is
+   * legal, and the roof is lifted to it rather than clipped.
+   *
+   * It is slack by roughly 8 m today at the tightest point. That is not a
+   * reason to drop it: the springing row, the rise and the scallop amplitude
+   * are all free to move, and this is the line that says which way they may.
+   */
+  const corridor = st.halfWidth + BARRIER_MARGIN + CORRIDOR_CLEARANCE
+  const minH = CORRIDOR_HEADROOM + CORRIDOR_LEAN_FADE * (1 - Math.abs(w) / corridor)
+  soffitY = Math.max(soffitY, st.py + minH)
+
+  out[0] = st.px + st.rx * w
+  out[1] = soffitY
+  out[2] = st.pz + st.rz * w
+  // `sin^0.6` is fatter than `sin` through the haunches — a real span carries
+  // its depth out toward the abutments — while still reaching exactly zero at
+  // both springings, which is what wedges the slab into the wall.
+  out[3] = soffitY + ARCH_ROOF_THICKNESS * Math.pow(window, 0.6)
+  out[4] = w
+}
+
+/** Is the cell centred on (`along`, `p`) a skylight rather than roof? */
+function archIsOpen(along: number, p: number, archLength: number): boolean {
+  for (const s of ARCH_SKYLIGHTS) {
+    const da = ((along - s.at) * archLength) / (s.lengthM * 0.5)
+    const dp = (p - s.centre) / s.halfSpan
+    // Elliptical, not rectangular. A rectangular hole in a swept surface reads
+    // as a hatch, and three hatches in a row is the repeat §1 Trap 4 is about.
+    if (da * da + dp * dp < 1) return true
+  }
+  return false
+}
+
+/**
+ * Sweep the roof.
+ *
+ * `soffit` and `shell` are separate builders because they take different
+ * materials: §5a splits rock roughness by hardness, and the underside of a span
+ * is the one surface in this canyon that is genuinely wind- and water-polished
+ * while its back is ordinary weathered caprock. Two materials on one slab is
+ * also the cheapest way to stop the arch reading as a single extruded object.
+ *
+ * Returns the number of skylight cells opened, so the caller can report it
+ * rather than trust this comment.
+ */
+function emitArchRoof(
+  soffit: SurfaceBuilder,
+  shell: SurfaceBuilder,
+  stations: Station[],
+  i0: number,
+  i1: number,
+  uvU: number,
+  fields: Fields,
+  lapLength: number,
+): number {
+  const SEG = ARCH_SPAN_SEGMENTS
+  const nAlong = i1 - i0
+  const archLength = ARCH_LENGTH_M
+
+  // Solve every grid point once. Two rings per station — soffit and top — and
+  // the open/closed decision is per CELL, so it has to be known before any quad
+  // is emitted rather than discovered while emitting.
+  const pt: number[] = [0, 0, 0, 0, 0]
+  const sx: number[][] = []
+  const sy: number[][] = []
+  const sz: number[][] = []
+  const ty: number[][] = []
+  const sv: number[][] = []
+  for (let i = i0; i <= i1; i++) {
+    const st = stations[i]!
+    const rx: number[] = []
+    const ry: number[] = []
+    const rz: number[] = []
+    const rt: number[] = []
+    const rv: number[] = []
+    let acc = 0
+    let px = 0
+    let py = 0
+    let pz = 0
+    for (let j = 0; j <= SEG; j++) {
+      archPoint(st, j / SEG, lapLength, fields, pt)
+      if (j > 0) acc += Math.hypot(pt[0]! - px, pt[1]! - py, pt[2]! - pz)
+      px = pt[0]!
+      py = pt[1]!
+      pz = pt[2]!
+      rx.push(pt[0]!)
+      ry.push(pt[1]!)
+      rz.push(pt[2]!)
+      rt.push(pt[3]!)
+      // Same divisor as every other v in this file: arc length ACROSS the
+      // section over 8. Bedding stays horizontal because u runs along the lap.
+      rv.push(acc / 8)
+    }
+    sx.push(rx)
+    sy.push(ry)
+    sz.push(rz)
+    ty.push(rt)
+    sv.push(rv)
+  }
+
+  const open: boolean[][] = []
+  let opened = 0
+  for (let a = 0; a < nAlong; a++) {
+    const row: boolean[] = []
+    for (let j = 0; j < SEG; j++) {
+      const o = archIsOpen((a + 0.5) / nAlong, (j + 0.5) / SEG, archLength)
+      if (o) opened++
+      row.push(o)
+    }
+    open.push(row)
+  }
+  const isOpen = (a: number, j: number): boolean =>
+    a < 0 || a >= nAlong || j < 0 || j >= SEG ? true : open[a]![j]!
+
+  /*
+   * WHICH BEDDING PLANE THIS POINT OF THE SOFFIT IS CUT THROUGH.
+   *
+   * The underside of an arch is not a surface laid ON the rock, it is a
+   * surface cut THROUGH it, so it exposes whatever beds it passes at that
+   * height — and the vault rises 4 m from springing to crown, which on this
+   * section's stack is two to three bands. Painting the whole soffit one colour
+   * throws that away and leaves the single largest low-variance surface this
+   * file emits, at grazing incidence under bounce-only light, which is §9b's
+   * failure mode with a spotlight on it.
+   *
+   * The band is read off the STATION'S OWN row table rather than recomputed, so
+   * the stripe on the soffit lines up with the stripe on the wall it runs into.
+   * Falls back to the springing band above the top of the stack.
+   */
+  const bandAtHeight = (st: Station, side: number, hAbove: number): number => {
+    for (let b = 1; b <= 7; b++) {
+      const o = BAND_ROW_OFFSET[b]!
+      const lo = st.rowH[side]![o]!
+      const hi = st.rowH[side]![o + BANDS[b]!.rows - 1]!
+      if (hAbove >= lo && hAbove <= hi) return b
+    }
+    return ARCH_SPRING_BAND
+  }
+
+  const vertex = (into: SurfaceBuilder, a: number, j: number, top: boolean): number => {
+    const st = stations[i0 + a]!
+    const x = sx[a]![j]!
+    const y = top ? ty[a]![j]! : sy[a]![j]!
+    const z = sz[a]![j]!
+    const p = j / SEG
+    // `bandColour` wants a side because wind scour and the sand blend are
+    // per-face. The roof has no side; the nearer wall is the honest answer, and
+    // it makes the two halves of the soffit differ, which is the point.
+    const side = p < 0.5 ? 0 : 1
+    const hAbove = y - st.baseY[side]!
+    const band = bandAtHeight(st, side, hAbove)
+    bandColour(_c, st, side, band, p, hAbove, x, y, z, fields)
+    return into.vertex(x, y, z, st.arc * uvU, sv[a]![j]!, _c)
+  }
+
+  for (let a = 0; a < nAlong; a++) {
+    for (let j = 0; j < SEG; j++) {
+      if (open[a]![j]!) continue
+
+      /*
+       * WINDING. `a` increases along travel and `j` increases toward the
+       * driver's right, so with A=(a,j) B=(a+1,j) C=(a+1,j+1) D=(a,j+1) the
+       * triangle (A,B,C) has normal `tangent x right`, which for a horizontal
+       * tangent is `-up`. That is the soffit, facing DOWN, and it is the order
+       * that gives it. The top surface is the same quad reversed.
+       *
+       * Getting this backwards does not produce an obvious error: it produces a
+       * roof that is invisible from the road and casts shadows anyway, which
+       * looks like a shading bug in `render/`.
+       */
+      const sA = vertex(soffit, a, j, false)
+      const sB = vertex(soffit, a + 1, j, false)
+      const sC = vertex(soffit, a + 1, j + 1, false)
+      const sD = vertex(soffit, a, j + 1, false)
+      soffit.quad(sA, sB, sC, sD)
+
+      const tA = vertex(shell, a, j, true)
+      const tB = vertex(shell, a + 1, j, true)
+      const tC = vertex(shell, a + 1, j + 1, true)
+      const tD = vertex(shell, a, j + 1, true)
+      shell.quad(tA, tD, tC, tB)
+
+      /*
+       * RIMS. Every edge of a closed cell whose neighbour is open — a skylight,
+       * or the two ends of the tunnel — gets a wall joining soffit to top.
+       *
+       * Without them the shell is a pair of parallel sheets and every skylight
+       * is a paper cut: from below you see a zero-thickness hole, and from
+       * above you see through the roof into the tunnel. The rim is also what
+       * makes the shaft hard-edged, which is the word §11 uses.
+       *
+       * The p = 0 and p = 1 edges get NO rim, and must not: the thickness taper
+       * has already closed the shell to zero there, so a rim would be a
+       * degenerate quad wedged inside the cliff face.
+       */
+      if (isOpen(a - 1, j)) emitArchRim(shell, a, j, a, j + 1, sx, sy, sz, ty, sv, stations, i0, uvU, fields)
+      if (isOpen(a + 1, j)) emitArchRim(shell, a + 1, j + 1, a + 1, j, sx, sy, sz, ty, sv, stations, i0, uvU, fields)
+      if (j > 0 && isOpen(a, j - 1)) emitArchRim(shell, a + 1, j, a, j, sx, sy, sz, ty, sv, stations, i0, uvU, fields)
+      if (j < SEG - 1 && isOpen(a, j + 1)) emitArchRim(shell, a, j + 1, a + 1, j + 1, sx, sy, sz, ty, sv, stations, i0, uvU, fields)
+    }
+  }
+
+  return opened
+}
+
+/**
+ * One rim quad, from grid point (`a0`,`j0`) to (`a1`,`j1`), soffit up to top.
+ *
+ * The two grid points are passed in the order that makes the quad's outward
+ * normal point AWAY from the rock, and the caller is what knows that order —
+ * which is why the four call sites above are not copy-paste of each other.
+ */
+function emitArchRim(
+  into: SurfaceBuilder,
+  a0: number,
+  j0: number,
+  a1: number,
+  j1: number,
+  sx: number[][],
+  sy: number[][],
+  sz: number[][],
+  ty: number[][],
+  sv: number[][],
+  stations: Station[],
+  i0: number,
+  uvU: number,
+  fields: Fields,
+): void {
+  const mk = (a: number, j: number, top: boolean): number => {
+    const st = stations[i0 + a]!
+    const x = sx[a]![j]!
+    const y = top ? ty[a]![j]! : sy[a]![j]!
+    const z = sz[a]![j]!
+    bandColour(_c, st, 0, BAND_CAP_TOP, top ? 1 : 0, y - st.py, x, y, z, fields)
+    // The rim's v runs UP the cut, not across the span, or a 3 m face gets the
+    // same texel row from top to bottom.
+    return into.vertex(x, y, z, st.arc * uvU, sv[a]![j]! + (top ? 0.4 : 0), _c)
+  }
+  const A = mk(a0, j0, false)
+  const B = mk(a1, j1, false)
+  const C = mk(a1, j1, true)
+  const D = mk(a0, j0, true)
+  into.quad(A, B, C, D)
 }
 
 // ---------------------------------------------------------------------------
