@@ -481,6 +481,39 @@ const CFG = {
    * increased, so any forward motion at all resets it. A legitimate stop is a
    * spin and a recovery, roughly 1.5 s. 360 ticks is 3 s — twice that, and a
    * kart that has made no forward progress for three seconds is on a wall.
+   *
+   * OPEN, AND TWO HYPOTHESES ARE ALREADY DEAD. This gate reports 798 ticks
+   * (6.6 s) for six of eight karts, and the numbers are too uniform to be six
+   * independent failures: 781, 783, 789, 790, 795, 798 — a spread of 17 ticks.
+   * That is one mechanism counted six times.
+   *
+   * Ruled out by measurement, not by argument. Both changes were made, built,
+   * and run, and BOTH LEFT THE NUMBER AT EXACTLY 798:
+   *
+   *   - the countdown. `main.ts` counts these ticks while the field is held on
+   *     the grid, and the countdown is 390 ticks against this 360 limit, so the
+   *     gate looked unsatisfiable by construction. Gating the counter on
+   *     `race.phase === 'racing'` changed nothing, because this file already
+   *     splits lap 1 out into `maxTicksWithoutProgressLap1` for exactly that
+   *     reason — see the comment there.
+   *   - the respawn. `bestProgress` is a high-water mark and a respawn moves a
+   *     kart back up to 285 m at zero speed, so the counter appeared to be
+   *     measuring the re-drive. Re-baselining it on `kart:respawn` changed
+   *     nothing either.
+   *
+   * The surviving candidate, from reading `race.ts` rather than from a
+   * measurement: `bestProgress` only advances while `racer.armed`
+   * (`race.ts:289`), and `crossBackward` disarms a kart that reverses over the
+   * start line at checkpoint depth 0 (`race.ts:199`). A disarmed kart never
+   * advances its high-water mark however well it drives, so this counter would
+   * climb through perfect driving. `main.ts` cannot see `armed` — it is not on
+   * `Standing` — so if that is the cause, the fix is a contract question and
+   * not a tuning one.
+   *
+   * Whoever picks this up: the cheap decisive measurement is to log `armed`
+   * and `bestProgress` per tick for kart 3 or 4 through the window where the
+   * counter climbs. Do not change this threshold until that is done — the
+   * threshold is not what is wrong.
    */
   maxTicksWithoutProgress: 360,
 
