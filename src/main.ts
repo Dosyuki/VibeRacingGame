@@ -474,6 +474,18 @@ const lastFrames: InputFrame[] = karts.map(() => ({
 let scriptedInput: InputFrame | null = null
 
 /*
+ * The stall detector's two constants, deliberately the same numbers
+ * `game/race.ts` uses for its own detector (`MAX_CONTINUOUS_STEP_METRES` and
+ * `PROGRESS_EPSILON` there). They are duplicated rather than shared because a
+ * constant is not one of the three sanctioned cross-subsystem channels and
+ * `src/types.ts` is not widened for a threshold. If either moves there, move it
+ * here: they describe the same physical fact, which is that one tick at the
+ * governed speed is well under a metre, so a larger jump is a teleport.
+ */
+const MAX_CONTINUOUS_STEP_METRES = 5
+const PROGRESS_EPSILON = 1e-6
+
+/*
  * TELEMETRY.
  *
  * `RaceTelemetry` lives on `HarnessAPI`, not on `IRace`, and this is why: the
@@ -495,7 +507,16 @@ interface Counters {
   boostSecondsBySource: Record<BoostSource, number>
   respawns: number
   wallHits: number
-  bestProgress: number
+  /**
+   * Forward travel along the centreline, in laps, accumulated one tick at a
+   * time from `Standing.progress`. NOT a position — see the stall detector in
+   * `fixedUpdate` for why the difference is the whole point.
+   */
+  travelled: number
+  /** High-water mark of `travelled`. What `ticksWithoutProgress` counts from. */
+  bestTravelled: number
+  /** Previous tick's `Standing.progress`. NaN until the first sample. */
+  previousProgress: number
   ticksWithoutProgress: number
 }
 
@@ -506,7 +527,9 @@ function newCounters(): Counters {
     boostSecondsBySource: { none: 0, drift: 0, pad: 0, item: 0, slipstream: 0 },
     respawns: 0,
     wallHits: 0,
-    bestProgress: -Infinity,
+    travelled: 0,
+    bestTravelled: 0,
+    previousProgress: Number.NaN,
     ticksWithoutProgress: 0,
   }
 }
@@ -880,15 +903,77 @@ const loop = createLoop({
      * `lastFollowTick` check; nothing in `race.ts` did.
      */
 
-    // Stall detection. `Standing.progress` is NOT monotonic — it decreases on a
-    // reverse or a respawn — which is exactly why the contract carries
-    // `bestProgress` separately and says it exists only for this.
+    /*
+     * STALL DETECTION, AND IT COUNTS TRAVEL RATHER THAN POSITION — MEASURED.
+     *
+     * This used to reset on any increase in `Standing.bestProgress`, which is
+     * the high-water mark of a POSITION (`completedLaps + t`). The contract
+     * calls that counter "the stuck-on-a-wall detector", and on this build it
+     * was not one: every route by which the GAME ITSELF moves a kart backwards
+     * handed the kart a debt it then had to re-drive before the counter would
+     * reset, so `ticksWithoutProgress` climbed through flawless driving.
+     *
+     * TRACED PER TICK, kart 4, seed 20260807, the race autoplay's `completes`
+     * gate grades. Tick 15009: off track for 2.25 s at 10.1 m/s, progress and
+     * bestProgress equal at 1.761330. Tick 15010: `race.ts:respawn` returns it
+     * to checkpoint 6 plus a metre — 98.2 m BACKWARDS, at 0.0 m/s — and
+     * `bestProgress` stays at its 1.761380 peak. Ticks 15011..15808: the kart
+     * accelerates to 25.7 m/s, on the road the whole way, and re-drives those
+     * 98.2 m. Tick 15809: progress finally passes the old peak and the counter
+     * resets. 798 ticks, 6.65 s, of "no forward progress" spent at full speed
+     * on the racing line. That was six of eight karts (781/783/789/790/795/798)
+     * — not six failures but one mechanism, and the 17-tick spread is traffic,
+     * because they all leave the road at the same corner and are all returned
+     * to the same checkpoint.
+     *
+     * TWO THINGS THE TRACE ALSO KILLED, so nobody pays for them twice:
+     *   - `armed`. `race.ts:crossBackward` disarms a kart that reverses over
+     *     the start line, and a disarmed kart cannot advance `bestProgress` at
+     *     all (`race.ts:289`). The trace logged `armed` every tick: it went
+     *     true at tick 423 and NEVER went false again. Not this.
+     *   - re-baselining the counter on `kart:respawn`. At the respawn tick the
+     *     counter is ALREADY zero — the kart was driving perfectly up to it —
+     *     so zeroing it there is a no-op, which is exactly why that change left
+     *     the number at 798 to the tick. What has to come down is the BAR, not
+     *     the counter.
+     *
+     * `game/race.ts` reached the same conclusion for its own 12 s stall rescue
+     * and moved it onto accumulated forward travel; the long comment there
+     * enumerates the other two routes (a lap the anti-cut validation refuses,
+     * and the disarm above). This counter is the copy that was left behind on
+     * the broken quantity. It now measures the same thing race.ts does:
+     *
+     *   travel, not place. A teleport contributes nothing to it, the t = 0 seam
+     *   is continuous in `progress` because `completedLaps` increments across
+     *   it, and a kart that is genuinely wedged still accumulates nothing and
+     *   still trips the gate. `Standing.progress` is all it needs, so nothing
+     *   private to `race.ts` has to reach the contract for this.
+     *
+     * The rejection threshold does the work: a tick that moves a kart more than
+     * MAX_CONTINUOUS_STEP_METRES along the centreline is a respawn, a seek, or
+     * a lap the validation refused, and it banks NOTHING rather than banking a
+     * jump the kart never drove. `bestProgress` is untouched and still published
+     * exactly as the contract describes it.
+     *
+     * NOTE FOR THE CONTRACT OWNER: `types.ts:956` documents this field as
+     * "Ticks since `bestProgress` last increased. The stuck-on-a-wall
+     * detector." Those two sentences name different things, and only the second
+     * is the requirement. The first is now stale and wants its own announced
+     * commit; `types.ts` is closed this session and was not touched.
+     */
     for (let i = 0; i < karts.length; i++) {
       const standing = race.standings.find((s2) => s2.kartId === karts[i]!.identity.id)
       const c = counters[i]!
-      const best = standing?.bestProgress ?? -Infinity
-      if (best > c.bestProgress) {
-        c.bestProgress = best
+      const progress = standing?.progress ?? c.previousProgress
+      const delta = progress - c.previousProgress
+      c.previousProgress = progress
+      // NaN on the first sample fails this comparison, which is the intent:
+      // there is no previous tick to have travelled from.
+      if (Math.abs(delta) * track.length <= MAX_CONTINUOUS_STEP_METRES) {
+        c.travelled += delta
+      }
+      if (c.travelled > c.bestTravelled + PROGRESS_EPSILON) {
+        c.bestTravelled = c.travelled
         c.ticksWithoutProgress = 0
       } else {
         c.ticksWithoutProgress++
