@@ -164,18 +164,9 @@ const TRAVEL_BLEND_FULL = 6.0
  * WHAT THIS GUARD DOES NOT FIX, MEASURED, SO THE NEXT READER DOES NOT RE-DERIVE
  * IT. It takes `cam-behind` from 82 violations worst 11.453 to 68 worst 10.880,
  * and no further. The residue is not this blend at all: it is the POSITION
- * SPRING'S STEADY-STATE LAG. A critically damped spring tracking a target
- * moving at constant speed settles 2v/omega BEHIND it, so at 21.8 m/s the rig
- * sits a measured 13.31 m behind the kart against the 7.28 m these constants
- * describe — the documented chase distance is not the distance the game has.
- * When the kart then yaws, the whole 13.31 m arm swings, and its lateral
- * component is what `cam-behind` reports. Cancelling the lag by feeding the
- * spring `desiredPos + (2/omega) * velocity` was tried: it puts the camera at
- * a measured 7.76 m and takes `cam-behind` to 28 violations worst 5.159 — and
- * turns `cam-seam` RED, 6 violations worst 146.312 deg/s against its 120 cap,
- * because a shorter arm rotates faster for the same lateral motion. That is one
- * gate traded for another, and a change to how the game feels at speed. It
- * wants a human, not an agent chasing a green.
+ * SPRING'S STEADY-STATE LAG, and `POS_LAG_COMPENSATION` below is the partial
+ * cancellation that was eventually shipped for it. Read that block for the
+ * arithmetic; what belongs here is only the finding that sent it there.
  */
 const TRAVEL_SLIP_KEEP_COS = Math.cos((50 * Math.PI) / 180)
 
@@ -213,6 +204,79 @@ const TRAVEL_SLIP_KEEP_COS = Math.cos((50 * Math.PI) / 180)
 const POS_OMEGA = 7.0
 const LOOK_OMEGA = 10.5
 const UP_OMEGA = 5.5
+
+/**
+ * PARTIAL CANCELLATION OF THE POSITION SPRING'S STEADY-STATE LAG.
+ *
+ * A critically damped spring tracking a target that moves at constant speed
+ * settles exactly 2v/omega BEHIND it. That is not a bug in the spring, it is
+ * what a spring does; but it means the chase distance the game HAS is not the
+ * chase distance `CHASE_DISTANCE + CHASE_DISTANCE_SPEED * speedNorm` DESCRIBES.
+ * Measured on straight-line rows: 13.31 m behind the kart at 21.8 m/s against
+ * the 7.28 m those constants name. When the kart then yaws, that whole 13.31 m
+ * arm swings, and its lateral component is what `cam-behind` reports.
+ *
+ * Feeding the spring `desiredPos + (2/omega) * velocity` cancels the lag
+ * exactly — the standard trick, and it works: it puts the camera at a measured
+ * 7.76 m. The reason this constant is a FRACTION and not simply absent is that
+ * full cancellation was measured, once, to cost more than it bought:
+ *
+ *   RECORDED, on the tree where the spin at turn one still happened — full
+ *   compensation took `cam-behind` to 28 violations worst 5.159 (from 68 worst
+ *   10.880) and turned `cam-seam` RED at 6 violations worst 146.312 deg/s
+ *   against its 120 cap. A shorter arm rotates faster for the same lateral
+ *   motion of the camera, so the gate that measures rotation gets worse in
+ *   exact proportion to how much the gate that measures offset gets better.
+ *
+ * THE FRACTION IS DERIVED FROM THAT, AND NOT FROM THE TREE IT SHIPPED ON, AND
+ * THE DIFFERENCE MATTERS. On the tree it shipped on the spin no longer occurs,
+ * and full compensation costs nothing measurable: worst swing 20.436 deg/s at
+ * fraction 0 against 21.204 deg/s at fraction 1, so `cam-seam` is slack by
+ * ~99 deg/s either way and a fraction solved from THOSE two points is ~130 —
+ * i.e. unconstrained. Sizing the constant on that would be sizing it on the
+ * absence of the failure it exists to survive.
+ *
+ * So it is sized on the worst case anyone has measured, with the conservative
+ * assumption that ALL of the recorded 146.312 deg/s came from the arm swinging
+ * (the assumption that maximises the predicted amplification, and therefore
+ * minimises this constant). Angular rate for a given lateral motion goes as
+ * 1/L, and L(a) = 13.31 - 5.55a metres from the two recorded arm measurements:
+ *
+ *   W(a) = W(1) * L(1)/L(a) = 146.312 * 7.76 / (13.31 - 5.55a)
+ *        = 1135.4 / (13.31 - 5.55a)      [W(0) = 85.3 deg/s, which is why
+ *                                         `cam-seam` was green at a = 0]
+ *
+ * Target 100 deg/s, so 20 deg/s below the cap. That margin is not taste: the
+ * camera's own surface RUMBLE contributes 1-2 deg/s to this metric all by
+ * itself, so a result sitting within 2 deg/s of 120 is not green, it is
+ * unresolved — 20 deg/s is ten times that and 17% of the cap. Solving:
+ *
+ *   a = (13.31 - 1135.4/100) / 5.55 = 1.9566 / 5.55 = 0.3525  ->  0.35
+ *
+ * The other end of the window is `cam-behind` itself, and it is measured rather
+ * than modelled: worst lateral offset 2.334 m at a = 0 and 0.990 m at a = 1, so
+ * a >= 0.249 to get under the 2.0 m gate. 0.35 is the top of [0.249, 0.352],
+ * which is the choice that leaves `cam-behind` the most margin the seam bound
+ * allows. PREDICTED 1.864 m, MEASURED 1.863 m, gate 2.0 m.
+ *
+ * WHAT IT COSTS, WHICH IS THE PART A GATE CANNOT SEE. The chase arm at speed,
+ * straight-line steady state, before -> after:
+ *
+ *   14 m/s   10.86 m -> 9.46 m      (measured bin mean 10.62 -> 9.30)
+ *   22 m/s   13.57 m -> 11.37 m     (measured bin mean 13.33 -> 11.21)
+ *   28 m/s   15.61 m -> 12.81 m
+ *
+ * The kart is meaningfully closer at speed and the game reads tighter for it.
+ * That is a taste change and it is stated here rather than buried, because it
+ * is the reason full compensation was not shipped even on a tree where every
+ * gate would have allowed it.
+ *
+ * Applied to the SPRING TARGET only, never to `desiredPos`, so `snapTo` still
+ * snaps to the true pose: a snap has no accumulated lag to cancel, and leading
+ * the target on the tick a kart respawns would place the camera by however fast
+ * it happened to be travelling when it died.
+ */
+const POS_LAG_COMPENSATION = 0.35
 
 /** `Settings.reducedMotion` variants. Slower springs low-pass the target, which
  *  genuinely removes angular rate rather than merely reporting less of it. */
@@ -301,6 +365,7 @@ const travelForward = new Vector3()
 const followForward = new Vector3()
 const targetUp = new Vector3()
 const desiredPos = new Vector3()
+const springTargetPos = new Vector3()
 const desiredAim = new Vector3()
 const roadAim = new Vector3()
 const noseAim = new Vector3()
@@ -691,7 +756,26 @@ export const createCameraRig: CameraFactory = (ctx: Ctx): ICameraRig & Subsystem
         camera.lookAt(springAim)
         prevQuat.copy(camera.quaternion)
       } else {
-        springStep(springPos, springPosVel, desiredPos, reduced ? POS_OMEGA_REDUCED : POS_OMEGA, step)
+        /*
+         * The spring is led by a FRACTION of its own steady-state lag, 2v/omega.
+         * See POS_LAG_COMPENSATION for why the fraction is 0.35 and not 1.
+         *
+         * The lead is a separate vector from `desiredPos` on purpose: `snapTo`
+         * must keep using the true desired pose (a snap has nothing to cancel),
+         * and `desiredAim` is deliberately NOT led — the look spring is already
+         * the faster of the two so that the aim arrives at a corner before the
+         * body does, and leading it as well would spend that ordering.
+         *
+         * `omega` is read from the same variable the step uses, so the reduced-
+         * motion spring cancels ITS lag rather than the full-motion one. Two
+         * copies of that number is how reduced motion ends up with a camera that
+         * leads by 17% too much and nothing says why.
+         */
+        const posOmega = reduced ? POS_OMEGA_REDUCED : POS_OMEGA
+        springTargetPos
+          .copy(desiredPos)
+          .addScaledVector(state.velocity, (2 * POS_LAG_COMPENSATION) / posOmega)
+        springStep(springPos, springPosVel, springTargetPos, posOmega, step)
         springStep(springAim, springAimVel, desiredAim, reduced ? LOOK_OMEGA_REDUCED : LOOK_OMEGA, step)
       }
 
