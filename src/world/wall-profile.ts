@@ -104,6 +104,54 @@ export const TALUS_RUN_PER_METRE = 1 / Math.tan((32 * Math.PI) / 180)
 export const CORRIDOR_CLEARANCE = 0.5
 
 /*
+ * The kart's half-width, as a documented local copy. `world/` may not import
+ * from `kart/` — sibling imports are banned — and `world/track.ts` already
+ * carries the same constant for the racing-line margin. If `HALF_TRACK` in
+ * `src/kart/kart.ts` ever changes, BOTH copies go stale silently: the racing
+ * line stops clearing the sand and a pinned kart stops being rescued. That is
+ * the failure mode, written down because nothing enforces it.
+ */
+const KART_HALF_TRACK = 0.64
+
+/*
+ * WHY THE BARRIER MUST CLEAR THE KART'S BODY AND NOT ITS CENTRE POINT.
+ *
+ * `onTrack` is `|lateral| <= halfWidth + BARRIER_MARGIN`, and `lateral` is the
+ * chassis CENTRE. The barrier stops that centre `KART_HALF_TRACK` inboard of
+ * the toe. So with a toe at `halfWidth + BARRIER_MARGIN + CORRIDOR_CLEARANCE`
+ * = hw + 2.00, a pinned kart sits at hw + 1.36 — 0.14 m INSIDE the corridor —
+ * and `onTrack` stays TRUE while it is welded to a rock.
+ *
+ * That is not cosmetic. `race.ts` rescues a kart 2.25 s after it goes
+ * OFF-track, so the rescue never fires and only the 12 s stall detector can
+ * save it. Measured at The Slot's left face: 3600 ticks of full lock and full
+ * throttle away from the wall recovered -0.01 m, wiggling recovered 0.00 m,
+ * and only a continuously held brake escaped at all, taking 7.9 s. The arch
+ * tunnel is worse — the kart ends welded at the limit exactly, 0.00 m gap,
+ * 0.0 m/s, `onTrack` true for all 900 ticks.
+ *
+ * And it was systemic rather than two unlucky rocks: both trap sites measured
+ * EXACTLY 0.14 m inside, because it is arithmetic. Every barrier standing at
+ * the corridor floor traps, on every seed.
+ *
+ * So the floor is now the distance that puts the kart's OUTER EDGE on the
+ * corridor line: `BARRIER_MARGIN + KART_HALF_TRACK`. The centre then rests at
+ * exactly `halfWidth + BARRIER_MARGIN` — and `onTrack` compares with `<=`, so
+ * resting exactly on the boundary still reads as ON track. PIN_ESCAPE is what
+ * carries it past. It is one `ITrack.locate` lateral tolerance (track-check
+ * reports worst 0.0017 m) rounded up two orders, for the same reason
+ * CORRIDOR_CLEARANCE is 0.5 rather than 0.32: obviously safe beats exactly
+ * safe.
+ *
+ * Cost to the visible rock: the toe moves out by
+ * (1.5 + 0.64 + 0.1) - (1.5 + 0.5) = 0.24 m, against section setbacks of 2.4
+ * to 50 m. The barrier and the rock still come from this one number, which is
+ * the entire reason this module exists.
+ */
+const PIN_ESCAPE = 0.1
+export const BARRIER_FLOOR_MARGIN = BARRIER_MARGIN + KART_HALF_TRACK + PIN_ESCAPE
+
+/*
  * Below this crest height the section has NO WALL — see `wallProfileAt`.
  *
  * 2 m is not a styling choice. The dune sweep's outside collapses its wall to
@@ -543,7 +591,7 @@ export function wallProfileAt(
    * a barrier there deletes it. This clamp is that promise, and it is the same
    * line of code that holds it for the visible rock.
    */
-  const minToe = halfWidth + BARRIER_MARGIN + CORRIDOR_CLEARANCE
+  const minToe = halfWidth + BARRIER_FLOOR_MARGIN + CORRIDOR_CLEARANCE
   if (base - run < minToe) {
     run = Math.max(0, base - minToe)
     tH = run / TALUS_RUN_PER_METRE
