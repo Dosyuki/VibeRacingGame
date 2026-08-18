@@ -935,7 +935,7 @@ release timing.
 
 **The mechanism is the button, not the technique.** Arms with `kSlip = 0` — the
 same pure-pursuit command the clean arm uses, no flick, no brake — reproduce the
-whole loss. `rearDriftScale = 0.61` cuts rear peak force 39% for as long as
+whole loss. `rearDriftScale = 0.61` cut rear peak force 39% for as long as
 `drift.active`, keyed on the button rather than on slip, and that is paid for the
 entire hold while the boost repays for 0.72–2.05 s. Entry speed is never the
 loss; where a drift survives, exit speed actually *rises* 1.1–1.3 m/s.
@@ -953,7 +953,9 @@ Criteria 1 and 2 are also in tension on this chassis: 2 wants most attempts
 banked, 1 wants drifting to be fast, and drifting is a loss at six of eight
 eligible corners. Meeting 2 by drifting everywhere costs at least 12 s/lap.
 
-Closing this needs the drift MODEL to change — `rearDriftScale`, or a boost that
+Closing this needs the drift MODEL to change further — the peak cut now
+scales with slip (`DRIFT_PEAK_CUT_SLIP`), which took the margin from -28.47 s
+to -5.94 s; what is left is a boost that
 is thrust rather than a `topSpeed` raise, or a rear cut that scales with slip
 instead of with the button — or it needs the criterion restated. Both are design
 decisions and neither belongs to a harness or an AI.

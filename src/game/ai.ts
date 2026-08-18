@@ -357,7 +357,7 @@ const DRIFT_ARM_SPEED = 12
  * real straight on this circuit, against 0.003 s returned by `wall-arc`,
  * which is longer, faster and wider and is at its lateral limit the whole
  * way. Drift value tracks the exit, not the radius. See ART_DIRECTION §10c
- * criterion 1 for the full table and `rearDriftScale` in `kart.ts` for why
+ * criterion 1 for the full table, and `DRIFT_PEAK_CUT_SLIP` in `kart.ts` for why
  * the hold costs what it does.
  *
  * The number is the distance a tier-3 boost can actually be spent over:
